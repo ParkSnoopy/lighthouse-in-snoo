@@ -39,6 +39,7 @@ Build both binaries locally:
 ```bash
 make build      # static linux/amd64 hub -> bin/lighthouse
 make build-ui   # Fyne desktop TUN app -> bin/lighthouse-ui
+make hooks      # install lefthook pre-commit and pre-push checks
 ```
 
 Or run the universal hub container (`linux/amd64`):

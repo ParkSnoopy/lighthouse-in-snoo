@@ -196,8 +196,24 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 				t.Fatalf("Dockerfile must not reference gcr.io images")
 			}
 		}
-		if rel == filepath.Join(".github", "workflows", "build.yml") && !strings.Contains(text, "libwayland-dev") {
-			t.Fatalf("%s must install libwayland-dev for Fyne v2.8 / GLFW v3.4 Linux headers", rel)
+		if rel == filepath.Join(".github", "workflows", "build.yml") {
+			if strings.Contains(text, "\n  verify:\n") {
+				t.Fatalf("%s must not run verify job in GitHub Actions (handled locally by lefthook)", rel)
+			}
+			if !strings.Contains(text, "pkg/version/version.go") {
+				t.Fatalf("%s must resolve release version from pkg/version/version.go", rel)
+			}
+		}
+	}
+
+	lhBytes, err := os.ReadFile(filepath.Join("..", "..", "lefthook.yml"))
+	if err != nil {
+		t.Fatalf("read lefthook.yml: %v", err)
+	}
+	lhText := string(lhBytes)
+	for _, want := range []string{"pre-commit:", "pre-push:", "make lint", "make check-deps", "make check-build", "make test", "make verify"} {
+		if !strings.Contains(lhText, want) {
+			t.Fatalf("lefthook.yml missing %q", want)
 		}
 	}
 

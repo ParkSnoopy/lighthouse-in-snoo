@@ -1,0 +1,28 @@
+min_version: 2.0.0
+
+pre-commit:
+  parallel: false
+  commands:
+    gofmt:
+      glob: "*.go"
+      run: |
+        unformatted="$(gofmt -l {staged_files})"
+        if [ -n "$unformatted" ]; then
+          echo "Unformatted Go files (run 'gofmt -w'):" >&2
+          echo "$unformatted" >&2
+          exit 1
+        fi
+    lint:
+      run: make lint
+    deps:
+      run: make check-deps
+    build-version:
+      run: make check-build
+    test:
+      run: make test
+
+pre-push:
+  parallel: false
+  commands:
+    verify:
+      run: make verify

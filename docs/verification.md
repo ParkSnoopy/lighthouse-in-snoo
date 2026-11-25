@@ -1,13 +1,28 @@
 # Verification Procedures and Invariants
 
-## 1. Build, Static Analysis, and Linting
+## 1. Local Git Hooks (`lefthook`), Build, Static Analysis, and Linting
 
-Run all build, vet, dependency isolation, and `go-critic` checks from a fresh clone:
+Install local Git hooks (backed by `lefthook` via Go's `tool` directive in `go.mod`):
+
+```bash
+make hooks
+```
+
+`lefthook.yml` runs formatting (`gofmt`), static analysis (`make lint`), dependency isolation (`make check-deps`), binary builds and single-source version alignment (`make check-build`), and the full race test suite (`make test`) locally on `pre-commit` and `pre-push`.
+
+Run all checks manually from a fresh clone:
+
+```bash
+make verify
+```
+
+Or individually:
 
 ```bash
 make lint
-make build
-make build-ui
+make check-deps
+make check-build
+make test
 ```
 
 `make lint` runs:

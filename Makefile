@@ -15,13 +15,31 @@ SECURITY_PKGS := \
 	./internal/stunserver/... \
 	./internal/turnserver/...
 
-.PHONY: build build-ui icons install-linux-desktop package-macos test vet lint version docker-build
+.PHONY: build build-ui check-deps check-build verify hooks icons install-linux-desktop package-macos test vet lint version docker-build
 
 build:
 	CGO_ENABLED=0 GOARCH=amd64 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/lighthouse ./cmd/lighthouse
 
 build-ui:
 	go build $(UI_BUILD_TAGS) -trimpath -ldflags="$(LDFLAGS)" -o bin/lighthouse-ui ./cmd/lighthouse-ui
+
+check-deps:
+	@if go list -deps ./internal/hub | grep -q 'github\.com/pion/webrtc'; then echo "forbidden pion/webrtc import in internal/hub" >&2; exit 1; fi
+	@if go list -deps ./internal/stunserver | grep -qE 'github\.com/pion/(webrtc|turn)'; then echo "forbidden pion/webrtc or pion/turn import in internal/stunserver" >&2; exit 1; fi
+	@if go list -deps ./cmd/lighthouse | grep -qE 'fyne\.io/fyne|modernc\.org/sqlite'; then echo "forbidden fyne or sqlite import in cmd/lighthouse" >&2; exit 1; fi
+
+check-build: build build-ui
+	@BIN_VER="$$(./bin/lighthouse --version | awk '{print $$2}')"; \
+	UI_VER="$$(./bin/lighthouse-ui --version | awk '{print $$2}')"; \
+	if [ -z "$$BIN_VER" ] || [ "$$BIN_VER" != "$(VERSION)" ] || [ "$$UI_VER" != "$(VERSION)" ]; then \
+		echo "version mismatch: pkg/version=$(VERSION) lighthouse=$$BIN_VER lighthouse-ui=$$UI_VER" >&2; \
+		exit 1; \
+	fi
+
+verify: lint check-deps check-build test
+
+hooks:
+	go tool lefthook install
 
 icons:
 	go run ./scripts/gen_platform_icons.go
