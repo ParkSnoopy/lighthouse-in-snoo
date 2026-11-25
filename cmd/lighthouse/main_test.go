@@ -196,6 +196,9 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 				t.Fatalf("Dockerfile must not reference gcr.io images")
 			}
 		}
+		if rel == filepath.Join(".github", "workflows", "build.yml") && !strings.Contains(text, "libwayland-dev") {
+			t.Fatalf("%s must install libwayland-dev for Fyne v2.8 / GLFW v3.4 Linux headers", rel)
+		}
 	}
 
 	tmpDir := t.TempDir()
