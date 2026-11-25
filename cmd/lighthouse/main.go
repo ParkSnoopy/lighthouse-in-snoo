@@ -16,8 +16,8 @@ func newRootCommand() *cli.Command {
 		LongAbout:  "Zero-config Lighthouse universal signaling hub and STUNS/TURNS relay. Peers authenticate independently and control connections via the Fyne TUN interface app (lighthouse-ui).",
 		Examples: []string{
 			"lighthouse hub",
-			"lighthouse hub --tls-cert tls.crt --tls-key tls.key --hub-origin wss://hub.example.com",
-			"lighthouse hub --passphrase <SECRET> --turn-public-ip 203.0.113.10",
+			"lighthouse hub --tls-algo ed25519 --hub-origin wss://hub.example.com",
+			"lighthouse hub --cidr 10.88.0.0/16 --turn-public-ip 203.0.113.10",
 			"lighthouse hub --tcp-only --stuns-addr :5349",
 		},
 	}

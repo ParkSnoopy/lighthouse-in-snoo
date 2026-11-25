@@ -62,16 +62,18 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lighthouse-ui --help failed: %v\n%s", err, string(uiHelpOut))
 	}
-	for _, want := range []string{"--ifname <NAME>", "--hub <URL>", "--hub-passphrase <SECRET>", "--tcp-only", "--blacklist <PATH>"} {
+	for _, want := range []string{"--ifname <NAME>", "--hub <URL>", "--tcp-only", "--blacklist <PATH>"} {
 		if !strings.Contains(string(uiHelpOut), want) {
 			t.Fatalf("lighthouse-ui --help missing %q:\n%s", want, string(uiHelpOut))
 		}
 	}
-	if strings.Contains(string(uiHelpOut), "--cidr") {
-		t.Fatalf("lighthouse-ui --help must not expose hub-only --cidr flag:\n%s", string(uiHelpOut))
+	for _, removed := range []string{"--cidr", "--hub-passphrase", "LIGHTHOUSE_PASSPHRASE"} {
+		if strings.Contains(string(uiHelpOut), removed) {
+			t.Fatalf("lighthouse-ui --help must not expose %q:\n%s", removed, string(uiHelpOut))
+		}
 	}
 
-	// Hub subcommand help: zero static ACL/policy/sqlite, includes --cidr, --passphrase & universal relay options.
+	// Hub subcommand help: blinded universal hub with --cidr, --tls-algo & universal relay (no hub passphrase or TLS path env vars).
 	hubHelp, err := exec.Command(hubBin, "help", "hub").CombinedOutput()
 	if err != nil {
 		t.Fatalf("lighthouse help hub failed: %v\n%s", err, string(hubHelp))
@@ -83,8 +85,10 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 		"--stuns-addr <ADDR>",
 		"--cidr <CIDR>",
 		"[env: LIGHTHOUSE_CIDR]",
-		"--passphrase <SECRET>",
-		"[env: LIGHTHOUSE_PASSPHRASE]",
+		"--tls-algo <ALGO>",
+		"[env: LIGHTHOUSE_TLS_ALGO]",
+		"--tls-rsa-bits <BITS>",
+		"[env: LIGHTHOUSE_TLS_RSA_BITS]",
 		"--no-relay",
 		"--tcp-only",
 		"[env: LIGHTHOUSE_TCP_ONLY]",
@@ -95,9 +99,9 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 			t.Fatalf("hub help missing %q:\n%s", want, string(hubHelp))
 		}
 	}
-	for _, removed := range []string{"--policy", "--sqlite"} {
+	for _, removed := range []string{"--policy", "--sqlite", "--passphrase", "LIGHTHOUSE_PASSPHRASE", "LIGHTHOUSE_TLS_CERT", "LIGHTHOUSE_TLS_KEY"} {
 		if strings.Contains(string(hubHelp), removed) {
-			t.Fatalf("hub help must not include removed flag %q:\n%s", removed, string(hubHelp))
+			t.Fatalf("hub help must not include removed option %q:\n%s", removed, string(hubHelp))
 		}
 	}
 
@@ -106,7 +110,7 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 		{"-help"},
 		{"hub", "-help"},
 		{"hub", "-https-addr", ":8443"},
-		{"hub", "-passphrase", "x"},
+		{"hub", "-tls-algo", "ed25519"},
 	} {
 		cmd := exec.Command(hubBin, badArgs...)
 		out, err := cmd.CombinedOutput()
@@ -128,19 +132,26 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 		t.Fatalf("expected --insecure hint:\n%s", string(hubInsecureOut))
 	}
 
-	// Invalid hub --cidr rejected with exit code 2.
-	badCIDRCmd := exec.Command(hubBin, "hub", "--cidr", "not-a-cidr")
-	if out, err := badCIDRCmd.CombinedOutput(); err == nil || badCIDRCmd.ProcessState.ExitCode() != 2 {
-		t.Fatalf("expected exit code 2 for invalid --cidr, got err=%v code=%d out=%s", err, badCIDRCmd.ProcessState.ExitCode(), string(out))
+	// Invalid hub --cidr and --tls-algo rejected with exit code 2.
+	for _, badArgs := range [][]string{
+		{"hub", "--cidr", "not-a-cidr"},
+		{"hub", "--tls-algo", "ed448"},
+		{"hub", "--tls-algo", "bogus"},
+		{"hub", "--tls-algo", "ed25519", "--tls-rsa-bits", "2048"},
+	} {
+		badValCmd := exec.Command(hubBin, badArgs...)
+		if out, err := badValCmd.CombinedOutput(); err == nil || badValCmd.ProcessState.ExitCode() != 2 {
+			t.Fatalf("expected exit code 2 for %v, got err=%v code=%d out=%s", badArgs, err, badValCmd.ProcessState.ExitCode(), string(out))
+		}
 	}
 
 	// Typo suggestion on unknown double-dash option.
-	badCmd := exec.Command(hubBin, "hub", "--pasphrase", "x")
+	badCmd := exec.Command(hubBin, "hub", "--tls-alg", "ed25519")
 	badOut, badErr := badCmd.CombinedOutput()
 	if badErr == nil || badCmd.ProcessState.ExitCode() != 2 {
 		t.Fatalf("expected exit code 2 for unknown flag, got err=%v code=%d", badErr, badCmd.ProcessState.ExitCode())
 	}
-	if !strings.Contains(string(badOut), "tip: a similar argument exists: '--passphrase'") {
+	if !strings.Contains(string(badOut), "tip: a similar argument exists: '--tls-algo'") {
 		t.Fatalf("expected typo suggestion in stderr:\n%s", string(badOut))
 	}
 }
@@ -172,6 +183,14 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 		}
 		if strings.Contains(text, "ARG VERSION") || strings.Contains(text, "appVersion") || strings.Contains(text, version.Version) {
 			t.Fatalf("%s must not hardcode or duplicate version %q", rel, version.Version)
+		}
+		if rel == "Dockerfile" {
+			if !strings.Contains(text, "FROM debian:13-slim") {
+				t.Fatalf("Dockerfile must use debian:13-slim as runner image")
+			}
+			if strings.Contains(text, "gcr.io/") {
+				t.Fatalf("Dockerfile must not reference gcr.io images")
+			}
 		}
 	}
 

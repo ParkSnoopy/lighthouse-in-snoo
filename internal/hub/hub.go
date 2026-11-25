@@ -2,18 +2,13 @@ package hub
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
@@ -47,13 +42,12 @@ type Config struct {
 	TLSConfig       *tls.Config
 	TLSCertFile     string
 	TLSKeyFile      string
-	AutoTLS         bool         // Generate an ephemeral self-signed TLS 1.3 cert when cert/key are omitted.
-	HubOrigin       string       // Canonical wss://host[:port] expected in registration proofs.
-	VirtualCIDR     netip.Prefix // Virtual IPv4 subnet assigned to peers (default 10.88.0.0/16).
-
-	// Optional offline shared passphrase gating registration on this hub (never sent in plaintext).
-	// Leave empty to run as an open universal public relay where clients scope broadcasts per passphrase.
-	Passphrase string
+	AutoTLS         bool               // Auto-generate a self-signed TLS 1.3 cert when cert/key are omitted.
+	TLSDir          string             // Optional directory to persist/reload auto-generated tls.crt and tls.key.
+	TLSAlgorithm    identity.Algorithm // Key algorithm for auto-generated TLS cert (default ed25519).
+	TLSRSABits      int                // Optional RSA modulus bits when TLSAlgorithm=rsa (default 3072).
+	HubOrigin       string             // Canonical wss://host[:port] expected in registration proofs.
+	VirtualCIDR     netip.Prefix       // Virtual IPv4 subnet assigned to peers (default 10.88.0.0/16).
 
 	TCPOnly          bool           // Explicit opt-in to disable all UDP sockets and serve TLS 1.3/TCP only.
 	AllowInsecure    bool           // Explicit opt-in required for plaintext STUN/TURN.
@@ -173,8 +167,8 @@ type Server struct {
 	cfg           Config
 	hubOrigin     string
 	virtualCIDR   netip.Prefix
-	hasPassphrase bool
-	hubKey        [32]byte
+	tlsAlgorithm  identity.Algorithm
+	tlsPersisted  bool
 	turnSecret    string
 	stunSrv       *stunserver.Server
 	turnSrv       *turnserver.Server
@@ -231,22 +225,11 @@ func New(cfgIn *Config) (*Server, error) {
 		}
 	}
 
-	var (
-		hasPassphrase bool
-		hubKey        [32]byte
-	)
-	if strings.TrimSpace(cfg.Passphrase) != "" {
-		hubKey, err = identity.DeriveHubKey(cfg.Passphrase)
-		if err != nil {
-			return nil, fmt.Errorf("derive hub passphrase key: %w", err)
-		}
-		hasPassphrase = true
-	}
-
-	tlsCfg, err := buildTLS13Config(&cfg, origin)
+	resolvedTLS, err := buildTLS13Config(&cfg, origin)
 	if err != nil {
 		return nil, err
 	}
+	tlsCfg := resolvedTLS.config
 
 	rawLn := cfg.HTTPSListener
 	if rawLn == nil {
@@ -373,8 +356,8 @@ func New(cfgIn *Config) (*Server, error) {
 		cfg:           cfg,
 		hubOrigin:     origin,
 		virtualCIDR:   virtualCIDR,
-		hasPassphrase: hasPassphrase,
-		hubKey:        hubKey,
+		tlsAlgorithm:  resolvedTLS.algorithm,
+		tlsPersisted:  resolvedTLS.persisted,
 		turnSecret:    turnSecret,
 		stunSrv:       stunSrv,
 		turnSrv:       turnSrv,
@@ -475,84 +458,6 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
-func buildTLS13Config(cfg *Config, canonicalOrigin string) (*tls.Config, error) {
-	var base *tls.Config
-	switch {
-	case cfg.TLSConfig != nil:
-		base = cfg.TLSConfig.Clone()
-	case cfg.TLSCertFile != "" || cfg.TLSKeyFile != "":
-		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
-			return nil, errors.New("hub: both TLS certificate and key paths are required")
-		}
-		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("load hub TLS keypair: %w", err)
-		}
-		base = &tls.Config{
-			MinVersion:   tls.VersionTLS13,
-			MaxVersion:   tls.VersionTLS13,
-			Certificates: []tls.Certificate{cert},
-		}
-	case cfg.AutoTLS:
-		cert, err := generateEphemeralServerCert(canonicalOrigin)
-		if err != nil {
-			return nil, err
-		}
-		base = &tls.Config{
-			MinVersion:   tls.VersionTLS13,
-			MaxVersion:   tls.VersionTLS13,
-			Certificates: []tls.Certificate{cert},
-		}
-	default:
-		return nil, errors.New("hub: TLS certificate/key or AutoTLS is required")
-	}
-	base.MinVersion = tls.VersionTLS13
-	base.MaxVersion = tls.VersionTLS13
-	return base, nil
-}
-
-func generateEphemeralServerCert(canonicalOrigin string) (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate ephemeral TLS key: %w", err)
-	}
-	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serial, err := rand.Int(rand.Reader, serialLimit)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	dnsNames := []string{"localhost"}
-	ips := []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback}
-	if u, parseErr := url.Parse(canonicalOrigin); parseErr == nil {
-		host := u.Hostname()
-		if ip := net.ParseIP(host); ip != nil {
-			ips = append(ips, ip)
-		} else if host != "" && host != "localhost" {
-			dnsNames = append(dnsNames, host)
-		}
-	}
-	now := time.Now()
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "lighthouse-hub"},
-		DNSNames:              dnsNames,
-		IPAddresses:           ips,
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create ephemeral TLS cert: %w", err)
-	}
-	return tls.Certificate{
-		Certificate: [][]byte{der},
-		PrivateKey:  priv,
-	}, nil
-}
-
 // HTTPSAddr returns the bound TCP address of the HTTPS/WSS server.
 func (s *Server) HTTPSAddr() net.Addr {
 	return s.httpsListener.Addr()
@@ -563,9 +468,14 @@ func (s *Server) TCPOnly() bool {
 	return s.cfg.TCPOnly
 }
 
-// PassphraseRequired reports whether the hub requires an offline passphrase proof to register.
-func (s *Server) PassphraseRequired() bool {
-	return s.hasPassphrase
+// TLSAlgorithm returns the key algorithm of the hub's active TLS 1.3 certificate.
+func (s *Server) TLSAlgorithm() identity.Algorithm {
+	return s.tlsAlgorithm
+}
+
+// TLSPersisted reports whether the hub's TLS certificate/key are persisted on disk.
+func (s *Server) TLSPersisted() bool {
+	return s.tlsPersisted
 }
 
 // STUNSDTLSAddr returns the bound DTLS 1.3 / UDP STUNS/TURNS address, or nil if disabled.
@@ -668,7 +578,18 @@ func (s *Server) Stats() Stats {
 	for _, list := range s.sessions {
 		active += len(list)
 	}
-	activeChannels := len(s.channels)
+	rooms := make(map[string]struct{}, len(s.channels)+len(s.channelSubs))
+	for chID, members := range s.channels {
+		if len(members) > 0 {
+			rooms[chID] = struct{}{}
+		}
+	}
+	for chID, subs := range s.channelSubs {
+		if len(subs) > 0 {
+			rooms[chID] = struct{}{}
+		}
+	}
+	activeChannels := len(rooms)
 	s.mu.RUnlock()
 
 	var stunStats stunserver.Stats
@@ -815,12 +736,11 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 	challengeExp := now.Add(s.cfg.ChallengeTTL)
 
 	chalRaw, err := json.Marshal(protocol.ChallengeMessage{
-		V:                  protocol.Version,
-		Type:               protocol.TypeChallenge,
-		Challenge:          challenge,
-		HubOrigin:          s.hubOrigin,
-		ExpiresAt:          challengeExp.Unix(),
-		PassphraseRequired: s.hasPassphrase,
+		V:         protocol.Version,
+		Type:      protocol.TypeChallenge,
+		Challenge: challenge,
+		HubOrigin: s.hubOrigin,
+		ExpiresAt: challengeExp.Unix(),
 	})
 	if err != nil {
 		_ = conn.Close(websocket.StatusInternalError, "internal_error")
@@ -951,11 +871,6 @@ func (s *Server) authenticateRegistration(
 	}
 	if err := identity.VerifyRegistrationChallenge(pub, reg.PeerID, expectedChallenge, s.hubOrigin, reg.Proof); err != nil {
 		return nil, protocol.ErrCodeAuthFailed, "invalid challenge proof"
-	}
-	if s.hasPassphrase {
-		if err := identity.VerifyHubPassphraseProofWithKey(s.hubKey, expectedChallenge, s.hubOrigin, reg.PeerID, reg.HubAuth); err != nil {
-			return nil, protocol.ErrCodeAuthFailed, "invalid hub passphrase proof"
-		}
 	}
 
 	assignedIP, err := identity.VirtualIPv4InPrefix(reg.PeerID, s.virtualCIDR)
@@ -1529,7 +1444,8 @@ func (s *Server) onlineSessions(peerID string) []*peerSession {
 
 func (s *Server) reapLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(5 * time.Second)
+	interval := min(5*time.Second, max(50*time.Millisecond, s.cfg.PresenceTTL/2))
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -1573,6 +1489,40 @@ func (s *Server) reapExpired() {
 
 	for _, ps := range expired {
 		s.unregisterSession(ps)
+	}
+
+	// Ensure any empty or orphaned passphrase rooms are removed once zero live peers remain.
+	var prunedBroadcastRooms []string
+	s.mu.Lock()
+	for chID, subs := range s.channelSubs {
+		for sub := range subs {
+			if sub.closed.Load() || nowNano > sub.expiresAt.Load() {
+				delete(subs, sub)
+			}
+		}
+		if len(subs) == 0 {
+			delete(s.channelSubs, chID)
+		}
+	}
+	for chID, members := range s.channels {
+		removed := false
+		for pid := range members {
+			if len(s.sessions[pid]) == 0 {
+				delete(members, pid)
+				removed = true
+			}
+		}
+		if len(members) == 0 {
+			delete(s.channels, chID)
+		}
+		if removed {
+			prunedBroadcastRooms = append(prunedBroadcastRooms, chID)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, chID := range prunedBroadcastRooms {
+		s.notifyChannelSubscribers(chID)
 	}
 }
 

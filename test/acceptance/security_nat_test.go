@@ -750,8 +750,8 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 	_ = wan.AddNet(netB)
 
 	var (
-		tamperNextCiphertext atomic.Bool
-		tamperedCount        atomic.Uint64
+		tamperActive  atomic.Bool
+		tamperedCount atomic.Uint64
 	)
 
 	wan.AddChunkFilter(func(c vnet.Chunk) bool {
@@ -760,7 +760,7 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 		data := c.UserData()
 		if src == "198.51.100.41" && dst == "198.51.100.42" && len(data) > 32 &&
 			dtlsProtocol.IsDTLS13Ciphertext(dtlsProtocol.ContentType(data[0])) {
-			if tamperNextCiphertext.CompareAndSwap(true, false) {
+			if tamperActive.Load() {
 				data[len(data)-1] ^= 0xff
 				data[len(data)-5] ^= 0xa5
 				tamperedCount.Add(1)
@@ -829,7 +829,7 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 	t.Fatal("packet/v1 failed to open during warmup")
 
 packetOpen:
-	tamperNextCiphertext.Store(true)
+	tamperActive.Store(true)
 	poisoned := []byte("FORGED-OR-CORRUPTED-PAYLOAD-MUST-NOT-ARRIVE")
 	if err := sessA.SendPacket(ctx, poisoned); err != nil {
 		t.Fatal(err)
@@ -838,6 +838,8 @@ packetOpen:
 	for tamperedCount.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
+	time.Sleep(30 * time.Millisecond)
+	tamperActive.Store(false)
 	if tamperedCount.Load() == 0 {
 		t.Fatal("T13: tamper filter did not intercept DTLS 1.3 ciphertext")
 	}

@@ -372,9 +372,10 @@ func TestUniversalPublicRelayAutoProvisionedAcrossSymmetricNATs(t *testing.T) {
 	t.Logf("Universal Public Relay Verified: Pair=%s DTLS=%s", diag.SelectedPair, diag.DTLSVersion)
 }
 
-// TestHubOfflinePassphraseGate verifies that a hub configured with an offline shared
-// passphrase rejects missing/wrong passphrases and admits matching peers via HMAC proof.
-func TestHubOfflinePassphraseGate(t *testing.T) {
+// TestBlindedHubRoomIsolationAndEmptyRoomReaping verifies that the blinded hub admits all peers
+// without a hub-level passphrase, creates isolated rooms dynamically per client passphrase,
+// enforces room-scoped auto-ACL, and prunes empty rooms once all peers disconnect.
+func TestBlindedHubRoomIsolationAndEmptyRoomReaping(t *testing.T) {
 	t.Parallel()
 
 	ids := newTestMeshIdentities(t)
@@ -390,7 +391,6 @@ func TestHubOfflinePassphraseGate(t *testing.T) {
 		HTTPSListener:   rawLn,
 		TLSConfig:       pki.serverTLS,
 		HubOrigin:       "wss://" + boundAddr,
-		Passphrase:      "offline-vault-key",
 		EnableSTUN:      true,
 		STUNSListenAddr: "127.0.0.1:0",
 	})
@@ -400,41 +400,74 @@ func TestHubOfflinePassphraseGate(t *testing.T) {
 	}
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Missing passphrase rejected.
-	noPass, _ := peer.NewClient(&peer.Config{
-		KeyPair:      ids.peerA,
-		SignalingURL: wsURL,
-		TLSConfig:    pki.clientTLS,
+	clientA, _ := peer.NewClient(&peer.Config{
+		KeyPair:         ids.peerA,
+		SignalingURL:    wsURL,
+		TLSConfig:       pki.clientTLS,
+		STUNServerURI:   "stuns:" + srv.STUNSAddr().String(),
+		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
-	defer noPass.Close()
-	if err := noPass.Register(ctx); err == nil {
-		t.Fatal("expected registration without hub passphrase to fail")
+	clientB, _ := peer.NewClient(&peer.Config{
+		KeyPair:         ids.peerB,
+		SignalingURL:    wsURL,
+		TLSConfig:       pki.clientTLS,
+		STUNServerURI:   "stuns:" + srv.STUNSAddr().String(),
+		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
+	})
+	clientC, _ := peer.NewClient(&peer.Config{
+		KeyPair:         ids.peerC,
+		SignalingURL:    wsURL,
+		TLSConfig:       pki.clientTLS,
+		STUNServerURI:   "stuns:" + srv.STUNSAddr().String(),
+		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
+	})
+
+	if err := clientA.Register(ctx); err != nil {
+		t.Fatalf("Register A: %v", err)
+	}
+	if err := clientB.Register(ctx); err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
+	if err := clientC.Register(ctx); err != nil {
+		t.Fatalf("Register C: %v", err)
 	}
 
-	// Wrong passphrase rejected.
-	wrongPass, _ := peer.NewClient(&peer.Config{
-		KeyPair:       ids.peerA,
-		SignalingURL:  wsURL,
-		HubPassphrase: "wrong-key",
-		TLSConfig:     pki.clientTLS,
-	})
-	defer wrongPass.Close()
-	if err := wrongPass.Register(ctx); err == nil {
-		t.Fatal("expected registration with wrong hub passphrase to fail")
+	// Room 1 ("alpha-room"): A broadcasts, B joins. Room 2 ("beta-room"): C broadcasts.
+	if _, err := clientA.SetBroadcast(ctx, true, "alpha-room", "NodeA"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientB.JoinChannel(ctx, "alpha-room"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientC.SetBroadcast(ctx, true, "beta-room", "NodeC"); err != nil {
+		t.Fatal(err)
 	}
 
-	// Matching passphrase admitted.
-	rightPass, _ := peer.NewClient(&peer.Config{
-		KeyPair:       ids.peerA,
-		SignalingURL:  wsURL,
-		HubPassphrase: "offline-vault-key",
-		TLSConfig:     pki.clientTLS,
-	})
-	defer rightPass.Close()
-	if err := rightPass.Register(ctx); err != nil {
-		t.Fatalf("expected matching hub passphrase to register: %v", err)
+	// Cross-room connection MUST be blocked by hub auto-ACL.
+	if _, err := clientB.Connect(ctx, ids.peerC.PeerID); !errors.Is(err, peer.ErrNotAuthorized) {
+		t.Fatalf("expected ErrNotAuthorized across different passphrase rooms, got %v", err)
 	}
+	if st := srv.Stats(); st.ActiveChannels != 2 {
+		t.Fatalf("expected 2 active passphrase rooms, got %+v", st)
+	}
+
+	// Close all peers -> empty rooms MUST be removed automatically.
+	_ = clientA.Close()
+	_ = clientB.Close()
+	_ = clientC.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := srv.Stats(); st.ActiveSessions == 0 && st.ActiveChannels == 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("expected empty rooms removed after all peers leave, got %+v", srv.Stats())
 }

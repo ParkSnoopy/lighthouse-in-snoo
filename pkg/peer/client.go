@@ -59,7 +59,6 @@ type Config struct {
 	KeyPair       *identity.KeyPair
 	SignalingURL  string // e.g. wss://hub.example.com/v1/signal
 	HubOrigin     string // Optional explicit canonical origin; derived from SignalingURL if empty.
-	HubPassphrase string // Optional offline passphrase when connecting to a passphrase-gated hub.
 	TLSConfig     *tls.Config
 	HTTPTransport http.RoundTripper // Optional custom transport (e.g. for tests).
 
@@ -800,19 +799,6 @@ func (c *Client) Register(ctx context.Context) error {
 		return err
 	}
 
-	hubAuth := ""
-	if chal.PassphraseRequired || strings.TrimSpace(c.cfg.HubPassphrase) != "" {
-		if strings.TrimSpace(c.cfg.HubPassphrase) == "" {
-			_ = conn.CloseNow()
-			return errors.New("peer: hub requires an offline passphrase")
-		}
-		hubAuth, err = identity.SignHubPassphraseProof(c.cfg.HubPassphrase, chal.Challenge, c.hubOrigin, c.cfg.KeyPair.PeerID)
-		if err != nil {
-			_ = conn.CloseNow()
-			return err
-		}
-	}
-
 	regPayload, err := json.Marshal(protocol.RegisterMessage{
 		V:         protocol.Version,
 		Type:      protocol.TypeRegister,
@@ -821,7 +807,6 @@ func (c *Client) Register(ctx context.Context) error {
 		HubOrigin: c.hubOrigin,
 		Challenge: chal.Challenge,
 		Proof:     proof,
-		HubAuth:   hubAuth,
 	})
 	if err != nil {
 		_ = conn.CloseNow()
@@ -2213,11 +2198,19 @@ func (s *Session) onIncomingDataChannel(gen uint32, pc *webrtc.PeerConnection, d
 }
 
 func (s *Session) startAsOfferer(ctx context.Context, gen uint32) error {
+	s.sendSignalMu.Lock()
 	s.mu.Lock()
+	if gen == 0 && !s.isInitiator {
+		s.mu.Unlock()
+		s.sendSignalMu.Unlock()
+		return nil
+	}
 	oldPC := s.resetGenerationLocked(gen)
 	s.isInitiator = true
 	pc, err := s.newPeerConnectionLocked(gen, true)
+	origSID := s.sessionID
 	s.mu.Unlock()
+	s.sendSignalMu.Unlock()
 	if oldPC != nil {
 		_ = oldPC.Close()
 	}
@@ -2229,16 +2222,40 @@ func (s *Session) startAsOfferer(ctx context.Context, gen uint32) error {
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
+		s.mu.Lock()
+		superseded := s.pc != pc || s.sessionID != origSID || !s.isInitiator
+		s.mu.Unlock()
+		if superseded {
+			return nil
+		}
 		return err
 	}
 	s.mu.Lock()
+	if s.pc != pc || s.sessionID != origSID || !s.isInitiator {
+		s.mu.Unlock()
+		return nil
+	}
 	s.localICEUfrag = extractICEUfragFromSDP(offer.SDP)
 	s.mu.Unlock()
 	if err := pc.SetLocalDescription(offer); err != nil {
+		s.mu.Lock()
+		superseded := s.pc != pc || s.sessionID != origSID || !s.isInitiator
+		s.mu.Unlock()
+		if superseded {
+			return nil
+		}
 		return err
 	}
 
-	if err := s.sendSignedEnvelope(ctx, gen, protocol.TypeOffer, protocol.SDPBody{SDP: offer.SDP}); err != nil {
+	if err := s.sendSignedEnvelopeBound(ctx, origSID, gen, pc, protocol.TypeOffer, protocol.SDPBody{SDP: offer.SDP}); err != nil {
+		if errors.Is(err, ErrStaleGeneration) {
+			s.mu.Lock()
+			superseded := s.pc != pc || s.sessionID != origSID || !s.isInitiator
+			s.mu.Unlock()
+			if superseded {
+				return nil
+			}
+		}
 		return err
 	}
 	s.flushLocalCandidates(gen)
@@ -2246,12 +2263,14 @@ func (s *Session) startAsOfferer(ctx context.Context, gen uint32) error {
 }
 
 func (s *Session) adoptWinningRemoteOffer(env *protocol.SignalEnvelope, raw []byte, remotePub identity.PublicKey) error {
+	s.sendSignalMu.Lock()
 	s.mu.Lock()
 	oldPC := s.resetGenerationLocked(env.Generation)
 	s.sessionID = env.SessionID
 	s.remotePub = remotePub
 	s.isInitiator = false
 	s.mu.Unlock()
+	s.sendSignalMu.Unlock()
 	if oldPC != nil {
 		_ = oldPC.Close()
 	}
@@ -2644,11 +2663,24 @@ func (s *Session) flushLocalCandidates(gen uint32) {
 }
 
 func (s *Session) sendSignedEnvelope(ctx context.Context, gen uint32, msgType string, body any) error {
+	return s.sendSignedEnvelopeBound(ctx, "", gen, nil, msgType, body)
+}
+
+func (s *Session) sendSignedEnvelopeBound(
+	ctx context.Context,
+	expectedSID string,
+	gen uint32,
+	expectedPC *webrtc.PeerConnection,
+	msgType string,
+	body any,
+) error {
 	s.sendSignalMu.Lock()
 	defer s.sendSignalMu.Unlock()
 
 	s.mu.Lock()
-	if s.generation != gen || s.remotePeerID == "" {
+	if s.generation != gen || s.remotePeerID == "" ||
+		(expectedSID != "" && s.sessionID != expectedSID) ||
+		(expectedPC != nil && s.pc != expectedPC) {
 		s.mu.Unlock()
 		return ErrStaleGeneration
 	}

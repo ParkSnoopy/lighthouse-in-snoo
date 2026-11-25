@@ -1,10 +1,10 @@
 # Fyne UI, passphrase broadcast, explicit consent, and TUN routing
 
-The Fyne desktop application (`lighthouse-ui`) binds a local OS TUN virtual network interface (`lh0`, `100.64.0.0/10`), isolates peer discovery strictly by offline passphrase, gates every incoming connection behind an explicit Allow / Deny / Blacklist prompt, auto-adopts the hub's universal relay when behind restrictive NATs, and enforces cryptographic source-IP anti-spoofing on TUN packets.
+The Fyne desktop application (`lighthouse-ui`) binds a local OS TUN virtual network interface (`lh0`, hub-assigned CIDR default `10.88.0.0/16`), isolates peer discovery and connections strictly by offline passphrase room, gates every incoming connection behind an explicit Allow / Deny / Blacklist prompt, auto-adopts the hub's universal relay when behind restrictive NATs, and enforces cryptographic source-IP anti-spoofing on TUN packets.
 
 ## Sub-features
 
-- `ui-binary-cli` compiles `lighthouse-ui` with single-source version alignment and `--ifname`, `--hub`, `--hub-passphrase`, `--blacklist`, and `--tcp-only` options.
+- `ui-binary-cli` compiles `lighthouse-ui` with single-source version alignment and `--ifname`, `--hub`, `--blacklist`, and `--tcp-only` options.
 - `ui-consent-modal` prompts with verified peer ID, key algorithm, virtual IP, and DTLS fingerprint and enforces explicit Allow, Deny, and Blacklist actions.
 - `broadcast-passphrase-scope` restricts peer discovery and AEAD-sealed peer labels strictly to peers sharing the exact offline passphrase.
 - `tun-routing-antispoof` routes bidirectional IPv4 packets across authorized DTLS 1.3 tunnels and drops spoofed-source or unrouted packets.
@@ -21,9 +21,9 @@ Preconditions:
 
 - Default run is launched (`"$CTRL" launch --run-id ui-tun`) and `"$CTRL" doctor --run-dir "$RUN_DIR"` reports `"healthy": true`.
 
-- **Confirm `lighthouse-ui` version and CLI flags.** Run `"$CTRL" cli --run-dir "$RUN_DIR" --bin ui --capture "ui-tun/ui-version.txt" -- --version` and `"$CTRL" cli --run-dir "$RUN_DIR" --bin ui --capture "ui-tun/ui-help.txt" -- --help`. Version matches `pkg/version/version.go` and help lists `--ifname`, `--hub`, `--hub-passphrase`, `--blacklist`, and `--tcp-only`.
+- **Confirm `lighthouse-ui` version and CLI flags.** Run `"$CTRL" cli --run-dir "$RUN_DIR" --bin ui --capture "ui-tun/ui-version.txt" -- --version` and `"$CTRL" cli --run-dir "$RUN_DIR" --bin ui --capture "ui-tun/ui-help.txt" -- --help`. Version matches `pkg/version/version.go` and help lists `--ifname`, `--hub`, `--blacklist`, and `--tcp-only`.
 - **Confirm headless Fyne UI controller, TUN router, and anti-spoofing under `-race`.** Run `mkdir -p "$EVIDENCE_DIR/ui-tun" && go test -race -v ./internal/ui ./pkg/tun > "$EVIDENCE_DIR/ui-tun/ui-tun-tests.txt"`. Exit code `0`, zero data races.
-- **Confirm passphrase broadcast isolation, explicit consent, universal relay, and hub passphrase gate under `-race`.** Run `go test -race -v ./test/acceptance -run 'TestPassphraseBroadcastIsolationAndUserConsent|TestUniversalPublicRelayAutoProvisionedAcrossSymmetricNATs|TestHubOfflinePassphraseGate' > "$EVIDENCE_DIR/ui-tun/acceptance.txt"`. Exit code `0`.
+- **Confirm passphrase broadcast isolation, explicit consent, universal relay, and blinded room reaping under `-race`.** Run `go test -race -v ./test/acceptance -run 'TestPassphraseBroadcastIsolationAndUserConsent|TestUniversalPublicRelayAutoProvisionedAcrossSymmetricNATs|TestBlindedHubRoomIsolationAndEmptyRoomReaping' > "$EVIDENCE_DIR/ui-tun/acceptance.txt"`. Exit code `0`.
 - **Proof.** Run `"$CTRL" capture --run-dir "$RUN_DIR" --feature "ui-tun" --note "Fyne UI binary + headless consent/TUN/broadcast/universal relay proof"`.
 
 ## Gotchas

@@ -1,7 +1,6 @@
 package identity
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -29,7 +28,6 @@ const (
 	// DefaultVirtualCIDRString is the default IPv4 virtual network CIDR for Lighthouse TUN peers.
 	DefaultVirtualCIDRString = "10.88.0.0/16"
 
-	domainHubAuthV2 = "LIGHTHOUSE-HUB-AUTH-V2\x00"
 	domainTunIPv4V2 = "LIGHTHOUSE-TUN-IPV4-V2\x00"
 
 	argonTime    uint32 = 1
@@ -39,7 +37,6 @@ const (
 
 var (
 	channelSalt        = []byte("LIGHTHOUSE-CHANNEL-V2")
-	hubKeySalt         = []byte("LIGHTHOUSE-HUB-KEY-V2")
 	defaultVirtualCIDR = netip.MustParsePrefix(DefaultVirtualCIDRString)
 )
 
@@ -134,64 +131,6 @@ func OpenBroadcastMeta(authKey [chacha20poly1305.KeySize]byte, peerID, channelID
 		return BroadcastMeta{}, ErrInvalidSealedMeta
 	}
 	return meta, nil
-}
-
-// DeriveHubKey derives a 32-byte MAC key from an optional offline hub passphrase.
-func DeriveHubKey(passphrase string) ([32]byte, error) {
-	var out [32]byte
-	if strings.TrimSpace(passphrase) == "" {
-		return out, ErrEmptyPassphrase
-	}
-	raw := argon2.IDKey([]byte(passphrase), hubKeySalt, argonTime, argonMemory, argonThreads, 32)
-	copy(out[:], raw)
-	return out, nil
-}
-
-// SignHubPassphraseProof computes a challenge-bound HMAC proof for a hub passphrase
-// without transmitting the passphrase itself.
-func SignHubPassphraseProof(passphrase, challenge, hubOrigin, peerID string) (string, error) {
-	key, err := DeriveHubKey(passphrase)
-	if err != nil {
-		return "", err
-	}
-	return SignHubPassphraseProofWithKey(key, challenge, hubOrigin, peerID)
-}
-
-// SignHubPassphraseProofWithKey computes the challenge-bound HMAC proof from a pre-derived hub key.
-func SignHubPassphraseProofWithKey(hubKey [32]byte, challenge, hubOrigin, peerID string) (string, error) {
-	origin, err := CanonicalizeOrigin(hubOrigin)
-	if err != nil {
-		return "", err
-	}
-	if challenge == "" {
-		return "", ErrInvalidProof
-	}
-	if err := ValidatePeerID(peerID); err != nil {
-		return "", err
-	}
-	mac := hmac.New(sha256.New, hubKey[:])
-	_, _ = mac.Write([]byte(domainHubAuthV2))
-	_, _ = mac.Write([]byte(challenge))
-	_, _ = mac.Write([]byte{0})
-	_, _ = mac.Write([]byte(origin))
-	_, _ = mac.Write([]byte{0})
-	_, _ = mac.Write([]byte(peerID))
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
-}
-
-// VerifyHubPassphraseProofWithKey validates a challenge-bound hub passphrase proof in constant time.
-func VerifyHubPassphraseProofWithKey(hubKey [32]byte, challenge, hubOrigin, peerID, proof string) error {
-	if proof == "" {
-		return ErrInvalidProof
-	}
-	expected, err := SignHubPassphraseProofWithKey(hubKey, challenge, hubOrigin, peerID)
-	if err != nil {
-		return err
-	}
-	if !hmac.Equal([]byte(expected), []byte(proof)) {
-		return ErrInvalidProof
-	}
-	return nil
 }
 
 // DefaultVirtualCIDR returns the default Lighthouse virtual IPv4 subnet (10.88.0.0/16).

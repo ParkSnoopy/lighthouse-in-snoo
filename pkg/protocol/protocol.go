@@ -164,15 +164,14 @@ func IsPeerSignalType(msgType string) bool {
 
 // ChallengeMessage is sent by Hub -> Peer upon WSS connection.
 type ChallengeMessage struct {
-	V                  int    `json:"v"`
-	Type               string `json:"type"`
-	Challenge          string `json:"challenge"`
-	HubOrigin          string `json:"hub_origin"`
-	ExpiresAt          int64  `json:"expires_at"`
-	PassphraseRequired bool   `json:"passphrase_required,omitempty"`
+	V         int    `json:"v"`
+	Type      string `json:"type"`
+	Challenge string `json:"challenge"`
+	HubOrigin string `json:"hub_origin"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
-// RegisterMessage is sent by Peer -> Hub to prove identity key ownership and optional hub passphrase.
+// RegisterMessage is sent by Peer -> Hub to prove identity key ownership.
 type RegisterMessage struct {
 	V         int    `json:"v"`
 	Type      string `json:"type"`
@@ -181,7 +180,6 @@ type RegisterMessage struct {
 	HubOrigin string `json:"hub_origin"`
 	Challenge string `json:"challenge"`
 	Proof     string `json:"proof"`
-	HubAuth   string `json:"hub_auth,omitempty"`
 }
 
 // RelayInfo advertises universal public relay URIs and ephemeral credentials minted by the hub.

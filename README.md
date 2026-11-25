@@ -25,8 +25,8 @@ flowchart TB
     A <-->|"End-to-End Encrypted DTLS 1.3 Tunnel (IPv4 over TUN)"| B
 ```
 
-1. **Zero-Config Universal Hub & Relay**: `lighthouse hub` runs without static ACL files or databases. It serves TLS 1.3 WSS signaling, an integrated DTLS 1.3 / UDP STUNS + TURNS relay, assigns each peer a deterministic virtual IPv4 address from the hub's configured `--cidr` (`LIGHTHOUSE_CIDR`, default `10.88.0.0/16`), and enforces automatic server-side ACL based on passphrase channel membership and active broadcast status. Operators running a private hub may optionally set `--passphrase` (`LIGHTHOUSE_PASSPHRASE`) to restrict hub registration via an offline shared passphrase.
-2. **Passphrase-Scoped Broadcasting & Auto-ACL**: Broadcasting is off by default. When a peer enables broadcast under an offline shared passphrase, only peers joined to that exact passphrase discover it and are automatically permitted by the hub to initiate connection offers to it. Turning broadcast off immediately blocks new incoming connection attempts at the hub. The raw passphrase is never sent over the network.
+1. **Blinded Zero-Config Universal Hub & Relay**: `lighthouse hub` runs as an open blinded relay with no hub passphrase, static ACL files, or databases. It serves TLS 1.3 WSS signaling, an integrated DTLS 1.3 / UDP STUNS + TURNS relay, generates and persists its own TLS 1.3 certificate and key on initial container startup using `--tls-algo` (`LIGHTHOUSE_TLS_ALGO`, default `ed25519`), assigns each peer a deterministic virtual IPv4 address from `--cidr` (`LIGHTHOUSE_CIDR`, default `10.88.0.0/16`), enforces automatic room-scoped ACL, and prunes empty rooms when peers leave or expire.
+2. **Passphrase-Scoped Rooms & Auto-ACL**: Any client-side passphrase dynamically forms an isolated blinded room. Broadcasting is off by default. When a peer enables broadcast in a room, only peers joined to that exact passphrase discover it and are automatically permitted by the hub to initiate connection offers to it. Turning broadcast off immediately blocks new incoming connection attempts, and empty rooms with zero active peers are automatically removed. The raw passphrase is never sent over the network.
 3. **Explicit User Consent & Blacklist**: Every peer holds a local cryptographic identity (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, or `rsa`) assigned an IP from the hub's CIDR upon registration. Incoming connection requests display the verified peer ID, key algorithm, virtual IP, and DTLS fingerprint and require explicit **Allow**, **Deny**, or **Blacklist** action. Blacklisted peers are dropped immediately and blocked from future offers.
 4. **Bound Virtual Network Interface**: Allowing a peer installs a route on the local TUN interface (`lh0`) backed by an end-to-end DTLS 1.3 WebRTC tunnel with source-IP anti-spoofing. UDP is prioritized by default; pass `--tcp-only` to disable UDP completely and operate over TLS 1.3 / TCP and ICE-TCP, or `--insecure` to allow plaintext `stun:`/`turn:`.
 
@@ -52,21 +52,19 @@ All `LIGHTHOUSE_*` environment variables and optional local `.env` entries are r
 
 ### 2. Run the Universal Hub
 
-Start with zero configuration (ephemeral self-signed TLS + universal DTLS 1.3 / UDP relay):
+Start with zero configuration (auto-generated Ed25519 TLS 1.3 cert + universal DTLS 1.3 / UDP relay):
 
 ```bash
 ./bin/lighthouse hub
 ```
 
-Run with a TLS certificate and an optional offline hub passphrase:
+Run with an explicit TLS key algorithm (`ed25519`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) and advertised origin. On initial `docker run` or `docker compose up`, the hub generates `/etc/lighthouse/tls.crt` and `/etc/lighthouse/tls.key` using `LIGHTHOUSE_TLS_ALGO` and reuses them across restarts:
 
 ```bash
 ./bin/lighthouse hub \
-  --tls-cert tls.crt \
-  --tls-key tls.key \
+  --tls-algo ed25519 \
   --hub-origin wss://hub.example.com \
-  --turn-public-ip 203.0.113.10 \
-  --passphrase "<OFFLINE_SHARED_PASSPHRASE>"
+  --turn-public-ip 203.0.113.10
 ```
 
 | Flag | Environment Variable | Default | Description |
@@ -74,7 +72,8 @@ Run with a TLS certificate and an optional offline hub passphrase:
 | `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS/WSS signaling |
 | `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | Encrypted STUNS/TURNS address (UDP default; TCP with `--tcp-only`) |
 | `--cidr` | `LIGHTHOUSE_CIDR` | `10.88.0.0/16` | Virtual IPv4 subnet CIDR assigned to connected peers |
-| `-P, --passphrase` | `LIGHTHOUSE_PASSPHRASE` | *(open)* | Optional offline shared passphrase gating hub registration |
+| `--tls-algo` | `LIGHTHOUSE_TLS_ALGO` | `ed25519` | TLS/DTLS key algorithm generated on initial run (`ed25519`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) |
+| `--tls-rsa-bits` | `LIGHTHOUSE_TLS_RSA_BITS` | `3072` | RSA modulus bit length when `--tls-algo=rsa` (`2048`–`8192`) |
 | `--no-relay` | `LIGHTHOUSE_NO_RELAY` | `false` | Disable integrated universal TURNS relay |
 | `--turn-public-ip` | `LIGHTHOUSE_TURN_PUBLIC_IP` | *(auto)* | Public IP advertised in TURN relay allocations |
 | `--turn-advertise-host` | `LIGHTHOUSE_TURN_ADVERTISE_HOST` | *(auto)* | Host advertised to peers in universal relay URIs |
@@ -82,8 +81,6 @@ Run with a TLS certificate and an optional offline hub passphrase:
 | `--turn-realm` | `LIGHTHOUSE_TURN_REALM` | `lighthouse` | TURN authentication realm |
 | `--turn-tls-addr` | `LIGHTHOUSE_TURN_TLS_ADDR` | *(disabled)* | Optional TLS 1.3 / TCP TURNS fallback address |
 | `--hub-origin` | `LIGHTHOUSE_HUB_ORIGIN` | `wss://localhost:8443` | Canonical WSS origin verified during registration |
-| `--tls-cert` | `LIGHTHOUSE_TLS_CERT` | *(ephemeral)* | TLS/DTLS certificate PEM path |
-| `--tls-key` | `LIGHTHOUSE_TLS_KEY` | *(ephemeral)* | TLS/DTLS private key PEM path |
 | `--tcp-only` | `LIGHTHOUSE_TCP_ONLY` | `false` | Disable UDP; serve STUNS over TLS 1.3 / TCP only |
 | `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Opt in to plaintext `stun:`/`turn:` listener on `--stun-addr` |
 | `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext STUN/TURN address (requires `--insecure`, default `:3478`) |
@@ -106,7 +103,6 @@ Inside the app:
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
 | `--hub` | `LIGHTHOUSE_HUB_URL` | `wss://localhost:8443/v1/signal` | Universal hub WSS signaling URL |
-| `--hub-passphrase` | `LIGHTHOUSE_PASSPHRASE` | *(none)* | Optional offline hub registration passphrase |
 | `--ifname` | `LIGHTHOUSE_IFNAME` | `lh0` | OS TUN virtual network interface name |
 | `--ca` | `LIGHTHOUSE_CA` | *(system)* | Optional PEM Root CA bundle |
 | `-s, --stun` | `LIGHTHOUSE_STUN_URI` | *(auto)* | Optional explicit STUNS/TURNS URI |

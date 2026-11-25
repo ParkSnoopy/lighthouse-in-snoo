@@ -75,7 +75,7 @@ cmd_launch() {
   local insecure="false"
   local no_relay="false"
   local auto_tls="false"
-  local passphrase=""
+  local tls_algo="ed25519"
   local evidence_base="/tmp/lighthouse-verify-evidence"
 
   while [ $# -gt 0 ]; do
@@ -85,7 +85,7 @@ cmd_launch() {
       --insecure) insecure="true"; shift ;;
       --no-relay) no_relay="true"; shift ;;
       --auto-tls) auto_tls="true"; shift ;;
-      --passphrase) passphrase="$2"; shift 2 ;;
+      --tls-algo) tls_algo="$2"; shift 2 ;;
       --evidence-dir) evidence_base="$2"; shift 2 ;;
       *) die "unknown launch option: $1" ;;
     esac
@@ -159,6 +159,8 @@ EOF
   )
   if [ "$auto_tls" != "true" ]; then
     hub_args+=(--tls-cert "$run_dir/tls/server.crt" --tls-key "$run_dir/tls/server.key")
+  else
+    hub_args+=(--tls-algo "$tls_algo")
   fi
   if [ "$tcp_only" = "true" ]; then
     hub_args+=(--tcp-only)
@@ -168,9 +170,6 @@ EOF
   fi
   if [ "$no_relay" = "true" ]; then
     hub_args+=(--no-relay)
-  fi
-  if [ -n "$passphrase" ]; then
-    hub_args+=(--passphrase "$passphrase")
   fi
 
   (
@@ -213,10 +212,9 @@ EOF
     die "hub failed readiness check within timeout"
   fi
 
-  local hub_ver ui_ver passphrase_gated="false"
+  local hub_ver ui_ver
   hub_ver="$(run_clean_env "$hub_bin" --version | awk '{print $2}')"
   ui_ver="$(run_clean_env "$ui_bin" --version | awk '{print $2}')"
-  [ -z "$passphrase" ] || passphrase_gated="true"
 
   jq -n \
     --arg run_id "$run_id" \
@@ -238,7 +236,7 @@ EOF
     --argjson insecure "$insecure" \
     --argjson no_relay "$no_relay" \
     --argjson auto_tls "$auto_tls" \
-    --argjson passphrase_gated "$passphrase_gated" \
+    --arg tls_algo "$tls_algo" \
     '{
       run_id: $run_id,
       run_dir: $run_dir,
@@ -259,7 +257,7 @@ EOF
       insecure: $insecure,
       no_relay: $no_relay,
       auto_tls: $auto_tls,
-      passphrase_gated: $passphrase_gated
+      tls_algo: $tls_algo
     }' > "$run_dir/state.json"
 
   cat "$run_dir/state.json"

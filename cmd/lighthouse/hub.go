@@ -23,7 +23,6 @@ func newHubCommand() *cli.Command {
 		stunsAddr        string
 		stunAddr         string
 		cidrStr          string
-		passphrase       string
 		tcpOnly          bool
 		insecure         bool
 		noRelay          bool
@@ -35,6 +34,8 @@ func newHubCommand() *cli.Command {
 		turnRelayMinPort int
 		turnRelayMaxPort int
 		hubOrigin        string
+		tlsAlgoStr       string
+		tlsRSABits       int
 		tlsCert          string
 		tlsKey           string
 		hbInterval       time.Duration
@@ -43,12 +44,12 @@ func newHubCommand() *cli.Command {
 
 	cmd := &cli.Command{
 		Name:       "hub",
-		ShortAbout: "Run the zero-config universal signaling hub and relay",
-		LongAbout:  "Run a Lighthouse signaling hub and universal DTLS 1.3/UDP STUNS+TURNS relay with hub-managed virtual IPv4 CIDR assignment (default 10.88.0.0/16) and automatic passphrase/broadcast ACL. Pass --passphrase to gate hub registration with an offline shared passphrase, or --tcp-only to disable UDP.",
+		ShortAbout: "Run the zero-config blinded universal signaling hub and relay",
+		LongAbout:  "Run a Lighthouse blinded signaling hub and universal DTLS 1.3/UDP STUNS+TURNS relay with hub-managed virtual IPv4 CIDR assignment (default 10.88.0.0/16), automatic passphrase-room ACL with empty-room pruning, and auto-generated TLS 1.3 certificates by algorithm (--tls-algo).",
 		Examples: []string{
 			"lighthouse hub",
-			"lighthouse hub --cidr 10.88.0.0/16 --passphrase <SECRET> --turn-public-ip 203.0.113.10",
-			"lighthouse hub --https-addr :8443 --stuns-addr :5349 --hub-origin wss://hub.example.com --tls-cert tls.crt --tls-key tls.key",
+			"lighthouse hub --cidr 10.88.0.0/16 --tls-algo ed25519 --turn-public-ip 203.0.113.10",
+			"lighthouse hub --https-addr :8443 --stuns-addr :5349 --hub-origin wss://hub.example.com --tls-algo nistp-256",
 			"lighthouse hub --tcp-only --stuns-addr :5349",
 			"lighthouse hub --insecure --stun-addr :3478",
 		},
@@ -85,13 +86,29 @@ func newHubCommand() *cli.Command {
 				return &cli.ExitError{Code: 2, Err: err}
 			}
 
+			tlsAlgo, err := hub.ParseTLSAlgorithm(tlsAlgoStr)
+			if err != nil {
+				fmt.Fprintf(ctx.Stderr, "error: invalid --tls-algo %q: %v\n", tlsAlgoStr, err)
+				return &cli.ExitError{Code: 2, Err: err}
+			}
+			if tlsRSABits != 0 && tlsAlgo != identity.AlgorithmRSA {
+				bitsErr := fmt.Errorf("invalid --tls-rsa-bits %d: only valid when --tls-algo=rsa", tlsRSABits)
+				fmt.Fprintf(ctx.Stderr, "error: %v\n", bitsErr)
+				return &cli.ExitError{Code: 2, Err: bitsErr}
+			}
+			if tlsAlgo == identity.AlgorithmRSA && tlsRSABits != 0 &&
+				(tlsRSABits < identity.MinRSABits || tlsRSABits > identity.MaxRSABits || tlsRSABits%8 != 0) {
+				bitsErr := fmt.Errorf("invalid --tls-rsa-bits %d (must be %d..%d, multiple of 8)", tlsRSABits, identity.MinRSABits, identity.MaxRSABits)
+				fmt.Fprintf(ctx.Stderr, "error: %v\n", bitsErr)
+				return &cli.ExitError{Code: 2, Err: bitsErr}
+			}
+
 			enableRelay := !noRelay && !tcpOnly
 			autoTLS := tlsCert == "" && tlsKey == ""
 
 			srv, err := hub.New(&hub.Config{
 				HTTPSListenAddr:    httpsAddr,
 				VirtualCIDR:        virtualCIDR,
-				Passphrase:         passphrase,
 				TCPOnly:            tcpOnly,
 				AllowInsecure:      insecure,
 				EnableSTUN:         true,
@@ -109,6 +126,9 @@ func newHubCommand() *cli.Command {
 				TLSCertFile:        tlsCert,
 				TLSKeyFile:         tlsKey,
 				AutoTLS:            autoTLS,
+				TLSDir:             hub.DefaultTLSDir,
+				TLSAlgorithm:       tlsAlgo,
+				TLSRSABits:         tlsRSABits,
 				PresenceHeartbeat:  hbInterval,
 				PresenceTTL:        presenceTTL,
 				Logger:             logger,
@@ -125,8 +145,9 @@ func newHubCommand() *cli.Command {
 				"stun_tcp_addr", fmt.Sprint(srv.STUNTCPAddr()),
 				"tcp_only", tcpOnly,
 				"relay_active", srv.TURNActive(),
-				"passphrase_gated", srv.PassphraseRequired(),
 				"auto_tls", autoTLS,
+				"tls_algo", string(srv.TLSAlgorithm()),
+				"tls_persisted", srv.TLSPersisted(),
 				"insecure", insecure,
 				"hub_origin", srv.HubOrigin(),
 				"virtual_cidr", srv.VirtualCIDR().String(),
@@ -175,14 +196,6 @@ func newHubCommand() *cli.Command {
 		LongHelp:  "IPv4 CIDR (/1../30) used by the hub to assign virtual TUN IPv4 addresses to registered peers",
 		EnvVar:    "LIGHTHOUSE_CIDR",
 		Default:   identity.DefaultVirtualCIDRString,
-	})
-	cmd.StringOpt(&passphrase, cli.Option{
-		Long:      "passphrase",
-		Short:     'P',
-		ValueName: "SECRET",
-		ShortHelp: "Optional offline hub passphrase",
-		LongHelp:  "Optional offline shared passphrase required to register on this hub (verified via challenge HMAC, never sent in plaintext)",
-		EnvVar:    "LIGHTHOUSE_PASSPHRASE",
 	})
 	cmd.BoolOpt(&tcpOnly, cli.Option{
 		Long:      "tcp-only",
@@ -251,17 +264,29 @@ func newHubCommand() *cli.Command {
 		EnvVar:    "LIGHTHOUSE_HUB_ORIGIN",
 		Default:   resolvedDefaultHubOrigin(),
 	})
+	cmd.StringOpt(&tlsAlgoStr, cli.Option{
+		Long:      "tls-algo",
+		ValueName: "ALGO",
+		ShortHelp: "TLS/DTLS key algorithm for auto-generated cert (ed25519, nistp-256, nistp-384, nistp-521, rsa)",
+		LongHelp:  "Key algorithm used to generate tls.crt/tls.key on initial run into /etc/lighthouse (or in memory when not writable)",
+		EnvVar:    "LIGHTHOUSE_TLS_ALGO",
+		Default:   string(hub.DefaultTLSAlgorithm),
+	})
+	cmd.IntOpt(&tlsRSABits, cli.Option{
+		Long:      "tls-rsa-bits",
+		ValueName: "BITS",
+		ShortHelp: "RSA modulus bit length when --tls-algo=rsa (2048..8192)",
+		EnvVar:    "LIGHTHOUSE_TLS_RSA_BITS",
+	})
 	cmd.StringOpt(&tlsCert, cli.Option{
 		Long:      "tls-cert",
 		ValueName: "PATH",
-		ShortHelp: "TLS/DTLS certificate PEM path (ephemeral self-signed if omitted)",
-		EnvVar:    "LIGHTHOUSE_TLS_CERT",
+		ShortHelp: "Optional explicit TLS/DTLS certificate PEM path override",
 	})
 	cmd.StringOpt(&tlsKey, cli.Option{
 		Long:      "tls-key",
 		ValueName: "PATH",
-		ShortHelp: "TLS/DTLS private key PEM path (ephemeral self-signed if omitted)",
-		EnvVar:    "LIGHTHOUSE_TLS_KEY",
+		ShortHelp: "Optional explicit TLS/DTLS private key PEM path override",
 	})
 	cmd.DurationOpt(&hbInterval, cli.Option{
 		Long:      "presence-heartbeat",

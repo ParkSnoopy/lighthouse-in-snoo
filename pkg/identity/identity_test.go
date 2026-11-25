@@ -232,39 +232,6 @@ func TestChannelPassphraseDerivationAndSealedMeta(t *testing.T) {
 	}
 }
 
-func TestHubPassphraseChallengeProof(t *testing.T) {
-	t.Parallel()
-
-	kp, err := identity.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
-	hubKey, err := identity.DeriveHubKey("private-hub-passphrase")
-	if err != nil {
-		t.Fatalf("DeriveHubKey: %v", err)
-	}
-	challenge := "0123456789abcdef0123456789abcdef0123456789a"
-	proof, err := identity.SignHubPassphraseProof("private-hub-passphrase", challenge, "wss://hub.example.com", kp.PeerID)
-	if err != nil {
-		t.Fatalf("SignHubPassphraseProof: %v", err)
-	}
-
-	if err := identity.VerifyHubPassphraseProofWithKey(hubKey, challenge, "wss://hub.example.com", kp.PeerID, proof); err != nil {
-		t.Fatalf("VerifyHubPassphraseProofWithKey: %v", err)
-	}
-
-	wrongKey, _ := identity.DeriveHubKey("wrong-passphrase")
-	if err := identity.VerifyHubPassphraseProofWithKey(wrongKey, challenge, "wss://hub.example.com", kp.PeerID, proof); !errors.Is(err, identity.ErrInvalidProof) {
-		t.Fatalf("expected ErrInvalidProof for wrong passphrase, got %v", err)
-	}
-	if err := identity.VerifyHubPassphraseProofWithKey(hubKey, challenge, "wss://evil.example.com", kp.PeerID, proof); !errors.Is(err, identity.ErrInvalidProof) {
-		t.Fatalf("expected ErrInvalidProof for wrong origin, got %v", err)
-	}
-	if err := identity.VerifyHubPassphraseProofWithKey(hubKey, "other-challenge-value-0123456789abcdef0123456", "wss://hub.example.com", kp.PeerID, proof); !errors.Is(err, identity.ErrInvalidProof) {
-		t.Fatalf("expected ErrInvalidProof for wrong challenge, got %v", err)
-	}
-}
-
 func TestVirtualIPv4FromPeerIDAndBlacklistPersistence(t *testing.T) {
 	t.Parallel()
 

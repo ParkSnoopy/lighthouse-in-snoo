@@ -26,7 +26,6 @@ type Options struct {
 	KeyPair          *identity.KeyPair
 	BlacklistPath    string
 	HubURL           string
-	HubPassphrase    string
 	STUNServerURI    string
 	TLSConfig        *tls.Config
 	TCPOnly          bool
@@ -84,10 +83,8 @@ type Controller struct {
 	VirtualIPText   *canvas.Text
 	InterfaceText   *canvas.Text
 	HubURLInput     *rawblock.Input
-	HubPassInput    *rawblock.Input
 	IfNameInput     *rawblock.Input
 	HubURLEntry     *widget.Entry
-	HubPassEntry    *widget.Entry
 	IfNameEntry     *widget.Entry
 	TCPOnlyCheck    *rawblock.Check
 	ConnectHubBtn   *rawblock.Button
@@ -347,10 +344,6 @@ func (c *Controller) buildUI() {
 	c.HubURLEntry = c.HubURLInput.Entry
 	c.HubURLEntry.SetText(c.opts.HubURL)
 
-	c.HubPassInput = rawblock.NewInput("HUB PASSPHRASE", "OPTIONAL", "", true)
-	c.HubPassEntry = c.HubPassInput.Entry
-	c.HubPassEntry.SetText(c.opts.HubPassphrase)
-
 	c.IfNameInput = rawblock.NewInput("TUN NAME", "lh0", "", false)
 	c.IfNameEntry = c.IfNameInput.Entry
 	c.IfNameEntry.SetText(c.opts.InterfaceName)
@@ -366,7 +359,6 @@ func (c *Controller) buildUI() {
 		nodeMeta,
 		rawblock.NewDivider(rawblock.BorderThick),
 		c.HubURLInput,
-		c.HubPassInput,
 		c.IfNameInput,
 		c.TCPOnlyCheck,
 		c.ConnectHubBtn,
@@ -495,14 +487,12 @@ func (c *Controller) toggleConnection() {
 func (c *Controller) ConnectAndBind(ctx context.Context) error {
 	var (
 		hubURL  string
-		hubPass string
 		ifName  string
 		tcpOnly bool
 	)
 	c.doUIWait(func() {
 		c.HubURLInput.SetError("")
 		hubURL = strings.TrimSpace(c.HubURLEntry.Text)
-		hubPass = c.HubPassEntry.Text
 		ifName = strings.TrimSpace(c.IfNameEntry.Text)
 		tcpOnly = c.TCPOnlyCheck.Checked
 	})
@@ -513,7 +503,6 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 	client, err := peer.NewClient(&peer.Config{
 		KeyPair:             c.opts.KeyPair,
 		SignalingURL:        hubURL,
-		HubPassphrase:       hubPass,
 		TLSConfig:           c.opts.TLSConfig,
 		STUNServerURI:       c.opts.STUNServerURI,
 		TCPOnly:             tcpOnly,

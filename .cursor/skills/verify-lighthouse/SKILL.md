@@ -1,6 +1,6 @@
 ---
 name: verify-lighthouse
-description: Verify Lighthouse end to end by building the real `lighthouse` static hub binary and `lighthouse-ui` Fyne TUN app, launching isolated zero-config / passphrase-gated / `--tcp-only` / `--insecure` hubs, inspecting live sockets and TLS 1.3 enforcement, exercising Fyne UI + TUN + broadcast consent flows, capturing proof artifacts, and tearing down cleanly. Use when proving behavior after changes to hub signaling, universal relay, passphrase broadcasts, explicit consent, TUN routing, or CLI flags.
+description: Verify Lighthouse end to end by building the real `lighthouse` static hub binary and `lighthouse-ui` Fyne TUN app, launching isolated zero-config / `--tls-algo` / `--tcp-only` / `--insecure` hubs, inspecting live sockets and TLS 1.3 enforcement, exercising Fyne UI + TUN + broadcast consent flows, capturing proof artifacts, and tearing down cleanly. Use when proving behavior after changes to hub signaling, universal relay, passphrase rooms, explicit consent, TUN routing, or CLI flags.
 ---
 
 # Verify Lighthouse
@@ -28,8 +28,7 @@ EVIDENCE_DIR="$(jq -r '.evidence_dir' <<<"$STATE")"
 
 Mode variants (each isolated in its own `--run-id`, safe to run side by side):
 - Default zero-config universal relay (TLS 1.3 WSS + DTLS 1.3/UDP STUNS+TURNS): `"$CTRL" launch --run-id udp-run`
-- Ephemeral AutoTLS (zero cert/key files): `"$CTRL" launch --run-id autotls-run --auto-tls`
-- Offline passphrase-gated hub: `"$CTRL" launch --run-id pass-run --passphrase "offline-secret"`
+- AutoTLS by algorithm (`ed25519`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`): `"$CTRL" launch --run-id autotls-run --auto-tls --tls-algo nistp-256`
 - TCP-only (zero UDP, TLS 1.3/TCP STUNS): `"$CTRL" launch --run-id tcp-run --tcp-only`
 - Opt-in insecure plaintext STUN/TURN alongside encrypted STUNS/TURNS: `"$CTRL" launch --run-id insecure-run --insecure`
 - Relay disabled (STUNS Binding only): `"$CTRL" launch --run-id norelay-run --no-relay`
@@ -68,9 +67,9 @@ Always drive through `control-lighthouse` so every invocation uses the run's iso
   ```bash
   "$CTRL" cli --run-dir "$RUN_DIR" --bin ui --capture "ui/version.txt" -- --version
   ```
-- **Headless Fyne UI, TUN routing, universal relay, and passphrase consent proof**:
+- **Headless Fyne UI, TUN routing, universal relay, and passphrase room consent proof**:
   ```bash
-  go test -race -v ./internal/ui ./pkg/tun ./test/acceptance -run 'TestFyneController|TestRouterBidirectional|TestPassphraseBroadcast|TestUniversalPublicRelay|TestHubOfflinePassphrase'
+  go test -race -v ./internal/ui ./pkg/tun ./test/acceptance -run 'TestFyneController|TestRouterBidirectional|TestPassphraseBroadcast|TestUniversalPublicRelay|TestBlindedHubRoomIsolation'
   ```
 
 Follow the exact recipes in [`features/`](./features/README.md) for preconditions, commands, and gotchas.
@@ -86,7 +85,7 @@ Proof artifacts are written to `/tmp/lighthouse-verify-evidence/<RUN_ID>/<featur
 Proof standards:
 - Exercise the real compiled `lighthouse` and `lighthouse-ui` binaries and live network sockets.
 - Capture both the action and resulting state: CLI transcripts (`command`, `exit_code`, `stdout`, `stderr`), hub JSON logs (`hub.log`), `state.json`, and `sockets.txt` (`ss -H -lntup` filtered strictly to our run PIDs).
-- Verify observable side effects: `"relay_active":true` in `hub.log`, `"passphrase_gated":true` when `--passphrase` is set, zero UDP sockets in `sockets.txt` for `--tcp-only`, and single-source version alignment across both binaries.
+- Verify observable side effects: `"relay_active":true` in `hub.log`, `"tls_algo"` logged on startup, zero UDP sockets in `sockets.txt` for `--tcp-only`, and single-source version alignment across both binaries.
 - Verify privacy invariants: no raw passphrases, private keys, SDP, or ICE passwords appear in `hub.log`.
 
 ## Cleanup
@@ -106,7 +105,7 @@ Cleanup rules:
 
 | Script | Invocation | Purpose |
 | --- | --- | --- |
-| [`scripts/control-lighthouse`](./scripts/control-lighthouse) | `control-lighthouse launch [--run-id ID] [--passphrase S] [--tcp-only] [--insecure] [--no-relay] [--auto-tls]` | Build `lighthouse` + `lighthouse-ui`, start isolated zero-config hub, wait for readiness |
+| [`scripts/control-lighthouse`](./scripts/control-lighthouse) | `control-lighthouse launch [--run-id ID] [--tls-algo A] [--tcp-only] [--insecure] [--no-relay] [--auto-tls]` | Build `lighthouse` + `lighthouse-ui`, start isolated zero-config hub, wait for readiness |
 | [`scripts/control-lighthouse`](./scripts/control-lighthouse) | `control-lighthouse doctor --run-dir DIR` | Read-only check of Hub PID, version alignment, socket ownership, and TLS 1.3 vs 1.2 |
 | [`scripts/control-lighthouse`](./scripts/control-lighthouse) | `control-lighthouse cli --run-dir DIR [--bin hub\|ui] [--capture REL] -- <args...>` | Run isolated CLI command and capture transcript + exit code |
 | [`scripts/control-lighthouse`](./scripts/control-lighthouse) | `control-lighthouse capture --run-dir DIR --feature ID [--note TEXT]` | Persist logs, state, and run-owned sockets into `$EVIDENCE_DIR/<ID>/` |

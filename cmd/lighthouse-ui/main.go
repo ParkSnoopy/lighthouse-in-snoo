@@ -23,7 +23,6 @@ func main() {
 		rsaBits       int
 		blacklistPath string
 		hubURL        string
-		hubPassphrase string
 		caPath        string
 		stunURI       string
 		ifName        string
@@ -77,7 +76,6 @@ func main() {
 				KeyPair:          kp,
 				BlacklistPath:    blacklistPath,
 				HubURL:           hubURL,
-				HubPassphrase:    hubPassphrase,
 				STUNServerURI:    stunURI,
 				TLSConfig:        tlsCfg,
 				TCPOnly:          tcpOnly,
@@ -127,12 +125,6 @@ func main() {
 		ShortHelp: "Universal Lighthouse hub WSS URL",
 		EnvVar:    "LIGHTHOUSE_HUB_URL",
 		Default:   "wss://localhost:8443/v1/signal",
-	})
-	cmd.StringOpt(&hubPassphrase, cli.Option{
-		Long:      "hub-passphrase",
-		ValueName: "SECRET",
-		ShortHelp: "Optional offline hub passphrase",
-		EnvVar:    "LIGHTHOUSE_PASSPHRASE",
 	})
 	cmd.StringOpt(&caPath, cli.Option{
 		Long:      "ca",

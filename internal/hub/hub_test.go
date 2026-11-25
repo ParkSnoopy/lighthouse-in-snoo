@@ -1,6 +1,7 @@
 package hub_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,6 +15,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -58,7 +61,7 @@ func dialAndRegister(
 	t *testing.T,
 	ctx context.Context,
 	hc *http.Client,
-	wsURL, origin, passphrase string,
+	wsURL, origin string,
 	kp *identity.KeyPair,
 ) (*websocket.Conn, protocol.RegisteredMessage) {
 	t.Helper()
@@ -81,14 +84,6 @@ func dialAndRegister(
 		_ = c.CloseNow()
 		t.Fatal(err)
 	}
-	hubAuth := ""
-	if passphrase != "" {
-		hubAuth, err = identity.SignHubPassphraseProof(passphrase, chal.Challenge, origin, kp.PeerID)
-		if err != nil {
-			_ = c.CloseNow()
-			t.Fatal(err)
-		}
-	}
 	regRaw, _ := json.Marshal(protocol.RegisterMessage{
 		V:         protocol.Version,
 		Type:      protocol.TypeRegister,
@@ -97,7 +92,6 @@ func dialAndRegister(
 		HubOrigin: origin,
 		Challenge: chal.Challenge,
 		Proof:     proof,
-		HubAuth:   hubAuth,
 	})
 	if err := c.Write(ctx, websocket.MessageText, regRaw); err != nil {
 		_ = c.CloseNow()
@@ -116,7 +110,7 @@ func dialAndRegister(
 	return c, reg
 }
 
-func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
+func TestHubBlindedUniversalRelayAndBroadcastIsolation(t *testing.T) {
 	t.Parallel()
 
 	srvTLS, cliTLS := makeCert(t)
@@ -129,12 +123,10 @@ func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	origin := "wss://" + ln.Addr().String()
-	const hubSecret = "offline-hub-passphrase"
 	srv, err := hub.New(&hub.Config{
 		HTTPSListener:      ln,
 		TLSConfig:          srvTLS,
 		HubOrigin:          origin,
-		Passphrase:         hubSecret,
 		EnableSTUN:         true,
 		EnableTURN:         true,
 		STUNSListenAddr:    "127.0.0.1:0",
@@ -146,8 +138,8 @@ func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
 	}
 	defer srv.Close()
 
-	if !srv.PassphraseRequired() || !srv.TURNActive() {
-		t.Fatalf("expected passphrase-gated hub with universal relay active")
+	if !srv.TURNActive() {
+		t.Fatalf("expected universal relay active")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -160,12 +152,7 @@ func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, chalRawUnauth, _ := cUnauth.Read(ctx)
-	var chalUnauth protocol.ChallengeMessage
-	_ = json.Unmarshal(chalRawUnauth, &chalUnauth)
-	if !chalUnauth.PassphraseRequired {
-		t.Fatal("expected challenge to advertise passphrase_required=true")
-	}
+	_, _, _ = cUnauth.Read(ctx)
 	_ = cUnauth.Write(ctx, websocket.MessageText, []byte(`{"v":2,"type":"channel_join","channel_id":"0123456789abcdef0123456789abcdef0123456789a"}`))
 	_, rawErr, _ := cUnauth.Read(ctx)
 	var em protocol.ErrorMessage
@@ -175,32 +162,31 @@ func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
 	}
 	_ = cUnauth.CloseNow()
 
-	// 2. Registering with wrong hub passphrase MUST be rejected.
-	cBadPass, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: hc})
+	// 2. Registering with invalid challenge signature MUST be rejected.
+	cBadSig, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: hc})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, chalRawBad, _ := cBadPass.Read(ctx)
+	_, chalRawBad, _ := cBadSig.Read(ctx)
 	var chalBad protocol.ChallengeMessage
 	_ = json.Unmarshal(chalRawBad, &chalBad)
-	proofBad, _ := kpA.SignRegistrationChallenge(chalBad.Challenge, origin)
-	wrongAuth, _ := identity.SignHubPassphraseProof("wrong-passphrase", chalBad.Challenge, origin, kpA.PeerID)
+	wrongProof, _ := kpB.SignRegistrationChallenge(chalBad.Challenge, origin)
 	regBad, _ := json.Marshal(protocol.RegisterMessage{
 		V: protocol.Version, Type: protocol.TypeRegister, PeerID: kpA.PeerID,
 		PublicKey: identity.EncodePublicKey(kpA.PublicKey), HubOrigin: origin,
-		Challenge: chalBad.Challenge, Proof: proofBad, HubAuth: wrongAuth,
+		Challenge: chalBad.Challenge, Proof: wrongProof,
 	})
-	_ = cBadPass.Write(ctx, websocket.MessageText, regBad)
-	_, badRespRaw, _ := cBadPass.Read(ctx)
+	_ = cBadSig.Write(ctx, websocket.MessageText, regBad)
+	_, badRespRaw, _ := cBadSig.Read(ctx)
 	var badErr protocol.ErrorMessage
 	_ = json.Unmarshal(badRespRaw, &badErr)
 	if badErr.Code != protocol.ErrCodeAuthFailed {
 		t.Fatalf("expected auth_failed, got %+v", badErr)
 	}
-	_ = cBadPass.CloseNow()
+	_ = cBadSig.CloseNow()
 
-	// 3. Valid registration succeeds, assigns default 10.88.0.0/16 IP, and mints universal TURNS relay credentials.
-	cA, regA := dialAndRegister(t, ctx, hc, wsURL, origin, hubSecret, kpA)
+	// 3. Open registration succeeds without any hub passphrase, assigns default 10.88.0.0/16 IP, and mints universal relay.
+	cA, regA := dialAndRegister(t, ctx, hc, wsURL, origin, kpA)
 	defer cA.CloseNow()
 	if regA.VirtualCIDR != identity.DefaultVirtualCIDRString {
 		t.Fatalf("expected default virtual_cidr %q, got %q", identity.DefaultVirtualCIDRString, regA.VirtualCIDR)
@@ -231,11 +217,10 @@ func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
 	var chalA2 protocol.ChallengeMessage
 	_ = json.Unmarshal(chalRawA2, &chalA2)
 	proofA2, _ := kpA.SignRegistrationChallenge(chalA2.Challenge, origin)
-	authA2, _ := identity.SignHubPassphraseProof(hubSecret, chalA2.Challenge, origin, kpA.PeerID)
 	regA2, _ := json.Marshal(protocol.RegisterMessage{
 		V: protocol.Version, Type: protocol.TypeRegister, PeerID: kpA.PeerID,
 		PublicKey: identity.EncodePublicKey(kpA.PublicKey), HubOrigin: origin,
-		Challenge: chalA2.Challenge, Proof: proofA2, HubAuth: authA2,
+		Challenge: chalA2.Challenge, Proof: proofA2,
 	})
 	_ = cA2.Write(ctx, websocket.MessageText, regA2)
 	_, limRaw, _ := cA2.Read(ctx)
@@ -246,12 +231,12 @@ func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
 	}
 	_ = cA2.CloseNow()
 
-	// 6. Passphrase-scoped broadcast isolation:
-	//    Peer B joins channel "room-alpha"; Peer C joins channel "room-beta".
+	// 6. Passphrase-scoped room isolation:
+	//    Peer B joins room "room-alpha"; Peer C joins room "room-beta".
 	//    Peer A broadcasts on "room-alpha" -> ONLY Peer B receives Peer A!
-	cB, _ := dialAndRegister(t, ctx, hc, wsURL, origin, hubSecret, kpB)
+	cB, _ := dialAndRegister(t, ctx, hc, wsURL, origin, kpB)
 	defer cB.CloseNow()
-	cC, _ := dialAndRegister(t, ctx, hc, wsURL, origin, hubSecret, kpC)
+	cC, _ := dialAndRegister(t, ctx, hc, wsURL, origin, kpC)
 	defer cC.CloseNow()
 
 	alphaKeys, _ := identity.DeriveChannelKeys("room-alpha")
@@ -376,11 +361,11 @@ func TestHubCustomCIDRAndPassphraseBroadcastAutoACL(t *testing.T) {
 	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: cliTLS}}
 	wsURL := origin + "/v1/signal"
 
-	cA, regA := dialAndRegister(t, ctx, hc, wsURL, origin, "", kpA)
+	cA, regA := dialAndRegister(t, ctx, hc, wsURL, origin, kpA)
 	defer cA.CloseNow()
-	cB, regB := dialAndRegister(t, ctx, hc, wsURL, origin, "", kpB)
+	cB, regB := dialAndRegister(t, ctx, hc, wsURL, origin, kpB)
 	defer cB.CloseNow()
-	cC, _ := dialAndRegister(t, ctx, hc, wsURL, origin, "", kpC)
+	cC, _ := dialAndRegister(t, ctx, hc, wsURL, origin, kpC)
 	defer cC.CloseNow()
 
 	// Hub must assign every peer an IP inside its configured 10.99.0.0/24 CIDR.
@@ -484,4 +469,196 @@ func TestHubCustomCIDRAndPassphraseBroadcastAutoACL(t *testing.T) {
 	if st := srv.Stats(); st.AutoACLDenied < 3 {
 		t.Fatalf("expected AutoACLDenied >= 3, got %+v", st)
 	}
+}
+
+func TestHubAutoTLSAlgorithmsAndDiskPersistence(t *testing.T) {
+	t.Parallel()
+
+	algos := []struct {
+		algo identity.Algorithm
+		bits int
+	}{
+		{algo: identity.AlgorithmEd25519},
+		{algo: identity.AlgorithmNISTP256},
+		{algo: identity.AlgorithmNISTP384},
+		{algo: identity.AlgorithmNISTP521},
+		{algo: identity.AlgorithmRSA, bits: 2048},
+	}
+
+	for _, tc := range algos {
+		t.Run(string(tc.algo), func(t *testing.T) {
+			t.Parallel()
+
+			tlsDir := t.TempDir()
+			srv1, err := hub.New(&hub.Config{
+				HTTPSListenAddr: "127.0.0.1:0",
+				STUNSListenAddr: "127.0.0.1:0",
+				AutoTLS:         true,
+				TLSDir:          tlsDir,
+				TLSAlgorithm:    tc.algo,
+				TLSRSABits:      tc.bits,
+				EnableSTUN:      true,
+				EnableTURN:      false,
+			})
+			if err != nil {
+				t.Fatalf("initial AutoTLS hub.New(%s): %v", tc.algo, err)
+			}
+			if srv1.TLSAlgorithm() != tc.algo || !srv1.TLSPersisted() {
+				_ = srv1.Close()
+				t.Fatalf("got algo=%q persisted=%v; want algo=%q persisted=true", srv1.TLSAlgorithm(), srv1.TLSPersisted(), tc.algo)
+			}
+
+			certPath := filepath.Join(tlsDir, hub.DefaultTLSCertFilename)
+			keyPath := filepath.Join(tlsDir, hub.DefaultTLSKeyFilename)
+			cert1, err := os.ReadFile(certPath)
+			if err != nil || len(cert1) == 0 {
+				_ = srv1.Close()
+				t.Fatalf("expected persisted tls.crt: err=%v", err)
+			}
+			keyInfo, err := os.Stat(keyPath)
+			if err != nil || keyInfo.Mode().Perm() != 0o600 {
+				_ = srv1.Close()
+				t.Fatalf("expected tls.key mode 0600: err=%v perm=%04o", err, keyInfo.Mode().Perm())
+			}
+
+			// Verify TLS 1.3 handshake works against the generated certificate.
+			hc := &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						MinVersion:         tls.VersionTLS13,
+						InsecureSkipVerify: true, //nolint:gosec // self-signed test cert
+					},
+				},
+			}
+			resp, err := hc.Get("https://" + srv1.HTTPSAddr().String() + "/healthz")
+			if err != nil {
+				_ = srv1.Close()
+				t.Fatalf("GET /healthz (%s): %v", tc.algo, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				_ = srv1.Close()
+				t.Fatalf("unexpected /healthz status %d", resp.StatusCode)
+			}
+			_ = srv1.Close()
+
+			// Restarting hub against the same TLSDir MUST reuse the persisted cert/key untouched.
+			srv2, err := hub.New(&hub.Config{
+				HTTPSListenAddr: "127.0.0.1:0",
+				STUNSListenAddr: "127.0.0.1:0",
+				AutoTLS:         true,
+				TLSDir:          tlsDir,
+				TLSAlgorithm:    identity.AlgorithmEd25519,
+				EnableSTUN:      true,
+				EnableTURN:      false,
+			})
+			if err != nil {
+				t.Fatalf("restart AutoTLS hub.New(%s): %v", tc.algo, err)
+			}
+			defer srv2.Close()
+
+			if srv2.TLSAlgorithm() != tc.algo || !srv2.TLSPersisted() {
+				t.Fatalf("restarted hub got algo=%q persisted=%v; want reused algo=%q persisted=true", srv2.TLSAlgorithm(), srv2.TLSPersisted(), tc.algo)
+			}
+			cert2, err := os.ReadFile(certPath)
+			if err != nil || !bytes.Equal(cert1, cert2) {
+				t.Fatalf("expected persisted tls.crt to remain identical across restarts")
+			}
+		})
+	}
+
+	// Unsupported TLS algorithm (ed448) MUST fail fast.
+	if _, err := hub.ParseTLSAlgorithm("ed448"); err == nil {
+		t.Fatal("expected ParseTLSAlgorithm(ed448) to fail")
+	}
+
+	// Unwritable TLSDir falls back cleanly to ephemeral in-memory TLS certificate.
+	roDir := filepath.Join(t.TempDir(), "readonly-tls")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(roDir, 0o700) }()
+	srvMem, err := hub.New(&hub.Config{
+		HTTPSListenAddr: "127.0.0.1:0",
+		STUNSListenAddr: "127.0.0.1:0",
+		AutoTLS:         true,
+		TLSDir:          roDir,
+		TLSAlgorithm:    identity.AlgorithmEd25519,
+		EnableSTUN:      true,
+		EnableTURN:      false,
+	})
+	if err != nil {
+		t.Fatalf("expected fallback to in-memory TLS when TLSDir is read-only: %v", err)
+	}
+	defer srvMem.Close()
+	if os.Geteuid() != 0 && srvMem.TLSPersisted() {
+		t.Fatal("expected TLSPersisted() == false on read-only TLSDir")
+	}
+}
+
+func TestHubTimeBasedPeerForgetRemovesEmptyRooms(t *testing.T) {
+	t.Parallel()
+
+	srvTLS, cliTLS := makeCert(t)
+	kpA, _ := identity.GenerateKeyPair()
+	kpB, _ := identity.GenerateKeyPair()
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin := "wss://" + ln.Addr().String()
+	srv, err := hub.New(&hub.Config{
+		HTTPSListener:     ln,
+		TLSConfig:         srvTLS,
+		HubOrigin:         origin,
+		PresenceHeartbeat: 100 * time.Millisecond,
+		PresenceTTL:       250 * time.Millisecond,
+		EnableSTUN:        true,
+		STUNSListenAddr:   "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: cliTLS}}
+	wsURL := origin + "/v1/signal"
+
+	cA, _ := dialAndRegister(t, ctx, hc, wsURL, origin, kpA)
+	defer cA.CloseNow()
+	cB, _ := dialAndRegister(t, ctx, hc, wsURL, origin, kpB)
+	defer cB.CloseNow()
+
+	roomOne, _ := identity.DeriveChannelKeys("ephemeral-room-one")
+	roomTwo, _ := identity.DeriveChannelKeys("ephemeral-room-two")
+
+	// Peer A joins roomOne and broadcasts on roomOne; Peer B joins roomTwo (listener only).
+	join1, _ := json.Marshal(protocol.ChannelJoinMessage{V: protocol.Version, Type: protocol.TypeChannelJoin, ChannelID: roomOne.ChannelID})
+	join2, _ := json.Marshal(protocol.ChannelJoinMessage{V: protocol.Version, Type: protocol.TypeChannelJoin, ChannelID: roomTwo.ChannelID})
+	_, bcast1, _ := protocol.SignBroadcast(kpA, roomOne.ChannelID, true, "", time.Now().Unix())
+	_ = cA.Write(ctx, websocket.MessageText, join1)
+	_, _, _ = cA.Read(ctx)
+	_ = cA.Write(ctx, websocket.MessageText, bcast1)
+	_, _, _ = cA.Read(ctx)
+	_ = cB.Write(ctx, websocket.MessageText, join2)
+	_, _, _ = cB.Read(ctx)
+
+	if st := srv.Stats(); st.ActiveSessions != 2 || st.ActiveChannels != 2 {
+		t.Fatalf("expected 2 active sessions and 2 active rooms, got %+v", st)
+	}
+
+	// Neither peer sends heartbeats -> after PresenceTTL elapses, reaper MUST forget both peers
+	// and remove both empty rooms!
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st := srv.Stats()
+		if st.ActiveSessions == 0 && st.ActiveChannels == 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("expected time-based peer forget to remove all expired peers and empty rooms, got %+v", srv.Stats())
 }
