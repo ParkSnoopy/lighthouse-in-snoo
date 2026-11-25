@@ -72,6 +72,7 @@ go test -race -count=1 ./...
 | `pkg/protocol` | `go test -race ./pkg/protocol` | v2 wire schemas, `64 KiB` limit, JCS signaling and broadcast signatures, embedded `public_key` binding |
 | `pkg/tun` | `go test -race ./pkg/tun` | IPv4/IPv6 header endpoint parsing, bidirectional TUN packet forwarding over DTLS 1.3 WebRTC, outbound and inbound cryptographic source-IP anti-spoofing |
 | `internal/ui` | `go test -race ./internal/ui` | Headless Fyne v2 controller binding TUN interface, passphrase-scoped broadcast discovery, explicit Allow/Deny/Blacklist modal workflow, live TUN routing, and blacklist teardown/unblacklist |
+| `internal/ui/rawblock` | `go test -race ./internal/ui/rawblock` | RawBlock brutalist Fyne theme tokens (`0px` radii, transparent shadow, embedded fonts) and all components (buttons, cards, inputs, chips, lists, checkboxes, circular radios, tooltips, hyperlinks) |
 | `internal/hub` | `go test -race ./internal/hub` | Zero-config AutoTLS startup, optional hub passphrase gate, auto-minted universal relay credentials, single-use challenges, session limits, passphrase-scoped broadcast isolation and disconnect withdrawal |
 | `internal/stunserver` | `go test -race ./internal/stunserver` | DTLS 1.3/UDP and TLS 1.3/TCP STUNS Binding, DTLS/TLS 1.2 rejection, TURN `Allocate` rejection, opt-in `AllowInsecure` |
 | `internal/turnserver` | `go test -race ./internal/turnserver` | DTLS 1.3/UDP and TLS 1.3/TCP TURNS + STUNS Binding, HMAC TURN REST authentication, `AllowInsecure` gate |

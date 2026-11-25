@@ -11,10 +11,11 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"lighthouse-in-snoo/internal/ui/rawblock"
 	"lighthouse-in-snoo/pkg/identity"
 	"lighthouse-in-snoo/pkg/peer"
 	"lighthouse-in-snoo/pkg/tun"
@@ -39,11 +40,11 @@ type Options struct {
 type pendingConsent struct {
 	req    peer.IncomingRequest
 	respCh chan peer.ConsentDecision
-	dlg    dialog.Dialog
+	popup  *widget.PopUp
 }
 
-// Controller binds a Fyne desktop UI to a Lighthouse peer Client and OS TUN Router.
-// All incoming connections require explicit Allow / Deny / Blacklist user action.
+// Controller binds a RawBlock-styled Fyne desktop UI to a Lighthouse peer Client
+// and OS TUN Router. All incoming connections require explicit Allow / Deny / Blacklist action.
 type Controller struct {
 	app    fyne.App
 	window fyne.Window
@@ -58,35 +59,50 @@ type Controller struct {
 	joinedPass       string
 	joinedChanID     string
 	broadcasting     bool
+	activeTab        int
 	peers            []peer.DiscoveredPeer
 	routes           []tun.RouteInfo
 	blacklisted      []string
 	consentPrompting bool
 	activeConsent    *pendingConsent
 
-	// Exposed widgets for user interaction and deterministic Fyne headless tests.
-	StatusLabel     *widget.Label
-	PeerIDLabel     *widget.Label
-	VirtualIPLabel  *widget.Label
-	InterfaceLabel  *widget.Label
+	// Exposed RawBlock components for user interaction and deterministic Fyne headless tests.
+	StatusChip      *rawblock.Chip
+	StatusText      *canvas.Text
+	PeerIDText      *canvas.Text
+	VirtualIPText   *canvas.Text
+	InterfaceText   *canvas.Text
+	HubURLInput     *rawblock.Input
+	HubPassInput    *rawblock.Input
+	IfNameInput     *rawblock.Input
 	HubURLEntry     *widget.Entry
 	HubPassEntry    *widget.Entry
 	IfNameEntry     *widget.Entry
-	TCPOnlyCheck    *widget.Check
-	ConnectHubBtn   *widget.Button
+	TCPOnlyCheck    *rawblock.Check
+	ConnectHubBtn   *rawblock.Button
+	PassphraseInput *rawblock.Input
+	DisplayInput    *rawblock.Input
 	PassphraseEntry *widget.Entry
 	DisplayEntry    *widget.Entry
-	JoinBtn         *widget.Button
-	BroadcastCheck  *widget.Check
+	JoinBtn         *rawblock.Button
+	BroadcastCheck  *rawblock.Check
+	DirectPeerInput *rawblock.Input
 	DirectPeerEntry *widget.Entry
-	DirectConnBtn   *widget.Button
+	DirectConnBtn   *rawblock.Button
+	TabPeersChip    *rawblock.Chip
+	TabTunnelsChip  *rawblock.Chip
+	TabBlockChip    *rawblock.Chip
+	tabContent      *fyne.Container
+	peersPanel      fyne.CanvasObject
+	tunnelsPanel    fyne.CanvasObject
+	blacklistPanel  fyne.CanvasObject
 	PeersBox        *fyne.Container
 	TunnelsBox      *fyne.Container
 	BlacklistBox    *fyne.Container
 }
 
-// NewController constructs the Fyne window and wires controls for TUN binding,
-// passphrase-scoped broadcasting, peer connection, incoming consent, and blacklisting.
+// NewController applies the RawBlock theme, constructs the brutalist Fyne window, and wires
+// controls for TUN binding, passphrase-scoped broadcasting, peer connection, consent, and blacklisting.
 func NewController(a fyne.App, opts Options) (*Controller, error) {
 	if opts.KeyPair == nil {
 		kp, err := identity.GenerateKeyPair()
@@ -109,8 +125,10 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 		return nil, err
 	}
 
-	w := a.NewWindow("Lighthouse")
-	w.Resize(fyne.NewSize(760, 560))
+	a.Settings().SetTheme(rawblock.NewTheme())
+
+	w := a.NewWindow("LIGHTHOUSE")
+	w.Resize(fyne.NewSize(1080, 800))
 
 	c := &Controller{
 		app:    a,
@@ -177,9 +195,9 @@ func (c *Controller) RespondIncoming(decision peer.ConsentDecision) bool {
 	if pc == nil {
 		return false
 	}
-	if pc.dlg != nil {
+	if pc.popup != nil {
 		c.doUI(func() {
-			pc.dlg.Hide()
+			pc.popup.Hide()
 		})
 	}
 	select {
@@ -191,106 +209,179 @@ func (c *Controller) RespondIncoming(decision peer.ConsentDecision) bool {
 }
 
 func (c *Controller) buildUI() {
-	c.StatusLabel = widget.NewLabel("Disconnected")
-	c.PeerIDLabel = widget.NewLabel(c.opts.KeyPair.PeerID)
-	c.VirtualIPLabel = widget.NewLabel(c.vip.String())
-	c.InterfaceLabel = widget.NewLabel("Unbound")
+	// --- Inverted Black Masthead (Archivo Black 48px + Status Chip) ---
+	title := rawblock.NewH2("LIGHTHOUSE", rawblock.ColorWhite)
+	c.StatusChip = rawblock.NewStatusChip("DISCONNECTED", rawblock.ChipDefault)
+	c.StatusText = rawblock.NewMono("UNBOUND", rawblock.ColorWhite)
+	c.StatusText.Alignment = fyne.TextAlignTrailing
+	mastheadRight := rawblock.GapVBox(rawblock.Sp2,
+		container.NewBorder(nil, nil, nil, c.StatusChip),
+		c.StatusText,
+	)
+	mastheadInner := container.NewBorder(nil, nil, nil, mastheadRight, title)
+	mastheadBG := canvas.NewRectangle(rawblock.ColorBlack)
+	mastheadBG.CornerRadius = rawblock.RadiusNone
+	masthead := container.NewBorder(
+		nil,
+		rawblock.NewDivider(rawblock.BorderHeavy),
+		nil,
+		nil,
+		container.NewStack(mastheadBG, rawblock.InsetBox(rawblock.Sp3, rawblock.Sp4, rawblock.Sp3, rawblock.Sp4, mastheadInner)),
+	)
 
-	copyIDBtn := widget.NewButton("Copy ID", func() {
+	// --- Left Rail: Elevated (5px border) Node & Hub Binding Card ---
+	c.PeerIDText = rawblock.NewMono(shortID(c.opts.KeyPair.PeerID), rawblock.ColorBlack)
+	c.VirtualIPText = rawblock.NewMono(c.vip.String(), rawblock.ColorBlack)
+	c.InterfaceText = rawblock.NewMono("UNBOUND", rawblock.ColorBlack)
+
+	copyIDBtn := rawblock.NewButton("COPY ID", rawblock.ButtonSecondary, rawblock.ButtonSmall, func() {
 		c.app.Clipboard().SetContent(c.opts.KeyPair.PeerID)
+		c.setStatus("COPIED", rawblock.ChipDefault)
 	})
 
-	c.HubURLEntry = widget.NewEntry()
+	nodeMeta := rawblock.GapVBox(rawblock.Sp2,
+		rawblock.NewH3("NODE", rawblock.ColorBlack),
+		rawblock.NewDivider(rawblock.BorderThick),
+		kvRow("PEER ID", container.NewBorder(nil, nil, nil, copyIDBtn,
+			rawblock.WithTooltip(c.PeerIDText, c.opts.KeyPair.PeerID))),
+		rawblock.AsymmetricSplit(0.52, rawblock.Sp3,
+			kvRow("VIRTUAL IP", c.VirtualIPText),
+			kvRow("INTERFACE", c.InterfaceText),
+		),
+	)
+
+	c.HubURLInput = rawblock.NewInput("HUB", "wss://hub.example.com/v1/signal", "", false)
+	c.HubURLEntry = c.HubURLInput.Entry
 	c.HubURLEntry.SetText(c.opts.HubURL)
-	c.HubURLEntry.SetPlaceHolder("wss://hub.example.com/v1/signal")
 
-	c.HubPassEntry = widget.NewPasswordEntry()
+	c.HubPassInput = rawblock.NewInput("HUB PASSPHRASE", "OPTIONAL", "", true)
+	c.HubPassEntry = c.HubPassInput.Entry
 	c.HubPassEntry.SetText(c.opts.HubPassphrase)
-	c.HubPassEntry.SetPlaceHolder("Optional")
 
-	c.IfNameEntry = widget.NewEntry()
+	c.IfNameInput = rawblock.NewInput("TUN NAME", "lh0", "", false)
+	c.IfNameEntry = c.IfNameInput.Entry
 	c.IfNameEntry.SetText(c.opts.InterfaceName)
 
-	c.TCPOnlyCheck = widget.NewCheck("TCP Only", nil)
-	c.TCPOnlyCheck.SetChecked(c.opts.TCPOnly)
+	c.TCPOnlyCheck = rawblock.NewCheck("TCP ONLY", nil)
+	c.TCPOnlyCheck.SetCheckedSilent(c.opts.TCPOnly)
 
-	c.ConnectHubBtn = widget.NewButton("Bind & Connect", func() {
+	c.ConnectHubBtn = rawblock.NewButton("BIND & CONNECT", rawblock.ButtonPrimary, rawblock.ButtonMedium, func() {
 		go c.toggleConnection()
 	})
 
-	c.PassphraseEntry = widget.NewPasswordEntry()
-	c.PassphraseEntry.SetPlaceHolder("Shared passphrase")
+	leftContent := rawblock.GapVBox(rawblock.Sp3,
+		nodeMeta,
+		rawblock.NewDivider(rawblock.BorderThick),
+		c.HubURLInput,
+		c.HubPassInput,
+		c.IfNameInput,
+		c.TCPOnlyCheck,
+		c.ConnectHubBtn,
+	)
+	leftCard := rawblock.NewCard(leftContent, rawblock.CardElevated)
 
-	c.DisplayEntry = widget.NewEntry()
-	c.DisplayEntry.SetPlaceHolder("Peer label")
+	// --- Right Column: Default (3px border) Panel with Brutalist Filter Chip Tabs ---
+	c.PassphraseInput = rawblock.NewInput("PASSPHRASE", "SHARED PASSPHRASE", "", true)
+	c.PassphraseEntry = c.PassphraseInput.Entry
 
-	c.JoinBtn = widget.NewButton("Join", func() {
+	c.DisplayInput = rawblock.NewInput("LABEL", "PEER LABEL", "", false)
+	c.DisplayEntry = c.DisplayInput.Entry
+
+	c.JoinBtn = rawblock.NewButton("JOIN", rawblock.ButtonPrimary, rawblock.ButtonSmall, func() {
 		go c.joinChannelAction()
 	})
 
-	c.BroadcastCheck = widget.NewCheck("Broadcast", func(enabled bool) {
+	c.BroadcastCheck = rawblock.NewCheck("BROADCAST", func(enabled bool) {
 		go c.broadcastToggleAction(enabled)
 	})
 
-	c.DirectPeerEntry = widget.NewEntry()
-	c.DirectPeerEntry.SetPlaceHolder("Peer ID")
-	c.DirectConnBtn = widget.NewButton("Connect", func() {
-		target := strings.TrimSpace(c.DirectPeerEntry.Text)
+	c.DirectPeerInput = rawblock.NewInput("DIRECT PEER ID", "PEER ID", "", false)
+	c.DirectPeerEntry = c.DirectPeerInput.Entry
+	c.DirectConnBtn = rawblock.NewButton("CONNECT", rawblock.ButtonSecondary, rawblock.ButtonMedium, func() {
+		var target string
+		c.doUIWait(func() {
+			target = strings.TrimSpace(c.DirectPeerEntry.Text)
+		})
 		if target != "" {
 			go c.connectPeerAction(target)
 		}
 	})
 
-	c.PeersBox = container.NewVBox(widget.NewLabel("No peers"))
-	c.TunnelsBox = container.NewVBox(widget.NewLabel("No active tunnels"))
-	c.BlacklistBox = container.NewVBox(widget.NewLabel("Empty"))
+	c.PeersBox = rawblock.GapVBox(0, emptyListRow("NO PEERS"))
+	c.TunnelsBox = rawblock.GapVBox(0, emptyListRow("NO ACTIVE TUNNELS"))
+	c.BlacklistBox = rawblock.GapVBox(0, emptyListRow("EMPTY"))
 
-	identityCard := widget.NewForm(
-		widget.NewFormItem("Peer ID", container.NewBorder(nil, nil, nil, copyIDBtn, c.PeerIDLabel)),
-		widget.NewFormItem("Virtual IP", c.VirtualIPLabel),
-		widget.NewFormItem("Interface", c.InterfaceLabel),
-		widget.NewFormItem("Status", c.StatusLabel),
-	)
+	channelRow := rawblock.AsymmetricSplit(0.58, rawblock.Sp3, c.PassphraseInput, c.DisplayInput)
+	channelActions := rawblock.GapHBox(rawblock.Sp3, c.JoinBtn, c.BroadcastCheck)
+	directRow := container.NewBorder(nil, nil, nil,
+		rawblock.InsetBox(0, 0, 0, rawblock.Sp2, container.NewBorder(nil, c.DirectConnBtn, nil, nil)),
+		c.DirectPeerInput)
 
-	hubForm := widget.NewForm(
-		widget.NewFormItem("Hub", c.HubURLEntry),
-		widget.NewFormItem("Hub Passphrase", c.HubPassEntry),
-		widget.NewFormItem("TUN Name", c.IfNameEntry),
+	peersTop := rawblock.GapVBox(rawblock.Sp3,
+		channelRow,
+		channelActions,
+		rawblock.NewDivider(rawblock.BorderThick),
+		directRow,
+		rawblock.NewDivider(rawblock.BorderThick),
 	)
-	hubBar := container.NewVBox(
-		hubForm,
-		container.NewHBox(c.TCPOnlyCheck, c.ConnectHubBtn),
-	)
+	c.peersPanel = container.NewBorder(peersTop, nil, nil, nil, container.NewVScroll(c.PeersBox))
+	c.tunnelsPanel = container.NewVScroll(c.TunnelsBox)
+	c.blacklistPanel = container.NewVScroll(c.BlacklistBox)
 
-	discoverControls := container.NewVBox(
-		widget.NewForm(
-			widget.NewFormItem("Passphrase", c.PassphraseEntry),
-			widget.NewFormItem("Label", c.DisplayEntry),
-		),
-		container.NewHBox(c.JoinBtn, c.BroadcastCheck),
-		widget.NewSeparator(),
-		container.NewBorder(nil, nil, widget.NewLabel("Direct"), c.DirectConnBtn, c.DirectPeerEntry),
-		widget.NewSeparator(),
-		container.NewVScroll(c.PeersBox),
-	)
+	c.TabPeersChip = rawblock.NewFilterChip("PEERS", true, func() { c.selectTab(0) })
+	c.TabTunnelsChip = rawblock.NewFilterChip("TUNNELS", false, func() { c.selectTab(1) })
+	c.TabBlockChip = rawblock.NewFilterChip("BLACKLIST", false, func() { c.selectTab(2) })
 
-	tabs := container.NewAppTabs(
-		container.NewTabItem("Peers", discoverControls),
-		container.NewTabItem("Tunnels", container.NewVScroll(c.TunnelsBox)),
-		container.NewTabItem("Blacklist", container.NewVScroll(c.BlacklistBox)),
+	tabBar := rawblock.GapVBox(rawblock.Sp2,
+		rawblock.GapHBox(rawblock.Sp2, c.TabPeersChip, c.TabTunnelsChip, c.TabBlockChip),
+		rawblock.NewDivider(rawblock.BorderThick),
 	)
+	c.tabContent = container.NewStack(c.peersPanel)
+	rightBody := container.NewBorder(tabBar, nil, nil, nil,
+		rawblock.InsetBox(rawblock.Sp3, 0, 0, 0, c.tabContent))
+	rightCard := rawblock.NewCard(rightBody, rawblock.CardDefault)
 
-	root := container.NewBorder(
-		container.NewVBox(identityCard, widget.NewSeparator(), hubBar, widget.NewSeparator()),
-		nil, nil, nil,
-		tabs,
-	)
+	// --- Asymmetric Root Layout (42% / 58%, Sp4 gutters, white surface base) ---
+	mainArea := rawblock.InsetBox(rawblock.Sp4, rawblock.Sp4, rawblock.Sp4, rawblock.Sp4,
+		rawblock.AsymmetricSplit(0.42, rawblock.Sp4, leftCard, rightCard))
+	rootBG := canvas.NewRectangle(rawblock.ColorSurfaceBase)
+	rootBG.CornerRadius = rawblock.RadiusNone
+	root := container.NewStack(rootBG, container.NewBorder(masthead, nil, nil, nil, mainArea))
 	c.window.SetContent(root)
 }
 
-func (c *Controller) setStatus(msg string) {
+func (c *Controller) selectTab(idx int) {
+	c.mu.Lock()
+	c.activeTab = idx
+	c.mu.Unlock()
+
 	c.doUI(func() {
-		c.StatusLabel.SetText(msg)
+		c.TabPeersChip.SetActive(idx == 0)
+		c.TabTunnelsChip.SetActive(idx == 1)
+		c.TabBlockChip.SetActive(idx == 2)
+		switch idx {
+		case 1:
+			c.tabContent.Objects = []fyne.CanvasObject{c.tunnelsPanel}
+		case 2:
+			c.tabContent.Objects = []fyne.CanvasObject{c.blacklistPanel}
+		default:
+			c.tabContent.Objects = []fyne.CanvasObject{c.peersPanel}
+		}
+		c.tabContent.Refresh()
+	})
+}
+
+func kvRow(label string, val fyne.CanvasObject) fyne.CanvasObject {
+	return rawblock.GapVBox(rawblock.Sp1, rawblock.NewLabel(label, rawblock.ColorContentSecondary), val)
+}
+
+func emptyListRow(text string) fyne.CanvasObject {
+	return rawblock.InsetBox(12, 0, 12, 0, rawblock.NewBody(text, rawblock.ColorContentSecondary))
+}
+
+func (c *Controller) setStatus(msg string, tone rawblock.ChipTone) {
+	c.doUI(func() {
+		c.StatusChip.SetStatus(msg, tone)
 	})
 }
 
@@ -303,7 +394,10 @@ func (c *Controller) toggleConnection() {
 		return
 	}
 	if err := c.ConnectAndBind(context.Background()); err != nil {
-		c.setStatus("Error: " + err.Error())
+		c.setStatus("ERROR", rawblock.ChipError)
+		c.doUI(func() {
+			c.HubURLInput.SetError(err.Error())
+		})
 	}
 }
 
@@ -316,6 +410,7 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 		tcpOnly bool
 	)
 	c.doUIWait(func() {
+		c.HubURLInput.SetError("")
 		hubURL = strings.TrimSpace(c.HubURLEntry.Text)
 		hubPass = c.HubPassEntry.Text
 		ifName = strings.TrimSpace(c.IfNameEntry.Text)
@@ -396,10 +491,15 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 	c.blacklisted = client.BlacklistedPeers()
 	c.mu.Unlock()
 
+	ifInfo := fmt.Sprintf("%s %s/%d", dev.Name(), c.vip.String(), tun.DefaultSubnetPrefixBits)
 	c.doUI(func() {
-		c.InterfaceLabel.SetText(fmt.Sprintf("%s (%s/%d)", dev.Name(), c.vip.String(), tun.DefaultSubnetPrefixBits))
-		c.StatusLabel.SetText("Connected")
-		c.ConnectHubBtn.SetText("Disconnect")
+		c.InterfaceText.Text = ifInfo
+		c.InterfaceText.Refresh()
+		c.StatusText.Text = ifInfo
+		c.StatusText.Refresh()
+		c.StatusChip.SetStatus("CONNECTED", rawblock.ChipActive)
+		c.ConnectHubBtn.SetText("DISCONNECT")
+		c.ConnectHubBtn.SetVariant(rawblock.ButtonSecondary)
 	})
 	c.refreshLists()
 	return nil
@@ -428,10 +528,14 @@ func (c *Controller) Disconnect() {
 	}
 
 	c.doUI(func() {
-		c.BroadcastCheck.SetChecked(false)
-		c.InterfaceLabel.SetText("Unbound")
-		c.StatusLabel.SetText("Disconnected")
-		c.ConnectHubBtn.SetText("Bind & Connect")
+		c.BroadcastCheck.SetCheckedSilent(false)
+		c.InterfaceText.Text = "UNBOUND"
+		c.InterfaceText.Refresh()
+		c.StatusText.Text = "UNBOUND"
+		c.StatusText.Refresh()
+		c.StatusChip.SetStatus("DISCONNECTED", rawblock.ChipDefault)
+		c.ConnectHubBtn.SetText("BIND & CONNECT")
+		c.ConnectHubBtn.SetVariant(rawblock.ButtonPrimary)
 	})
 	c.refreshLists()
 }
@@ -439,30 +543,33 @@ func (c *Controller) Disconnect() {
 func (c *Controller) joinChannelAction() {
 	var pass string
 	c.doUIWait(func() {
+		c.PassphraseInput.SetError("")
 		pass = c.PassphraseEntry.Text
 	})
 	c.mu.Lock()
 	client := c.client
 	c.mu.Unlock()
 	if client == nil {
-		c.setStatus("Connect to hub first")
+		c.setStatus("OFFLINE", rawblock.ChipWarning)
 		return
 	}
 	chID, err := client.JoinChannel(context.Background(), pass)
 	if err != nil {
-		c.setStatus("Join failed: " + err.Error())
+		c.setStatus("JOIN ERROR", rawblock.ChipError)
+		c.doUI(func() { c.PassphraseInput.SetError(err.Error()) })
 		return
 	}
 	c.mu.Lock()
 	c.joinedPass = pass
 	c.joinedChanID = chID
 	c.mu.Unlock()
-	c.setStatus("Listening on channel")
+	c.setStatus("LISTENING", rawblock.ChipActive)
 }
 
 func (c *Controller) broadcastToggleAction(enabled bool) {
 	var pass, label string
 	c.doUIWait(func() {
+		c.PassphraseInput.SetError("")
 		pass = c.PassphraseEntry.Text
 		label = strings.TrimSpace(c.DisplayEntry.Text)
 	})
@@ -474,23 +581,26 @@ func (c *Controller) broadcastToggleAction(enabled bool) {
 	c.mu.Unlock()
 	if client == nil {
 		if enabled {
-			c.doUI(func() { c.BroadcastCheck.SetChecked(false) })
-			c.setStatus("Connect to hub first")
+			c.doUI(func() { c.BroadcastCheck.SetCheckedSilent(false) })
+			c.setStatus("OFFLINE", rawblock.ChipWarning)
 		}
 		return
 	}
 	if _, err := client.SetBroadcast(context.Background(), enabled, pass, label); err != nil {
-		c.doUI(func() { c.BroadcastCheck.SetChecked(!enabled) })
-		c.setStatus("Broadcast failed: " + err.Error())
+		c.doUI(func() {
+			c.BroadcastCheck.SetCheckedSilent(!enabled)
+			c.PassphraseInput.SetError(err.Error())
+		})
+		c.setStatus("BROADCAST ERR", rawblock.ChipError)
 		return
 	}
 	c.mu.Lock()
 	c.broadcasting = enabled
 	c.mu.Unlock()
 	if enabled {
-		c.setStatus("Broadcasting")
+		c.setStatus("BROADCASTING", rawblock.ChipWarning)
 	} else {
-		c.setStatus("Broadcast stopped")
+		c.setStatus("CONNECTED", rawblock.ChipActive)
 	}
 }
 
@@ -499,17 +609,17 @@ func (c *Controller) connectPeerAction(targetPeerID string) {
 	client := c.client
 	c.mu.Unlock()
 	if client == nil {
-		c.setStatus("Connect to hub first")
+		c.setStatus("OFFLINE", rawblock.ChipWarning)
 		return
 	}
-	c.setStatus("Connecting " + shortID(targetPeerID))
+	c.setStatus("CONNECTING", rawblock.ChipWarning)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := client.Connect(ctx, targetPeerID); err != nil {
-		c.setStatus("Connect failed: " + err.Error())
+		c.setStatus("CONNECT ERR", rawblock.ChipError)
 		return
 	}
-	c.setStatus("Tunnel active: " + shortID(targetPeerID))
+	c.setStatus("CONNECTED", rawblock.ChipActive)
 	c.refreshLists()
 }
 
@@ -522,13 +632,13 @@ func (c *Controller) blacklistPeerAction(peerID string) {
 		return
 	}
 	if err := client.Blacklist(peerID); err != nil {
-		c.setStatus("Blacklist failed: " + err.Error())
+		c.setStatus("BLOCK ERR", rawblock.ChipError)
 		return
 	}
 	if router != nil {
 		router.DetachPeer(peerID)
 	}
-	c.setStatus("Blacklisted " + shortID(peerID))
+	c.setStatus("BLACKLISTED", rawblock.ChipError)
 	c.refreshLists()
 }
 
@@ -540,11 +650,11 @@ func (c *Controller) unblacklistPeerAction(peerID string) {
 		return
 	}
 	_ = client.Unblacklist(peerID)
-	c.setStatus("Removed " + shortID(peerID))
+	c.setStatus("CONNECTED", rawblock.ChipActive)
 	c.refreshLists()
 }
 
-// AuthorizeIncoming implements peer.ConsentHandler with an explicit Fyne modal prompt.
+// AuthorizeIncoming implements peer.ConsentHandler with an elevated 5px-bordered RawBlock modal.
 func (c *Controller) AuthorizeIncoming(ctx context.Context, req *peer.IncomingRequest) peer.ConsentDecision {
 	if req == nil {
 		return peer.ConsentDeny
@@ -565,39 +675,50 @@ func (c *Controller) AuthorizeIncoming(ctx context.Context, req *peer.IncomingRe
 	fpShort := ""
 	if len(req.DTLSFingerprints) > 0 {
 		fpShort = req.DTLSFingerprints[0]
-		if len(fpShort) > 23 {
-			fpShort = fpShort[:23] + "..."
+		if len(fpShort) > 29 {
+			fpShort = fpShort[:29] + "..."
 		}
 	}
 	nameText := req.DisplayName
 	if nameText == "" {
-		nameText = "(unlabeled)"
+		nameText = "(UNLABELED)"
 	}
 
 	c.doUIWait(func() {
-		info := widget.NewForm(
-			widget.NewFormItem("Peer", widget.NewLabel(req.PeerID)),
-			widget.NewFormItem("Label", widget.NewLabel(nameText)),
-			widget.NewFormItem("Key", widget.NewLabel(string(req.Algorithm))),
-			widget.NewFormItem("Virtual IP", widget.NewLabel(req.VirtualIP.String())),
-			widget.NewFormItem("DTLS SHA-256", widget.NewLabel(fpShort)),
+		headerBG := canvas.NewRectangle(rawblock.ColorBlack)
+		headerBG.CornerRadius = rawblock.RadiusNone
+		header := container.NewStack(headerBG, rawblock.InsetBox(rawblock.Sp2, rawblock.Sp3, rawblock.Sp2, rawblock.Sp3,
+			rawblock.NewH4("INCOMING CONNECTION", rawblock.ColorWhite)))
+
+		details := rawblock.GapVBox(rawblock.Sp2,
+			kvRow("PEER ID", rawblock.NewMono(req.PeerID, rawblock.ColorBlack)),
+			kvRow("LABEL", rawblock.NewBody(nameText, rawblock.ColorBlack)),
+			kvRow("KEY", rawblock.NewMono(strings.ToUpper(string(req.Algorithm)), rawblock.ColorBlack)),
+			kvRow("VIRTUAL IP", rawblock.NewMono(req.VirtualIP.String(), rawblock.ColorBlack)),
+			kvRow("DTLS SHA-256", rawblock.NewMono(fpShort, rawblock.ColorBlack)),
 		)
-		allowBtn := widget.NewButton("Allow", func() {
+
+		allowBtn := rawblock.NewButton("ALLOW", rawblock.ButtonPrimary, rawblock.ButtonMedium, func() {
 			c.RespondIncoming(peer.ConsentAllow)
 		})
-		allowBtn.Importance = widget.HighImportance
-		denyBtn := widget.NewButton("Deny", func() {
+		denyBtn := rawblock.NewButton("DENY", rawblock.ButtonSecondary, rawblock.ButtonMedium, func() {
 			c.RespondIncoming(peer.ConsentDeny)
 		})
-		blockBtn := widget.NewButton("Blacklist", func() {
+		blockBtn := rawblock.NewButton("BLACKLIST", rawblock.ButtonDestructive, rawblock.ButtonMedium, func() {
 			c.RespondIncoming(peer.ConsentBlacklist)
 		})
-		blockBtn.Importance = widget.DangerImportance
 
-		body := container.NewVBox(info, container.NewHBox(allowBtn, denyBtn, blockBtn))
-		dlg := dialog.NewCustomWithoutButtons("Incoming Connection", body, c.window)
-		pc.dlg = dlg
-		dlg.Show()
+		modalBody := rawblock.GapVBox(rawblock.Sp3,
+			header,
+			details,
+			rawblock.NewDivider(rawblock.BorderThick),
+			rawblock.GapHBox(rawblock.Sp2, allowBtn, denyBtn, blockBtn),
+		)
+		modalCard := rawblock.NewCard(modalBody, rawblock.CardElevated)
+
+		pop := widget.NewModalPopUp(modalCard, c.window.Canvas())
+		pc.popup = pop
+		pop.Show()
 	})
 
 	c.mu.Lock()
@@ -631,20 +752,25 @@ func (c *Controller) refreshLists() {
 	c.mu.Unlock()
 
 	c.doUI(func() {
-		// Discovered peers list.
+		// Discovered peers list (3px black dividers, 12px vertical padding, zero icons).
 		c.PeersBox.Objects = nil
 		if len(peers) == 0 {
-			c.PeersBox.Add(widget.NewLabel("No peers"))
+			c.PeersBox.Add(emptyListRow("NO PEERS"))
 		} else {
-			for _, dp := range peers {
+			for i, dp := range peers {
 				pid := dp.PeerID
-				label := fmt.Sprintf("%s  %s  (%s)", dp.VirtualIP.String(), shortID(pid), dp.DisplayName)
-				if dp.DisplayName == "" {
-					label = fmt.Sprintf("%s  %s", dp.VirtualIP.String(), shortID(pid))
+				meta := rawblock.GapVBox(rawblock.Sp1,
+					rawblock.NewMono(dp.VirtualIP.String(), rawblock.ColorBlack),
+					rawblock.NewSmall(fmt.Sprintf("%s  //  %s", truncateLabel(nonEmptyLabel(dp.DisplayName), 18), shortID8(pid)), rawblock.ColorContentSecondary),
+				)
+				connBtn := rawblock.NewButton("CONNECT", rawblock.ButtonPrimary, rawblock.ButtonSmall, func() { go c.connectPeerAction(pid) })
+				blockBtn := rawblock.NewButton("BLACKLIST", rawblock.ButtonDestructive, rawblock.ButtonSmall, func() { go c.blacklistPeerAction(pid) })
+				row := rawblock.InsetBox(12, 0, 12, 0,
+					container.NewBorder(nil, nil, nil, rawblock.GapHBox(rawblock.Sp2, connBtn, blockBtn), meta))
+				c.PeersBox.Add(row)
+				if i < len(peers)-1 {
+					c.PeersBox.Add(rawblock.NewDivider(rawblock.BorderThick))
 				}
-				connBtn := widget.NewButton("Connect", func() { go c.connectPeerAction(pid) })
-				blockBtn := widget.NewButton("Blacklist", func() { go c.blacklistPeerAction(pid) })
-				c.PeersBox.Add(container.NewBorder(nil, nil, nil, container.NewHBox(connBtn, blockBtn), widget.NewLabel(label)))
 			}
 		}
 		c.PeersBox.Refresh()
@@ -652,12 +778,18 @@ func (c *Controller) refreshLists() {
 		// Active TUN tunnels list.
 		c.TunnelsBox.Objects = nil
 		if len(routes) == 0 {
-			c.TunnelsBox.Add(widget.NewLabel("No active tunnels"))
+			c.TunnelsBox.Add(emptyListRow("NO ACTIVE TUNNELS"))
 		} else {
-			for _, rt := range routes {
+			for i, rt := range routes {
 				pid := rt.PeerID
-				rowLabel := fmt.Sprintf("%s  %s", rt.VirtualIP.String(), shortID(pid))
-				discBtn := widget.NewButton("Disconnect", func() {
+				meta := rawblock.GapVBox(rawblock.Sp1,
+					rawblock.GapHBox(rawblock.Sp2,
+						rawblock.NewStatusChip("ACTIVE", rawblock.ChipActive),
+						rawblock.NewMono(rt.VirtualIP.String(), rawblock.ColorBlack),
+					),
+					rawblock.NewSmall(shortID(pid), rawblock.ColorContentSecondary),
+				)
+				discBtn := rawblock.NewButton("DISCONNECT", rawblock.ButtonSecondary, rawblock.ButtonSmall, func() {
 					go func() {
 						if client != nil {
 							for _, s := range client.ActiveSessions() {
@@ -668,8 +800,13 @@ func (c *Controller) refreshLists() {
 						}
 					}()
 				})
-				blockBtn := widget.NewButton("Blacklist", func() { go c.blacklistPeerAction(pid) })
-				c.TunnelsBox.Add(container.NewBorder(nil, nil, nil, container.NewHBox(discBtn, blockBtn), widget.NewLabel(rowLabel)))
+				blockBtn := rawblock.NewButton("BLACKLIST", rawblock.ButtonDestructive, rawblock.ButtonSmall, func() { go c.blacklistPeerAction(pid) })
+				row := rawblock.InsetBox(12, 0, 12, 0,
+					container.NewBorder(nil, nil, nil, rawblock.GapHBox(rawblock.Sp2, discBtn, blockBtn), meta))
+				c.TunnelsBox.Add(row)
+				if i < len(routes)-1 {
+					c.TunnelsBox.Add(rawblock.NewDivider(rawblock.BorderThick))
+				}
 			}
 		}
 		c.TunnelsBox.Refresh()
@@ -677,16 +814,32 @@ func (c *Controller) refreshLists() {
 		// Blacklist tab.
 		c.BlacklistBox.Objects = nil
 		if len(bl) == 0 {
-			c.BlacklistBox.Add(widget.NewLabel("Empty"))
+			c.BlacklistBox.Add(emptyListRow("EMPTY"))
 		} else {
-			for _, pid := range bl {
+			for i, pid := range bl {
 				target := pid
-				remBtn := widget.NewButton("Remove", func() { go c.unblacklistPeerAction(target) })
-				c.BlacklistBox.Add(container.NewBorder(nil, nil, nil, remBtn, widget.NewLabel(target)))
+				meta := rawblock.GapHBox(rawblock.Sp2,
+					rawblock.NewStatusChip("BLOCKED", rawblock.ChipError),
+					rawblock.NewMono(shortID(target), rawblock.ColorBlack),
+				)
+				remBtn := rawblock.NewButton("REMOVE", rawblock.ButtonSecondary, rawblock.ButtonSmall, func() { go c.unblacklistPeerAction(target) })
+				row := rawblock.InsetBox(12, 0, 12, 0,
+					container.NewBorder(nil, nil, nil, remBtn, meta))
+				c.BlacklistBox.Add(row)
+				if i < len(bl)-1 {
+					c.BlacklistBox.Add(rawblock.NewDivider(rawblock.BorderThick))
+				}
 			}
 		}
 		c.BlacklistBox.Refresh()
 	})
+}
+
+func nonEmptyLabel(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(unlabeled)"
+	}
+	return s
 }
 
 func shortID(peerID string) string {
@@ -694,4 +847,19 @@ func shortID(peerID string) string {
 		return peerID
 	}
 	return peerID[:12]
+}
+
+func shortID8(peerID string) string {
+	if len(peerID) <= 8 {
+		return peerID
+	}
+	return peerID[:8]
+}
+
+func truncateLabel(s string, maxLen int) string {
+	rs := []rune(s)
+	if len(rs) <= maxLen {
+		return s
+	}
+	return string(rs[:maxLen-1]) + "…"
 }
