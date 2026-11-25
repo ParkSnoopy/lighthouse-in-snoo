@@ -14,7 +14,10 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -612,8 +615,8 @@ func TestHubTimeBasedPeerForgetRemovesEmptyRooms(t *testing.T) {
 		HTTPSListener:     ln,
 		TLSConfig:         srvTLS,
 		HubOrigin:         origin,
-		PresenceHeartbeat: 100 * time.Millisecond,
-		PresenceTTL:       250 * time.Millisecond,
+		PresenceHeartbeat: 200 * time.Millisecond,
+		PresenceTTL:       600 * time.Millisecond,
 		EnableSTUN:        true,
 		STUNSListenAddr:   "127.0.0.1:0",
 	})
@@ -621,6 +624,10 @@ func TestHubTimeBasedPeerForgetRemovesEmptyRooms(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.Close()
+
+	// Derive Argon2id room keys before registering so short PresenceTTL is not spent on KDF.
+	roomOne, _ := identity.DeriveChannelKeys("ephemeral-room-one")
+	roomTwo, _ := identity.DeriveChannelKeys("ephemeral-room-two")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -631,9 +638,6 @@ func TestHubTimeBasedPeerForgetRemovesEmptyRooms(t *testing.T) {
 	defer cA.CloseNow()
 	cB, _ := dialAndRegister(t, ctx, hc, wsURL, origin, kpB)
 	defer cB.CloseNow()
-
-	roomOne, _ := identity.DeriveChannelKeys("ephemeral-room-one")
-	roomTwo, _ := identity.DeriveChannelKeys("ephemeral-room-two")
 
 	// Peer A joins roomOne and broadcasts on roomOne; Peer B joins roomTwo (listener only).
 	join1, _ := json.Marshal(protocol.ChannelJoinMessage{V: protocol.Version, Type: protocol.TypeChannelJoin, ChannelID: roomOne.ChannelID})
@@ -661,4 +665,154 @@ func TestHubTimeBasedPeerForgetRemovesEmptyRooms(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("expected time-based peer forget to remove all expired peers and empty rooms, got %+v", srv.Stats())
+}
+
+func TestHubReverseProxyTLS13Termination(t *testing.T) {
+	t.Parallel()
+
+	srvTLS, cliTLS := makeCert(t)
+	kp, _ := identity.GenerateKeyPair()
+
+	rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendURL, err := url.Parse("http://" + rawLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a TLS-terminating edge proxy (Cloudtype, Caddy, Nginx, K8s Ingress)
+	// terminating TLS 1.3 externally and forwarding plaintext HTTP/1.1 + WebSocket to :8443.
+	rp := httputil.NewSingleHostReverseProxy(backendURL)
+	proxySrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("X-Forwarded-For", "203.0.113.77")
+		rp.ServeHTTP(w, r)
+	}))
+	proxySrv.TLS = srvTLS.Clone()
+	proxySrv.TLS.MinVersion = tls.VersionTLS13
+	proxySrv.TLS.MaxVersion = tls.VersionTLS13
+	proxySrv.StartTLS()
+	defer proxySrv.Close()
+
+	proxyOrigin := "wss://" + strings.TrimPrefix(proxySrv.URL, "https://")
+	srv, err := hub.New(&hub.Config{
+		HTTPSListener:   rawLn,
+		TLSConfig:       srvTLS,
+		HubOrigin:       proxyOrigin,
+		EnableSTUN:      true,
+		STUNSListenAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		_ = rawLn.Close()
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: cliTLS}}
+
+	// 1. /healthz works through the TLS-terminating reverse proxy.
+	resp, err := hc.Get(proxySrv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz via reverse proxy: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != `{"status":"ok"}` {
+		t.Fatalf("unexpected proxied /healthz: %d %q", resp.StatusCode, string(body))
+	}
+
+	// 2. WSS signaling registration succeeds end-to-end through the reverse proxy.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	wsConn, reg := dialAndRegister(t, ctx, hc, proxyOrigin+"/v1/signal", proxyOrigin, kp)
+	defer wsConn.CloseNow()
+	if reg.PeerID != kp.PeerID || reg.AssignedIP == "" {
+		t.Fatalf("unexpected proxied registration: %+v", reg)
+	}
+
+	// 3. Direct TLS 1.3 connection to the hub port STILL works alongside proxied HTTP.
+	directResp, err := hc.Get("https://" + srv.HTTPSAddr().String() + "/healthz")
+	if err != nil {
+		t.Fatalf("direct TLS 1.3 GET /healthz: %v", err)
+	}
+	_ = directResp.Body.Close()
+	if directResp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected direct TLS 1.3 /healthz status %d", directResp.StatusCode)
+	}
+
+	// 4. Direct TLS 1.2 connection MUST STILL be rejected.
+	tls12Cfg := cliTLS.Clone()
+	tls12Cfg.MinVersion = tls.VersionTLS12
+	tls12Cfg.MaxVersion = tls.VersionTLS12
+	hc12 := &http.Client{Transport: &http.Transport{TLSClientConfig: tls12Cfg}}
+	if r12, err12 := hc12.Get("https://" + srv.HTTPSAddr().String() + "/healthz"); err12 == nil {
+		_ = r12.Body.Close()
+		t.Fatal("expected direct TLS 1.2 handshake to be rejected")
+	}
+}
+
+func TestHubAcceptsRotatingDomainAndRandomPortWhenDomainOmitted(t *testing.T) {
+	t.Parallel()
+
+	srvTLS, cliTLS := makeCert(t)
+	kpA, _ := identity.GenerateKeyPair()
+	kpB, _ := identity.GenerateKeyPair()
+
+	rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendURL, err := url.Parse("http://" + rawLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero-domain hub: HubOrigin omitted -> dynamically accepts any rotating domain and forwarded port.
+	srv, err := hub.New(&hub.Config{
+		HTTPSListener:   rawLn,
+		TLSConfig:       srvTLS,
+		EnableSTUN:      true,
+		STUNSListenAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		_ = rawLn.Close()
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	if srv.HubOrigin() != "" {
+		t.Fatalf("expected empty HubOrigin (accept all) when omitted, got %q", srv.HubOrigin())
+	}
+
+	// Simulate rotating Cloudtype proxy forwarding custom domain + random port via X-Forwarded-Host.
+	rp := httputil.NewSingleHostReverseProxy(backendURL)
+	proxySrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rp.ServeHTTP(w, r)
+	}))
+	proxySrv.TLS = srvTLS.Clone()
+	proxySrv.TLS.MinVersion = tls.VersionTLS13
+	proxySrv.TLS.MaxVersion = tls.VersionTLS13
+	proxySrv.StartTLS()
+	defer proxySrv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: cliTLS}}
+
+	// 1. Register via reverse proxy (arbitrary random local port on proxySrv).
+	proxyOrigin := "wss://" + strings.TrimPrefix(proxySrv.URL, "https://")
+	cA, regA := dialAndRegister(t, ctx, hc, proxyOrigin+"/v1/signal", proxyOrigin, kpA)
+	defer cA.CloseNow()
+	if regA.PeerID != kpA.PeerID || regA.AssignedIP == "" {
+		t.Fatalf("unexpected proxied dynamic-origin registration: %+v", regA)
+	}
+
+	// 2. Register directly via TLS 1.3 on the hub's own random port without any domain configured.
+	directOrigin := "wss://" + srv.HTTPSAddr().String()
+	cB, regB := dialAndRegister(t, ctx, hc, directOrigin+"/v1/signal", directOrigin, kpB)
+	defer cB.CloseNow()
+	if regB.PeerID != kpB.PeerID || regB.AssignedIP == "" {
+		t.Fatalf("unexpected direct dynamic-origin registration: %+v", regB)
+	}
 }

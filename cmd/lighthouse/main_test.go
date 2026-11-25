@@ -62,7 +62,7 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lighthouse-ui --help failed: %v\n%s", err, string(uiHelpOut))
 	}
-	for _, want := range []string{"--domain <DOMAIN>", "[env: LIGHTHOUSE_DOMAIN]", "--ifname <NAME>", "--hub <URL>", "--tcp-only", "--blacklist <PATH>"} {
+	for _, want := range []string{"--domain <DOMAIN>", "[env: LIGHTHOUSE_DOMAIN]", "--ifname <NAME>", "--hub <HOST>", "--tcp-only", "--blacklist <PATH>"} {
 		if !strings.Contains(string(uiHelpOut), want) {
 			t.Fatalf("lighthouse-ui --help missing %q:\n%s", want, string(uiHelpOut))
 		}
@@ -282,8 +282,8 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dotenv ui --help failed: %v\n%s", err, string(uiDotEnvHelp))
 	}
-	if !strings.Contains(string(uiDotEnvHelp), "[default: wss://hub.dotenv.example/v1/signal]") {
-		t.Fatalf("dotenv ui --help missing auto-configured WSS URL:\n%s", string(uiDotEnvHelp))
+	if !strings.Contains(string(uiDotEnvHelp), "[default: hub.dotenv.example]") {
+		t.Fatalf("dotenv ui --help missing boilerplate-free domain default:\n%s", string(uiDotEnvHelp))
 	}
 
 	// Explicit process ENV LIGHTHOUSE_DOMAIN (with port) overrides .env without rebuilding.

@@ -50,7 +50,7 @@ func main() {
 					return &cli.ExitError{Code: 2, Err: domErr}
 				}
 				if !hubURLOpt.IsSet() {
-					hubURL = dom.HubURL()
+					hubURL = dom.HostPort
 				}
 			}
 			algo, err := identity.ParseAlgorithm(algoStr)
@@ -137,13 +137,13 @@ func main() {
 	cmd.StringOpt(&domainStr, cli.Option{
 		Long:      "domain",
 		ValueName: "DOMAIN",
-		ShortHelp: "Single hub domain auto-configuring --hub (wss://<domain>/v1/signal)",
+		ShortHelp: "Single hub domain (e.g. hub.example.com)",
 		EnvVar:    "LIGHTHOUSE_DOMAIN",
 	})
 	hubURLOpt = cmd.StringOpt(&hubURL, cli.Option{
 		Long:      "hub",
-		ValueName: "URL",
-		ShortHelp: "Universal Lighthouse hub WSS URL (auto-derived from --domain when unset)",
+		ValueName: "HOST",
+		ShortHelp: "Universal Lighthouse hub domain or WSS URL (omit wss:// and /v1/signal)",
 		EnvVar:    "LIGHTHOUSE_HUB_URL",
 		Default:   cli.DefaultHubURL(),
 	})

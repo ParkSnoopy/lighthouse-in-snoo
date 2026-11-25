@@ -160,6 +160,10 @@ func newHubCommand() *cli.Command {
 				return err
 			}
 
+			loggedOrigin := srv.HubOrigin()
+			if loggedOrigin == "" {
+				loggedOrigin = "*"
+			}
 			logger.Info("lighthouse hub started",
 				"https_addr", srv.HTTPSAddr().String(),
 				"stuns_addr", fmt.Sprint(srv.STUNSAddr()),
@@ -171,7 +175,7 @@ func newHubCommand() *cli.Command {
 				"tls_algo", string(srv.TLSAlgorithm()),
 				"tls_persisted", srv.TLSPersisted(),
 				"insecure", insecure,
-				"hub_origin", srv.HubOrigin(),
+				"hub_origin", loggedOrigin,
 				"turn_advertise_host", turnAdvHost,
 				"turn_realm", turnRealm,
 				"virtual_cidr", srv.VirtualCIDR().String(),
@@ -193,8 +197,8 @@ func newHubCommand() *cli.Command {
 	cmd.StringOpt(&domainStr, cli.Option{
 		Long:      "domain",
 		ValueName: "DOMAIN",
-		ShortHelp: "Single hub domain auto-configuring WSS origin, TURN host/realm, and TLS SAN",
-		LongHelp:  "Public domain (or host:port) for this hub; automatically derives --hub-origin (wss://<domain>), --turn-advertise-host, --turn-realm, and TLS cert SAN unless explicitly overridden",
+		ShortHelp: "Optional hub domain pinning WSS origin, TURN host/realm, and TLS SAN (omit to accept all)",
+		LongHelp:  "Optional public domain (or host:port) for this hub; when omitted, the hub dynamically accepts any incoming Host/forwarded port",
 		EnvVar:    "LIGHTHOUSE_DOMAIN",
 	})
 	cmd.StringOpt(&httpsAddr, cli.Option{
@@ -292,7 +296,7 @@ func newHubCommand() *cli.Command {
 	hubOriginOpt = cmd.StringOpt(&hubOrigin, cli.Option{
 		Long:      "hub-origin",
 		ValueName: "URL",
-		ShortHelp: "Canonical WSS hub origin (auto-derived from --domain when unset)",
+		ShortHelp: "Optional pinned WSS hub origin (auto-derived from --domain, or accept any host when omitted)",
 		EnvVar:    "LIGHTHOUSE_HUB_ORIGIN",
 		Default:   cli.DefaultHubOrigin(),
 	})

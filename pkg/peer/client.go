@@ -159,6 +159,50 @@ type Client struct {
 	wg       sync.WaitGroup
 }
 
+// NormalizeSignalingURL converts a bare hub domain/host or full WSS/HTTPS URL into
+// a canonical TLS signaling URL ("wss://<host>[:<port>]/v1/signal"). Explicit plaintext
+// schemes such as "http://" or "ws://" are rejected.
+func NormalizeSignalingURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", identity.ErrInvalidOrigin
+	}
+	candidate := trimmed
+	if !strings.Contains(candidate, "://") {
+		if ip := net.ParseIP(candidate); ip != nil && ip.To4() == nil {
+			candidate = "[" + candidate + "]"
+		}
+		candidate = "wss://" + candidate
+	}
+	u, err := url.Parse(candidate)
+	if err != nil || u.Host == "" || u.User != nil {
+		return "", identity.ErrInvalidOrigin
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "wss" && scheme != "https" {
+		return "", identity.ErrInvalidOrigin
+	}
+	if port := u.Port(); port != "" {
+		pNum, pErr := strconv.Atoi(port)
+		if pErr != nil || pNum < 1 || pNum > 65535 {
+			return "", identity.ErrInvalidOrigin
+		}
+	}
+	origin, err := identity.CanonicalizeOrigin(candidate)
+	if err != nil {
+		return "", err
+	}
+	path := u.Path
+	if path == "" || path == "/" {
+		path = "/v1/signal"
+	}
+	res := origin + path
+	if u.RawQuery != "" {
+		res += "?" + u.RawQuery
+	}
+	return res, nil
+}
+
 // NewClient validates configuration and constructs a new consent-driven peer Client.
 func NewClient(cfgIn *Config) (*Client, error) {
 	if cfgIn == nil {
@@ -171,6 +215,12 @@ func NewClient(cfgIn *Config) (*Client, error) {
 	if err := identity.ValidatePeerID(cfg.KeyPair.PeerID); err != nil {
 		return nil, err
 	}
+
+	normSigURL, err := NormalizeSignalingURL(cfg.SignalingURL)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SignalingURL = normSigURL
 
 	compiledICE, err := compileICEServers(&cfg)
 	if err != nil {

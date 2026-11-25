@@ -123,7 +123,7 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 		opts.InterfaceName = "lh0"
 	}
 	if opts.HubURL == "" {
-		opts.HubURL = "wss://localhost:8443/v1/signal"
+		opts.HubURL = "localhost:8443"
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -340,7 +340,7 @@ func (c *Controller) buildUI() {
 		),
 	)
 
-	c.HubURLInput = rawblock.NewInput("HUB", "wss://hub.example.com/v1/signal", "", false)
+	c.HubURLInput = rawblock.NewInput("HUB", "hub.example.com", "", false)
 	c.HubURLEntry = c.HubURLInput.Entry
 	c.HubURLEntry.SetText(c.opts.HubURL)
 

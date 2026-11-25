@@ -211,17 +211,22 @@ func New(cfgIn *Config) (*Server, error) {
 		cfg = *cfgIn
 	}
 	applyDefaults(&cfg)
-	origin, err := identity.CanonicalizeOrigin(cfg.HubOrigin)
-	if err != nil {
-		return nil, fmt.Errorf("hub origin: %w", err)
+	var origin string
+	if strings.TrimSpace(cfg.HubOrigin) != "" {
+		var originErr error
+		origin, originErr = identity.CanonicalizeOrigin(cfg.HubOrigin)
+		if originErr != nil {
+			return nil, fmt.Errorf("hub origin: %w", originErr)
+		}
 	}
 	virtualCIDR := cfg.VirtualCIDR
 	if !virtualCIDR.IsValid() {
 		virtualCIDR = identity.DefaultVirtualCIDR()
 	} else {
-		virtualCIDR, err = identity.ParseVirtualCIDR(virtualCIDR.String())
-		if err != nil {
-			return nil, fmt.Errorf("hub virtual cidr: %w", err)
+		var cidrErr error
+		virtualCIDR, cidrErr = identity.ParseVirtualCIDR(virtualCIDR.String())
+		if cidrErr != nil {
+			return nil, fmt.Errorf("hub virtual cidr: %w", cidrErr)
 		}
 	}
 
@@ -239,7 +244,7 @@ func New(cfgIn *Config) (*Server, error) {
 			return nil, fmt.Errorf("listen https %s: %w", cfg.HTTPSListenAddr, listenErr)
 		}
 	}
-	ln := tls.NewListener(rawLn, tlsCfg)
+	ln := newTLSOrProxyListener(rawLn, tlsCfg)
 
 	if cfg.TCPOnly && (cfg.STUNSPacketConn != nil || cfg.STUNPacketConn != nil) {
 		_ = ln.Close()
@@ -401,9 +406,6 @@ func New(cfgIn *Config) (*Server, error) {
 func applyDefaults(cfg *Config) {
 	if cfg.HTTPSListenAddr == "" {
 		cfg.HTTPSListenAddr = ":8443"
-	}
-	if cfg.HubOrigin == "" {
-		cfg.HubOrigin = "wss://localhost:8443"
 	}
 	if cfg.PresenceHeartbeat <= 0 {
 		cfg.PresenceHeartbeat = 20 * time.Second
@@ -647,16 +649,16 @@ func (s *Server) Close() error {
 	return errors.Join(stunErr, turnErr)
 }
 
-func (s *Server) buildRelayInfoForPeer(peerID string) *protocol.RelayInfo {
+func (s *Server) buildRelayInfoForPeer(peerID, reqOrigin string) *protocol.RelayInfo {
 	if s.turnSrv == nil || s.turnSecret == "" {
 		return nil
 	}
 	var uris []string
 	if dtlsAddr := s.turnSrv.DTLSAddr(); dtlsAddr != nil {
-		uris = append(uris, "turns:"+s.formatAdvertisedAddr(dtlsAddr))
+		uris = append(uris, "turns:"+s.formatAdvertisedAddr(dtlsAddr, reqOrigin))
 	}
 	if tlsAddr := s.turnSrv.TLSAddr(); tlsAddr != nil {
-		uris = append(uris, "turns:"+s.formatAdvertisedAddr(tlsAddr)+"?transport=tcp")
+		uris = append(uris, "turns:"+s.formatAdvertisedAddr(tlsAddr, reqOrigin)+"?transport=tcp")
 	}
 	if len(uris) == 0 {
 		return nil
@@ -674,7 +676,7 @@ func (s *Server) buildRelayInfoForPeer(peerID string) *protocol.RelayInfo {
 	}
 }
 
-func (s *Server) formatAdvertisedAddr(addr net.Addr) string {
+func (s *Server) formatAdvertisedAddr(addr net.Addr, reqOrigin string) string {
 	host, port, err := net.SplitHostPort(addr.String())
 	if err != nil {
 		return addr.String()
@@ -687,7 +689,11 @@ func (s *Server) formatAdvertisedAddr(addr net.Addr) string {
 		if s.cfg.TURNPublicIP != nil {
 			return net.JoinHostPort(s.cfg.TURNPublicIP.String(), port)
 		}
-		if u, uErr := url.Parse(s.hubOrigin); uErr == nil && u.Hostname() != "" {
+		originForHost := s.hubOrigin
+		if originForHost == "" {
+			originForHost = reqOrigin
+		}
+		if u, uErr := url.Parse(originForHost); uErr == nil && u.Hostname() != "" {
 			return net.JoinHostPort(u.Hostname(), port)
 		}
 	}
@@ -708,7 +714,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
-	remoteIP := extractRemoteIP(r.RemoteAddr)
+	remoteIP := extractClientIP(r)
 	if !s.ipConnRate.Allow(remoteIP) || !s.ipConnConc.Acquire(remoteIP) {
 		s.rateDropped.Add(1)
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
@@ -735,11 +741,13 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 	now := s.nowFunc()
 	challengeExp := now.Add(s.cfg.ChallengeTTL)
 
+	reqOrigin := s.resolveRequestOrigin(r)
+
 	chalRaw, err := json.Marshal(protocol.ChallengeMessage{
 		V:         protocol.Version,
 		Type:      protocol.TypeChallenge,
 		Challenge: challenge,
-		HubOrigin: s.hubOrigin,
+		HubOrigin: reqOrigin,
 		ExpiresAt: challengeExp.Unix(),
 	})
 	if err != nil {
@@ -773,7 +781,7 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ps, errCode, errDetail := s.authenticateRegistration(conn, cancel, remoteIP, challenge, challengeExp, rawReg)
+	ps, errCode, errDetail := s.authenticateRegistration(conn, cancel, remoteIP, reqOrigin, challenge, challengeExp, rawReg)
 	if ps == nil {
 		s.regFailed.Add(1)
 		s.log.Warn("peer registration rejected", "remote_ip", remoteIP, "code", errCode)
@@ -795,7 +803,7 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 		HeartbeatIntervalSec: hbSec,
 		VirtualCIDR:          s.virtualCIDR.String(),
 		AssignedIP:           ps.assignedIP.String(),
-		Relay:                s.buildRelayInfoForPeer(ps.peerID),
+		Relay:                s.buildRelayInfoForPeer(ps.peerID, reqOrigin),
 	}); err != nil {
 		return
 	}
@@ -841,7 +849,7 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authenticateRegistration(
 	conn *websocket.Conn,
 	cancel context.CancelFunc,
-	remoteIP, expectedChallenge string,
+	remoteIP, expectedOrigin, expectedChallenge string,
 	challengeExp time.Time,
 	raw []byte,
 ) (sess *peerSession, errCode, errDetail string) {
@@ -862,14 +870,14 @@ func (s *Server) authenticateRegistration(
 		return nil, protocol.ErrCodeChallengeInvalid, "invalid or expired challenge"
 	}
 	canonOrigin, err := identity.CanonicalizeOrigin(reg.HubOrigin)
-	if err != nil || canonOrigin != s.hubOrigin {
+	if err != nil || canonOrigin != expectedOrigin {
 		return nil, protocol.ErrCodeAuthFailed, "hub_origin mismatch"
 	}
 	pub, err := identity.DecodePublicKey(reg.PublicKey)
 	if err != nil {
 		return nil, protocol.ErrCodeAuthFailed, "invalid public_key"
 	}
-	if err := identity.VerifyRegistrationChallenge(pub, reg.PeerID, expectedChallenge, s.hubOrigin, reg.Proof); err != nil {
+	if err := identity.VerifyRegistrationChallenge(pub, reg.PeerID, expectedChallenge, expectedOrigin, reg.Proof); err != nil {
 		return nil, protocol.ErrCodeAuthFailed, "invalid challenge proof"
 	}
 

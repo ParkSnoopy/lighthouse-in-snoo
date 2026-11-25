@@ -150,7 +150,9 @@ func ResolveDomainFromEnv() (DomainConfig, bool) {
 	return DomainConfig{}, false
 }
 
-// DefaultHubOrigin resolves the default WSS hub origin for CLI help and startup defaults.
+// DefaultHubOrigin resolves the optional pinned WSS hub origin for CLI help and startup.
+// When neither LIGHTHOUSE_HUB_ORIGIN nor LIGHTHOUSE_DOMAIN is set, it returns "" so the hub
+// dynamically accepts any incoming domain or forwarded port.
 func DefaultHubOrigin() string {
 	if origin := strings.TrimSpace(os.Getenv("LIGHTHOUSE_HUB_ORIGIN")); origin != "" {
 		return origin
@@ -158,18 +160,19 @@ func DefaultHubOrigin() string {
 	if dom, ok := ResolveDomainFromEnv(); ok {
 		return dom.HubOrigin()
 	}
-	return "wss://localhost:8443"
+	return ""
 }
 
-// DefaultHubURL resolves the default WSS signaling URL for lighthouse-ui.
+// DefaultHubURL resolves the default hub address for lighthouse-ui without forcing
+// users to type "wss://" or "/v1/signal" boilerplate.
 func DefaultHubURL() string {
 	if hubURL := strings.TrimSpace(os.Getenv("LIGHTHOUSE_HUB_URL")); hubURL != "" {
 		return hubURL
 	}
 	if dom, ok := ResolveDomainFromEnv(); ok {
-		return dom.HubURL()
+		return dom.HostPort
 	}
-	return "wss://localhost:8443/v1/signal"
+	return "localhost:8443"
 }
 
 // DefaultTURNAdvertiseHost resolves the default advertised relay host from LIGHTHOUSE_DOMAIN.

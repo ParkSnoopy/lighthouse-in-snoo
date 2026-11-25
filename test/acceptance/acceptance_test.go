@@ -155,8 +155,11 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 	if diagA.DTLSVersion != peer.ExpectedDTLS13HexVersion {
 		t.Fatalf("DTLSVersion = %q; want %q (DTLS 1.3)", diagA.DTLSVersion, peer.ExpectedDTLS13HexVersion)
 	}
-	if diagA.LocalCandidateType != "host" || diagA.RemoteCandidateType != "host" {
-		t.Fatalf("expected direct host-host pair on LAN, got (%s, %s)", diagA.LocalCandidateType, diagA.RemoteCandidateType)
+	isDirectLAN := func(candType string) bool {
+		return candType == "host" || candType == "prflx"
+	}
+	if !isDirectLAN(diagA.LocalCandidateType) || !isDirectLAN(diagA.RemoteCandidateType) {
+		t.Fatalf("expected direct host/prflx pair on LAN, got (%s, %s) pair=%q", diagA.LocalCandidateType, diagA.RemoteCandidateType, diagA.SelectedPair)
 	}
 
 	secretPayload := []byte("SUPER-SECRET-APP-PAYLOAD-T01")

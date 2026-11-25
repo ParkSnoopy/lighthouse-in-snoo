@@ -109,12 +109,12 @@ func TestSingleDomainEnvResolutionAndOverrides(t *testing.T) {
 		_ = os.Unsetenv(k)
 	}
 
-	// Defaults when nothing is set.
-	if got := cli.DefaultHubOrigin(); got != "wss://localhost:8443" {
-		t.Fatalf("DefaultHubOrigin() = %q; want wss://localhost:8443", got)
+	// Defaults when nothing is set (hub origin empty => accept all domains/ports dynamically).
+	if got := cli.DefaultHubOrigin(); got != "" {
+		t.Fatalf("DefaultHubOrigin() = %q; want empty (accept all)", got)
 	}
-	if got := cli.DefaultHubURL(); got != "wss://localhost:8443/v1/signal" {
-		t.Fatalf("DefaultHubURL() = %q; want wss://localhost:8443/v1/signal", got)
+	if got := cli.DefaultHubURL(); got != "localhost:8443" {
+		t.Fatalf("DefaultHubURL() = %q; want localhost:8443", got)
 	}
 	if got := cli.DefaultTURNAdvertiseHost(); got != "" {
 		t.Fatalf("DefaultTURNAdvertiseHost() = %q; want empty", got)
@@ -133,8 +133,8 @@ func TestSingleDomainEnvResolutionAndOverrides(t *testing.T) {
 	if got := cli.DefaultHubOrigin(); got != "wss://vpn.example.org:8443" {
 		t.Fatalf("DefaultHubOrigin() = %q; want wss://vpn.example.org:8443", got)
 	}
-	if got := cli.DefaultHubURL(); got != "wss://vpn.example.org:8443/v1/signal" {
-		t.Fatalf("DefaultHubURL() = %q; want wss://vpn.example.org:8443/v1/signal", got)
+	if got := cli.DefaultHubURL(); got != "vpn.example.org:8443" {
+		t.Fatalf("DefaultHubURL() = %q; want vpn.example.org:8443", got)
 	}
 	if got := cli.DefaultTURNAdvertiseHost(); got != "vpn.example.org" {
 		t.Fatalf("DefaultTURNAdvertiseHost() = %q; want vpn.example.org", got)

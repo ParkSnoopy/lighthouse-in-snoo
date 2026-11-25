@@ -70,7 +70,7 @@ Run with a single domain (`LIGHTHOUSE_DOMAIN` in `.env` or `--domain`) to auto-c
 
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
-| `--domain` | `LIGHTHOUSE_DOMAIN` | *(none)* | Single hub domain auto-configuring `--hub-origin` (`wss://<domain>`), `--turn-advertise-host`, `--turn-realm`, and TLS SAN |
+| `--domain` | `LIGHTHOUSE_DOMAIN` | *(accept all)* | Optional hub domain pinning `--hub-origin` (`wss://<domain>`), `--turn-advertise-host`, `--turn-realm`, and TLS SAN; omit to accept rotating domains/ports (e.g. Cloudtype) |
 | `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS/WSS signaling |
 | `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | Encrypted STUNS/TURNS address (UDP default; TCP with `--tcp-only`) |
 | `--cidr` | `LIGHTHOUSE_CIDR` | `10.88.0.0/16` | Virtual IPv4 subnet CIDR assigned to connected peers |
@@ -82,7 +82,7 @@ Run with a single domain (`LIGHTHOUSE_DOMAIN` in `.env` or `--domain`) to auto-c
 | `--turn-secret` | `LIGHTHOUSE_TURN_SECRET` | *(ephemeral)* | Optional HMAC secret for universal relay credentials |
 | `--turn-realm` | `LIGHTHOUSE_TURN_REALM` | *(from domain / `lighthouse`)* | TURN authentication realm |
 | `--turn-tls-addr` | `LIGHTHOUSE_TURN_TLS_ADDR` | *(disabled)* | Optional TLS 1.3 / TCP TURNS fallback address |
-| `--hub-origin` | `LIGHTHOUSE_HUB_ORIGIN` | *(from domain / `wss://localhost:8443`)* | Canonical WSS origin verified during registration |
+| `--hub-origin` | `LIGHTHOUSE_HUB_ORIGIN` | *(accept all / from domain)* | Optional pinned canonical WSS origin verified during registration |
 | `--tcp-only` | `LIGHTHOUSE_TCP_ONLY` | `false` | Disable UDP; serve STUNS over TLS 1.3 / TCP only |
 | `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Opt in to plaintext `stun:`/`turn:` listener on `--stun-addr` |
 | `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext STUN/TURN address (requires `--insecure`, default `:3478`) |
@@ -92,20 +92,20 @@ Run with a single domain (`LIGHTHOUSE_DOMAIN` in `.env` or `--domain`) to auto-c
 Launch `lighthouse-ui` (requires `CAP_NET_ADMIN` / TUN privileges to bind `lh0` on Linux):
 
 ```bash
-./bin/lighthouse-ui --domain hub.example.com --ifname lh0
+./bin/lighthouse-ui --hub hub.example.com --ifname lh0
 ```
 
 Inside the app:
 
-1. Click **Bind & Connect** to register with the hub, receive an assigned IP from the hub's CIDR (default `10.88.0.0/16`), and bind the local virtual network interface (`lh0`).
+1. Enter your hub domain (e.g. `hub.example.com` — omit `wss://` and `/v1/signal`) and click **Bind & Connect** to register, receive an assigned IP from the hub's CIDR (default `10.88.0.0/16`), and bind the local virtual network interface (`lh0`).
 2. Enter a shared passphrase and click **Join** to listen for peers on that passphrase. Toggle **Broadcast** only when you want peers with the same passphrase to discover you.
 3. Click **Connect** next to a discovered peer (or enter a Peer ID directly).
 4. On the receiving peer, review the incoming connection prompt and click **Allow**, **Deny**, or **Blacklist**. Manage active tunnels and blacklisted peers from their respective tabs.
 
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
-| `--domain` | `LIGHTHOUSE_DOMAIN` | *(none)* | Single hub domain auto-configuring `--hub` (`wss://<domain>/v1/signal`) |
-| `--hub` | `LIGHTHOUSE_HUB_URL` | *(from domain / `wss://localhost:8443/v1/signal`)* | Universal hub WSS signaling URL |
+| `--domain` | `LIGHTHOUSE_DOMAIN` | *(none)* | Single hub domain (e.g. `hub.example.com`) |
+| `--hub` | `LIGHTHOUSE_HUB_URL` | *(from domain / `localhost:8443`)* | Hub domain or WSS URL (`wss://` and `/v1/signal` optional) |
 | `--ifname` | `LIGHTHOUSE_IFNAME` | `lh0` | OS TUN virtual network interface name |
 | `--ca` | `LIGHTHOUSE_CA` | *(system)* | Optional PEM Root CA bundle |
 | `-s, --stun` | `LIGHTHOUSE_STUN_URI` | *(auto)* | Optional explicit STUNS/TURNS URI |
