@@ -2,6 +2,7 @@
 bin/
 dist/
 coverage.out
+.env
 *.key
 *.crt
 *.db

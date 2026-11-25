@@ -1,0 +1,125 @@
+name: Build and Publish Lighthouse Hub Container
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      default_stun_domain:
+        description: "Optional default STUN domain baked into the image"
+        required: false
+        default: ""
+      default_stun_port:
+        description: "Optional default STUN UDP port"
+        required: false
+        default: "3478"
+      default_hub_origin:
+        description: "Optional default canonical WSS hub origin"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Static Analysis and Race Tests
+        run: |
+          go vet ./...
+          CGO_ENABLED=0 go build -o bin/lighthouse ./cmd/lighthouse
+          go test -race -count=1 ./...
+
+      - name: Resolve and Verify Version Alignment
+        id: version
+        run: |
+          FILE_VER="$(tr -d '[:space:]' < VERSION)"
+          BIN_VER="$(./bin/lighthouse --version | awk '{print $2}')"
+          if [ "$FILE_VER" != "$BIN_VER" ]; then
+            echo "VERSION ($FILE_VER) != lighthouse --version ($BIN_VER)" >&2
+            exit 1
+          fi
+          if ! grep -Fq "v${BIN_VER}" README.md; then
+            echo "README.md does not match lighthouse --version (v${BIN_VER})" >&2
+            exit 1
+          fi
+          RELEASE_VER="$BIN_VER"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            TAG_VER="${GITHUB_REF_NAME#v}"
+            if [ "$TAG_VER" != "$BIN_VER" ]; then
+              echo "Tag ${GITHUB_REF_NAME} does not match lighthouse --version (${BIN_VER})" >&2
+              exit 1
+            fi
+            RELEASE_VER="$TAG_VER"
+          fi
+          echo "version=${RELEASE_VER}" >> "$GITHUB_OUTPUT"
+
+  container:
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.version }}
+            type=raw,value=v${{ needs.verify.outputs.version }}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and Push Hub Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+            LIGHTHOUSE_STUN_DOMAIN=${{ inputs.default_stun_domain || vars.LIGHTHOUSE_STUN_DOMAIN || '' }}
+            LIGHTHOUSE_STUN_PORT=${{ inputs.default_stun_port || vars.LIGHTHOUSE_STUN_PORT || '3478' }}
+            LIGHTHOUSE_HUB_ORIGIN=${{ inputs.default_hub_origin || vars.LIGHTHOUSE_HUB_ORIGIN || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

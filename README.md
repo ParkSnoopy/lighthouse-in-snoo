@@ -1,6 +1,6 @@
-# Lighthouse — Direct P2P WebRTC Networking
+# Lighthouse (v0.1.0)
 
-Lighthouse coordinates authenticated, end-to-end encrypted, direct peer-to-peer WebRTC DataChannel connections through a single-container control-plane hub. Application payloads travel exclusively between participating peers over SCTP protected by DTLS 1.3 above ICE-negotiated UDP paths.
+Lighthouse (`v0.1.0`, reported by `lighthouse --version`) coordinates authenticated, end-to-end encrypted, direct peer-to-peer WebRTC DataChannel connections through a single-container control-plane hub. Application payloads travel exclusively between participating peers over SCTP protected by DTLS 1.3 above ICE-negotiated UDP paths.
 
 ## Architecture
 
@@ -40,10 +40,16 @@ flowchart TB
 
 ## Quick Start
 
-### 1. Build Binary
+### 1. Build Binary (with Optional `.env` / ENV Default STUN Domain)
+
+Build directly with Go or via `Makefile` / `.env` (copy `.env.example` to `.env`) to bake a default STUN domain, port, hub origin, and version (`VERSION` / `lighthouse --version`) into the binary:
 
 ```bash
+# Plain static build
 CGO_ENABLED=0 go build -o bin/lighthouse ./cmd/lighthouse
+
+# Build with default STUN domain via ENV or .env
+LIGHTHOUSE_STUN_DOMAIN=stun.example.com LIGHTHOUSE_HUB_ORIGIN=wss://hub.example.com make build
 ```
 
 ### 2. Provision Offline Authority, Peer Keys, and Policy
@@ -93,11 +99,15 @@ Create `config/policy.json` (provisioned to the hub and each peer):
 }
 ```
 
-### 3. Deploy the Hub with Docker Compose
+### 3. Deploy the Hub with Docker / GHCR
 
-Place `tls.crt`, `tls.key`, and `policy.json` in `./config`, then build and run the single container:
+Pull the versioned hub container published to GitHub Container Registry by `.github/workflows/build.yml` (tagged to match `lighthouse --version`, e.g., `0.1.0` / `v0.1.0`), or build locally with Docker Compose:
 
 ```bash
+# Pull published hub image matching lighthouse --version (v0.1.0)
+docker pull ghcr.io/<owner>/<repo>:v0.1.0
+
+# Or build and run locally (reads optional .env for LIGHTHOUSE_STUN_DOMAIN / VERSION)
 docker compose up -d --build
 ```
 

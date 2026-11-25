@@ -7,8 +7,6 @@ import (
 	"lighthouse-in-snoo/internal/cli"
 )
 
-const appVersion = "0.1.0"
-
 func newRootCommand() *cli.Command {
 	root := &cli.Command{
 		Name:       "lighthouse",

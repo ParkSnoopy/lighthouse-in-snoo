@@ -273,13 +273,15 @@ func newPeerCommand() *cli.Command {
 		ValueName: "URL",
 		ShortHelp: "Hub WSS signaling endpoint",
 		LongHelp:  "TLS 1.3 WebSocket signaling URL (e.g. wss://hub.example.com/v1/signal)",
-		Default:   "wss://localhost:8443/v1/signal",
+		EnvVar:    "LIGHTHOUSE_HUB_URL",
+		Default:   resolvedDefaultHubURL(),
 	})
 	cmd.StringOpt(&hubOrigin, cli.Option{
 		Long:      "hub-origin",
 		ValueName: "URL",
 		ShortHelp: "Canonical hub origin override",
 		LongHelp:  "Explicit wss://host[:port] origin signed in registration proofs (defaults to origin of --hub)",
+		EnvVar:    "LIGHTHOUSE_HUB_ORIGIN",
 	})
 	cmd.StringOpt(&caPath, cli.Option{
 		Long:      "ca",
@@ -293,7 +295,8 @@ func newPeerCommand() *cli.Command {
 		ValueName: "URI",
 		ShortHelp: "UDP STUN server URI",
 		LongHelp:  "Single UDP STUN server URI (stun:host:port); TURN and TCP URIs are prohibited",
-		Default:   "stun:127.0.0.1:3478",
+		EnvVar:    "LIGHTHOUSE_STUN_URI",
+		Default:   resolvedDefaultSTUNURI(),
 	})
 	cmd.StringOpt(&targetID, cli.Option{
 		Long:      "connect",

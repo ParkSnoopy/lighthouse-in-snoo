@@ -118,7 +118,7 @@ func newHubCommand() *cli.Command {
 		ShortHelp: "Canonical WSS hub origin",
 		LongHelp:  "Canonical wss://host[:port] origin verified in peer registration proofs",
 		EnvVar:    "LIGHTHOUSE_HUB_ORIGIN",
-		Default:   "wss://localhost:8443",
+		Default:   resolvedDefaultHubOrigin(),
 	})
 	cmd.StringOpt(&tlsCert, cli.Option{
 		Long:      "tls-cert",

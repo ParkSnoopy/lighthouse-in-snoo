@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -167,5 +168,60 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 	}
 	if !strings.Contains(string(memOut), `"sig"`) {
 		t.Fatalf("unexpected membership output:\n%s", string(memOut))
+	}
+}
+
+func TestVersionAlignmentAndBuildTimeSTUNDomainDefaults(t *testing.T) {
+	t.Parallel()
+
+	// Verify VERSION file, default binary --version, and README.md stay strictly synchronized.
+	verBytes, err := os.ReadFile(filepath.Join("..", "..", "VERSION"))
+	if err != nil {
+		t.Fatalf("read VERSION: %v", err)
+	}
+	fileVer := strings.TrimSpace(string(verBytes))
+	if fileVer != appVersion {
+		t.Fatalf("VERSION file (%q) != appVersion (%q)", fileVer, appVersion)
+	}
+	readmeBytes, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	if !strings.Contains(string(readmeBytes), "v"+fileVer) {
+		t.Fatalf("README.md does not contain current version v%s", fileVer)
+	}
+
+	// Build a binary with compile-time VERSION + LIGHTHOUSE_STUN_DOMAIN injected via -ldflags.
+	tmpDir := t.TempDir()
+	bakedBin := filepath.Join(tmpDir, "lighthouse-baked")
+	ldflags := "-X main.appVersion=9.8.7 -X main.defaultSTUNDomain=stun.baked.example -X main.defaultSTUNPort=3479 -X main.defaultHubOrigin=wss://hub.baked.example"
+	if out, err := exec.Command("go", "build", "-ldflags", ldflags, "-o", bakedBin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build with ldflags failed: %v\n%s", err, string(out))
+	}
+
+	verOut, err := exec.Command(bakedBin, "--version").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(verOut)) != "lighthouse 9.8.7" {
+		t.Fatalf("baked --version = %q (err=%v); want 'lighthouse 9.8.7'", strings.TrimSpace(string(verOut)), err)
+	}
+
+	peerHelp, err := exec.Command(bakedBin, "peer", "--help").CombinedOutput()
+	if err != nil {
+		t.Fatalf("baked peer --help failed: %v\n%s", err, string(peerHelp))
+	}
+	for _, want := range []string{"[default: stun:stun.baked.example:3479]", "[default: wss://hub.baked.example/v1/signal]"} {
+		if !strings.Contains(string(peerHelp), want) {
+			t.Fatalf("baked peer --help missing %q:\n%s", want, string(peerHelp))
+		}
+	}
+
+	// Verify runtime ENV LIGHTHOUSE_STUN_DOMAIN overrides compile-time default.
+	envCmd := exec.Command(bakedBin, "peer", "--help")
+	envCmd.Env = append(os.Environ(), "LIGHTHOUSE_STUN_DOMAIN=stun.env.example", "LIGHTHOUSE_STUN_PORT=3480")
+	envHelp, err := envCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("env peer --help failed: %v\n%s", err, string(envHelp))
+	}
+	if !strings.Contains(string(envHelp), "[default: stun:stun.env.example:3480]") {
+		t.Fatalf("runtime env STUN override not reflected in help:\n%s", string(envHelp))
 	}
 }

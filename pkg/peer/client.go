@@ -64,6 +64,11 @@ type Config struct {
 	MaxClockSkew            time.Duration // Default 30s (Section 9).
 	MaxCandidatesPerGen     int           // Default 128 (Section 9).
 
+	// Optional algorithm for per-PeerConnection ephemeral DTLS 1.3 X.509 certificates
+	// (ed25519, nistp-256 [default], nistp-384, nistp-521, rsa).
+	DTLSCertAlgorithm identity.Algorithm
+	DTLSRSABits       int
+
 	// Strictly for T05 negative testing (simulating a non-conformant DTLS 1.2 peer).
 	// Production callers MUST leave both zero (which enforces DTLS 1.3 min and max).
 	OverrideDTLSMinVersion dtlsProtocol.Version
@@ -1321,9 +1326,17 @@ func (s *Session) newPeerConnectionLocked(gen uint32, offerer bool) (*webrtc.Pee
 	if s.client.cfg.STUNServerURI != "" {
 		iceServers = []webrtc.ICEServer{{URLs: []string{s.client.cfg.STUNServerURI}}}
 	}
-	pc, err := api.NewPeerConnection(webrtc.Configuration{
+	pcCfg := webrtc.Configuration{
 		ICEServers: iceServers,
-	})
+	}
+	if s.client.cfg.DTLSCertAlgorithm != "" {
+		cert, certErr := generateEphemeralDTLSCertificate(s.client.cfg.DTLSCertAlgorithm, s.client.cfg.DTLSRSABits)
+		if certErr != nil {
+			return nil, certErr
+		}
+		pcCfg.Certificates = []webrtc.Certificate{cert}
+	}
+	pc, err := api.NewPeerConnection(pcCfg)
 	if err != nil {
 		return nil, err
 	}
