@@ -1,0 +1,24 @@
+services:
+  lighthouse:
+    image: lighthouse:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "443:8443/tcp"
+      - "3478:3478/udp"
+    volumes:
+      - ./config:/etc/lighthouse:ro
+      - lighthouse-state:/var/lib/lighthouse
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "10001:10001"
+
+volumes:
+  lighthouse-state:
