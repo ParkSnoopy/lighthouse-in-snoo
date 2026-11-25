@@ -53,7 +53,7 @@ Each acceptance requirement in `test/acceptance` exercises independently authent
 
 | Package | Command | Covered Invariants |
 | --- | --- | --- |
-| `cmd/lighthouse` | `go test -race ./cmd/lighthouse` | Clap/POSIX flag rules, single-source `version.go` / `README.md` sync (no duplicated `ARG VERSION`), runtime-only `LIGHTHOUSE_*` env/`.env` loading, `--insecure` and `--tcp-only` CLI validation |
+| `cmd/lighthouse` | `go test -race ./cmd/lighthouse` | Clap/POSIX flag rules, single-source `version.go` (no duplicated `ARG VERSION` or hardcoded README version), runtime-only `LIGHTHOUSE_*` env/`.env` loading, `--insecure` and `--tcp-only` CLI validation |
 | `internal/jcs` | `go test -race ./internal/jcs` | RFC 8785 UTF-16 key sorting, ES6 number canonicalization, duplicate-key rejection, strict field decoding |
 | `pkg/identity` | `go test -race ./pkg/identity` | Multi-algorithm keygen, `0600` file mode enforcement, `peer_id` derivation, registration proofs, authority memberships, ACLs, revocations |
 | `pkg/protocol` | `go test -race ./pkg/protocol` | 12 message schemas, `64 KiB` limit, JCS envelope signatures, clock skew and TTL bounds |

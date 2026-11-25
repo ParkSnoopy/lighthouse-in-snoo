@@ -227,8 +227,8 @@ func TestVersionAlignmentAndRuntimeEnvDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read README.md: %v", err)
 	}
-	if !strings.Contains(string(readmeBytes), "v"+Version) {
-		t.Fatalf("README.md does not contain current version v%s", Version)
+	if strings.Contains(string(readmeBytes), Version) {
+		t.Fatalf("README.md must not hardcode specific version %q", Version)
 	}
 
 	// Verify build definitions never duplicate Version or bake LIGHTHOUSE_* variables at build time.

@@ -43,10 +43,6 @@ jobs:
             echo "failed to resolve version from lighthouse --version" >&2
             exit 1
           fi
-          if ! grep -Fq "v${BIN_VER}" README.md; then
-            echo "README.md does not match lighthouse --version (v${BIN_VER})" >&2
-            exit 1
-          fi
           RELEASE_VER="$BIN_VER"
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
             TAG_VER="${GITHUB_REF_NAME#v}"
