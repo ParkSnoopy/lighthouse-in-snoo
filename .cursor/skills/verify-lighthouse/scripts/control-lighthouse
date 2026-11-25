@@ -1,0 +1,797 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+
+die() {
+  echo "control-lighthouse: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"
+}
+
+pick_free_port() {
+  local exclude="${1:-}"
+  local p
+  for _ in $(seq 1 120); do
+    p=$(( 20000 + (RANDOM % 30000) ))
+    if [ -n "$exclude" ] && [ "$p" = "$exclude" ]; then
+      continue
+    fi
+    if ! ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${p}$"; then
+      echo "$p"
+      return 0
+    fi
+  done
+  die "failed to allocate a free local port"
+}
+
+read_version_const() {
+  sed -n 's/^const Version = "\(.*\)"/\1/p' "$REPO_ROOT/cmd/lighthouse/version.go"
+}
+
+run_clean_env() {
+  local args=(env)
+  while IFS='=' read -r k _; do
+    case "$k" in
+      LIGHTHOUSE_*) args+=(-u "$k") ;;
+    esac
+  done < <(env)
+  "${args[@]}" "$@"
+}
+
+stop_pid_file() {
+  local pidfile="$1"
+  [ -f "$pidfile" ] || return 0
+  local pid
+  pid="$(tr -d '[:space:]' < "$pidfile")"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+      sleep 0.1
+    fi
+  fi
+  rm -f "$pidfile"
+}
+
+cmd_launch() {
+  require_cmd go
+  require_cmd openssl
+  require_cmd curl
+  require_cmd jq
+  require_cmd ss
+
+  local run_id="lh-$(date +%Y%m%d-%H%M%S)-$$"
+  local tcp_only="false"
+  local insecure="false"
+  local turn_secret=""
+  local evidence_base="/tmp/lighthouse-verify-evidence"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id) run_id="$2"; shift 2 ;;
+      --tcp-only) tcp_only="true"; shift ;;
+      --insecure) insecure="true"; shift ;;
+      --turn-secret) turn_secret="$2"; shift 2 ;;
+      --evidence-dir) evidence_base="$2"; shift 2 ;;
+      *) die "unknown launch option: $1" ;;
+    esac
+  done
+
+  local run_dir="/tmp/lighthouse-verify-${run_id}"
+  local evidence_dir="${evidence_base}/${run_id}"
+  if [ -e "$run_dir" ]; then
+    die "run dir already exists: $run_dir (choose a fresh --run-id or clean it up)"
+  fi
+
+  mkdir -p "$run_dir"/{bin,tls,keys,memberships,logs,pids,fifos}
+  mkdir -p "$evidence_dir"
+
+  local bin="$run_dir/bin/lighthouse"
+  (cd "$REPO_ROOT" && CGO_ENABLED=0 GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$bin" ./cmd/lighthouse)
+
+  # Verification scaffolding: disposable self-signed CA + TLS 1.3 leaf for 127.0.0.1 / localhost.
+  # Removed completely during cleanup.
+  openssl ecparam -name prime256v1 -genkey -noout -out "$run_dir/tls/ca.key" 2>/dev/null
+  openssl req -x509 -new -key "$run_dir/tls/ca.key" -sha256 -days 1 \
+    -subj "/CN=lighthouse-verify-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -out "$run_dir/tls/ca.crt" 2>/dev/null
+
+  openssl ecparam -name prime256v1 -genkey -noout -out "$run_dir/tls/server.key" 2>/dev/null
+  openssl req -new -key "$run_dir/tls/server.key" -subj "/CN=localhost" -out "$run_dir/tls/server.csr" 2>/dev/null
+  cat > "$run_dir/tls/ext.cnf" <<'EOF'
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=IP:127.0.0.1,DNS:localhost
+EOF
+  openssl x509 -req -in "$run_dir/tls/server.csr" -CA "$run_dir/tls/ca.crt" -CAkey "$run_dir/tls/ca.key" \
+    -CAcreateserial -days 1 -sha256 -extfile "$run_dir/tls/ext.cnf" -out "$run_dir/tls/server.crt" 2>/dev/null
+  chmod 0600 "$run_dir/tls/ca.key" "$run_dir/tls/server.key"
+
+  # Seed authority + peer-a + peer-b identities and memberships using the real CLI.
+  local auth_json peer_a_json peer_b_json
+  auth_json="$(run_clean_env "$bin" admin keygen --out "$run_dir/keys/authority.key")"
+  peer_a_json="$(run_clean_env "$bin" admin keygen --out "$run_dir/keys/peer-a.key")"
+  peer_b_json="$(run_clean_env "$bin" admin keygen --out "$run_dir/keys/peer-b.key")"
+
+  local auth_pub peer_a_id peer_a_pub peer_b_id peer_b_pub
+  auth_pub="$(jq -r '.public_key' <<<"$auth_json")"
+  peer_a_id="$(jq -r '.peer_id' <<<"$peer_a_json")"
+  peer_a_pub="$(jq -r '.public_key' <<<"$peer_a_json")"
+  peer_b_id="$(jq -r '.peer_id' <<<"$peer_b_json")"
+  peer_b_pub="$(jq -r '.public_key' <<<"$peer_b_json")"
+
+  run_clean_env "$bin" admin issue-membership \
+    --authority "$run_dir/keys/authority.key" \
+    --peer-pub "$peer_a_pub" \
+    --allow "$peer_b_id" \
+    --ttl 24h \
+    --out "$run_dir/memberships/peer-a.json" >/dev/null
+
+  run_clean_env "$bin" admin issue-membership \
+    --authority "$run_dir/keys/authority.key" \
+    --peer-pub "$peer_b_pub" \
+    --allow "$peer_a_id" \
+    --ttl 24h \
+    --out "$run_dir/memberships/peer-b.json" >/dev/null
+
+  jq -n \
+    --arg auth_pub "$auth_pub" \
+    --arg peer_a "$peer_a_id" \
+    --arg peer_b "$peer_b_id" \
+    '{
+      v: 1,
+      trusted_authorities: [$auth_pub],
+      acl_rules: [{peer_a: $peer_a, peer_b: $peer_b}]
+    }' > "$run_dir/policy.json"
+
+  local https_port stuns_port stun_insecure_port=""
+  https_port="$(pick_free_port)"
+  stuns_port="$(pick_free_port "$https_port")"
+  if [ "$insecure" = "true" ]; then
+    stun_insecure_port="$(pick_free_port "$stuns_port")"
+    while [ "$stun_insecure_port" = "$https_port" ]; do
+      stun_insecure_port="$(pick_free_port "$stuns_port")"
+    done
+  fi
+
+  local hub_origin="wss://127.0.0.1:${https_port}"
+  local hub_url="${hub_origin}/v1/signal"
+  local stuns_uri="stuns:127.0.0.1:${stuns_port}"
+  local db_path="$run_dir/state.db"
+
+  local hub_args=(
+    hub
+    --https-addr "127.0.0.1:${https_port}"
+    --stuns-addr "127.0.0.1:${stuns_port}"
+    --hub-origin "$hub_origin"
+    --tls-cert "$run_dir/tls/server.crt"
+    --tls-key "$run_dir/tls/server.key"
+    --policy "$run_dir/policy.json"
+    --sqlite "$db_path"
+  )
+  if [ "$tcp_only" = "true" ]; then
+    hub_args+=(--tcp-only)
+  fi
+  if [ "$insecure" = "true" ]; then
+    hub_args+=(--insecure --stun-addr "127.0.0.1:${stun_insecure_port}")
+  fi
+  if [ -n "$turn_secret" ]; then
+    hub_args+=(--turn-secret "$turn_secret")
+  fi
+
+  # Launch hub in isolated working dir so local repo .env is never read implicitly.
+  (
+    cd "$run_dir"
+    run_clean_env "$bin" "${hub_args[@]}" >"$run_dir/logs/hub.out" 2>"$run_dir/logs/hub.log" &
+    echo $! > "$run_dir/pids/hub.pid"
+  )
+  local hub_pid
+  hub_pid="$(cat "$run_dir/pids/hub.pid")"
+
+  # Wait for usable readiness: started log line + TLS 1.3 /healthz 200 {"status":"ok"}.
+  local ready="false"
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$hub_pid" 2>/dev/null; then
+      cat "$run_dir/logs/hub.log" >&2 || true
+      rm -rf "$run_dir"
+      die "hub process exited before becoming ready"
+    fi
+    if grep -q '"msg":"lighthouse hub started"' "$run_dir/logs/hub.log" 2>/dev/null; then
+      local body
+      body="$(curl --tlsv1.3 --tls-max 1.3 --cacert "$run_dir/tls/ca.crt" -fsS \
+        "https://127.0.0.1:${https_port}/healthz" 2>/dev/null || true)"
+      if [ "$body" = '{"status":"ok"}' ]; then
+        ready="true"
+        break
+      fi
+    fi
+    sleep 0.1
+  done
+
+  if [ "$ready" != "true" ]; then
+    stop_pid_file "$run_dir/pids/hub.pid"
+    cat "$run_dir/logs/hub.log" >&2 || true
+    rm -rf "$run_dir"
+    die "hub failed readiness check within timeout"
+  fi
+
+  local bin_ver
+  bin_ver="$(run_clean_env "$bin" --version | awk '{print $2}')"
+
+  jq -n \
+    --arg run_id "$run_id" \
+    --arg run_dir "$run_dir" \
+    --arg evidence_dir "$evidence_dir" \
+    --arg binary "$bin" \
+    --arg version "$bin_ver" \
+    --arg hub_pid "$hub_pid" \
+    --argjson https_port "$https_port" \
+    --argjson stuns_port "$stuns_port" \
+    --arg stun_insecure_port "$stun_insecure_port" \
+    --arg hub_origin "$hub_origin" \
+    --arg hub_url "$hub_url" \
+    --arg stuns_uri "$stuns_uri" \
+    --arg ca_cert "$run_dir/tls/ca.crt" \
+    --arg policy "$run_dir/policy.json" \
+    --arg sqlite "$db_path" \
+    --arg authority_pub "$auth_pub" \
+    --arg peer_a_id "$peer_a_id" \
+    --arg peer_a_pub "$peer_a_pub" \
+    --arg peer_b_id "$peer_b_id" \
+    --arg peer_b_pub "$peer_b_pub" \
+    --argjson tcp_only "$tcp_only" \
+    --argjson insecure "$insecure" \
+    '{
+      run_id: $run_id,
+      run_dir: $run_dir,
+      evidence_dir: $evidence_dir,
+      binary: $binary,
+      version: $version,
+      hub_pid: ($hub_pid | tonumber),
+      https_port: $https_port,
+      stuns_port: $stuns_port,
+      stun_insecure_port: (if $stun_insecure_port == "" then null else ($stun_insecure_port | tonumber) end),
+      hub_origin: $hub_origin,
+      hub_url: $hub_url,
+      stuns_uri: $stuns_uri,
+      ca_cert: $ca_cert,
+      policy: $policy,
+      sqlite: $sqlite,
+      authority_pub: $authority_pub,
+      peer_a: {id: $peer_a_id, public_key: $peer_a_pub, key: ($run_dir + "/keys/peer-a.key"), membership: ($run_dir + "/memberships/peer-a.json")},
+      peer_b: {id: $peer_b_id, public_key: $peer_b_pub, key: ($run_dir + "/keys/peer-b.key"), membership: ($run_dir + "/memberships/peer-b.json")},
+      tcp_only: $tcp_only,
+      insecure: $insecure
+    }' > "$run_dir/state.json"
+
+  cat "$run_dir/state.json"
+}
+
+cmd_doctor() {
+  require_cmd curl
+  require_cmd jq
+  require_cmd ss
+
+  local run_dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "doctor requires --run-dir <DIR>"
+  [ -f "$run_dir/state.json" ] || die "missing $run_dir/state.json"
+
+  local bin hub_pid https_port stuns_port ca_cert tcp_only insecure stun_insecure_port
+  bin="$(jq -r '.binary' "$run_dir/state.json")"
+  hub_pid="$(jq -r '.hub_pid' "$run_dir/state.json")"
+  https_port="$(jq -r '.https_port' "$run_dir/state.json")"
+  stuns_port="$(jq -r '.stuns_port' "$run_dir/state.json")"
+  ca_cert="$(jq -r '.ca_cert' "$run_dir/state.json")"
+  tcp_only="$(jq -r '.tcp_only' "$run_dir/state.json")"
+  insecure="$(jq -r '.insecure' "$run_dir/state.json")"
+  stun_insecure_port="$(jq -r '.stun_insecure_port // empty' "$run_dir/state.json")"
+
+  local ok="true"
+  local issues=()
+
+  # 1. Process alive and matches our built binary.
+  if ! kill -0 "$hub_pid" 2>/dev/null; then
+    ok="false"
+    issues+=("hub pid $hub_pid is not running")
+  elif [ -r "/proc/${hub_pid}/cmdline" ] && ! tr '\0' ' ' < "/proc/${hub_pid}/cmdline" | grep -Fq "$bin"; then
+    ok="false"
+    issues+=("pid $hub_pid does not match binary $bin")
+  fi
+
+  # 2. Binary version matches cmd/lighthouse/version.go.
+  local source_ver bin_ver
+  source_ver="$(read_version_const)"
+  bin_ver="$(run_clean_env "$bin" --version | awk '{print $2}')"
+  if [ "$source_ver" != "$bin_ver" ]; then
+    ok="false"
+    issues+=("binary version ($bin_ver) != version.go ($source_ver)")
+  fi
+
+  # 3. Socket ownership checks.
+  local tcp_sockets udp_sockets
+  tcp_sockets="$(ss -H -lntp 2>/dev/null | grep "pid=${hub_pid}," || true)"
+  udp_sockets="$(ss -H -lnup 2>/dev/null | grep "pid=${hub_pid}," || true)"
+
+  if ! grep -q "127.0.0.1:${https_port}" <<<"$tcp_sockets"; then
+    ok="false"
+    issues+=("hub pid $hub_pid does not own TCP 127.0.0.1:${https_port}")
+  fi
+
+  if [ "$tcp_only" = "true" ]; then
+    if [ -n "$udp_sockets" ]; then
+      ok="false"
+      issues+=("tcp-only hub unexpectedly bound UDP sockets: $udp_sockets")
+    fi
+    if ! grep -q "127.0.0.1:${stuns_port}" <<<"$tcp_sockets"; then
+      ok="false"
+      issues+=("tcp-only hub does not own TLS/TCP STUNS 127.0.0.1:${stuns_port}")
+    fi
+  else
+    if ! grep -q "127.0.0.1:${stuns_port}" <<<"$udp_sockets"; then
+      ok="false"
+      issues+=("hub does not own DTLS/UDP STUNS 127.0.0.1:${stuns_port}")
+    fi
+  fi
+
+  if [ "$insecure" = "true" ] && [ -n "$stun_insecure_port" ]; then
+    if [ "$tcp_only" = "true" ]; then
+      if ! grep -q "127.0.0.1:${stun_insecure_port}" <<<"$tcp_sockets"; then
+        ok="false"
+        issues+=("insecure tcp-only hub missing TCP 127.0.0.1:${stun_insecure_port}")
+      fi
+    else
+      if ! grep -q "127.0.0.1:${stun_insecure_port}" <<<"$udp_sockets"; then
+        ok="false"
+        issues+=("insecure hub missing UDP 127.0.0.1:${stun_insecure_port}")
+      fi
+    fi
+  fi
+
+  # 4. TLS 1.3 /healthz returns ok and TLS 1.2 fails handshake.
+  local health_body tls12_rejected="false"
+  health_body="$(curl --tlsv1.3 --tls-max 1.3 --cacert "$ca_cert" -fsS "https://127.0.0.1:${https_port}/healthz" 2>/dev/null || true)"
+  if [ "$health_body" != '{"status":"ok"}' ]; then
+    ok="false"
+    issues+=("TLS 1.3 /healthz failed (body=$health_body)")
+  fi
+  if curl --tlsv1.2 --tls-max 1.2 --cacert "$ca_cert" -fsS "https://127.0.0.1:${https_port}/healthz" >/dev/null 2>&1; then
+    ok="false"
+    issues+=("TLS 1.2 /healthz unexpectedly succeeded")
+  else
+    tls12_rejected="true"
+  fi
+
+  # 5. Key file permissions are 0600.
+  for kf in "$run_dir/keys/authority.key" "$run_dir/keys/peer-a.key" "$run_dir/keys/peer-b.key"; do
+    local mode
+    mode="$(stat -c '%a' "$kf" 2>/dev/null || echo missing)"
+    if [ "$mode" != "600" ]; then
+      ok="false"
+      issues+=("key $kf has mode $mode (expected 600)")
+    fi
+  done
+
+  local issues_json="[]"
+  if [ "${#issues[@]}" -gt 0 ]; then
+    issues_json="$(printf '%s\n' "${issues[@]}" | jq -R . | jq -s .)"
+  fi
+
+  jq -n \
+    --argjson healthy "$ok" \
+    --arg run_dir "$run_dir" \
+    --arg version "$bin_ver" \
+    --argjson hub_pid "$hub_pid" \
+    --argjson https_port "$https_port" \
+    --argjson stuns_port "$stuns_port" \
+    --argjson tcp_only "$tcp_only" \
+    --argjson tls12_rejected "$tls12_rejected" \
+    --argjson udp_socket_count "$(printf '%s' "$udp_sockets" | grep -c . || true)" \
+    --argjson issues "$issues_json" \
+    '{
+      healthy: $healthy,
+      run_dir: $run_dir,
+      version: $version,
+      hub_pid: $hub_pid,
+      https_port: $https_port,
+      stuns_port: $stuns_port,
+      tcp_only: $tcp_only,
+      tls12_rejected: $tls12_rejected,
+      hub_udp_sockets: $udp_socket_count,
+      issues: $issues
+    }'
+
+  [ "$ok" = "true" ]
+}
+
+cmd_cli() {
+  local run_dir="" capture_rel=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      --capture) capture_rel="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) die "unknown cli option: $1 (pass '--' before lighthouse args)" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "cli requires --run-dir <DIR>"
+  [ $# -gt 0 ] || die "cli requires lighthouse arguments after '--'"
+
+  local bin evidence_dir
+  bin="$(jq -r '.binary' "$run_dir/state.json")"
+  evidence_dir="$(jq -r '.evidence_dir' "$run_dir/state.json")"
+
+  local tmp_out tmp_err rc=0
+  tmp_out="$(mktemp "$run_dir/logs/cli-out.XXXXXX")"
+  tmp_err="$(mktemp "$run_dir/logs/cli-err.XXXXXX")"
+  (cd "$run_dir" && run_clean_env "$bin" "$@") >"$tmp_out" 2>"$tmp_err" || rc=$?
+
+  cat "$tmp_out"
+  cat "$tmp_err" >&2
+
+  if [ -n "$capture_rel" ]; then
+    local dst="$evidence_dir/$capture_rel"
+    mkdir -p "$(dirname "$dst")"
+    {
+      echo "command: lighthouse $*"
+      echo "exit_code: $rc"
+      echo "--- stdout ---"
+      cat "$tmp_out"
+      echo "--- stderr ---"
+      cat "$tmp_err"
+    } > "$dst"
+  fi
+  rm -f "$tmp_out" "$tmp_err"
+  return "$rc"
+}
+
+cmd_peer_start() {
+  local run_dir="" name="" connect_id="" key_path="" mem_path="" pol_path=""
+  local stun_uri="" turn_uri="" turn_user="" turn_pass="" tcp_only_override="" insecure="false"
+  local wait_timeout=15
+  local extra_args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --connect) connect_id="$2"; shift 2 ;;
+      --key) key_path="$2"; shift 2 ;;
+      --membership) mem_path="$2"; shift 2 ;;
+      --policy) pol_path="$2"; shift 2 ;;
+      --stun) stun_uri="$2"; shift 2 ;;
+      --turn) turn_uri="$2"; shift 2 ;;
+      --turn-user) turn_user="$2"; shift 2 ;;
+      --turn-pass) turn_pass="$2"; shift 2 ;;
+      --tcp-only) tcp_only_override="true"; shift ;;
+      --insecure) insecure="true"; shift ;;
+      --timeout) wait_timeout="$2"; shift 2 ;;
+      --) shift; extra_args=("$@"); break ;;
+      *) die "unknown peer-start option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "peer-start requires --run-dir <DIR>"
+  [ -n "$name" ] || die "peer-start requires --name <NAME>"
+
+  local bin hub_url ca_cert default_policy default_stun state_tcp_only
+  bin="$(jq -r '.binary' "$run_dir/state.json")"
+  hub_url="$(jq -r '.hub_url' "$run_dir/state.json")"
+  ca_cert="$(jq -r '.ca_cert' "$run_dir/state.json")"
+  default_policy="$(jq -r '.policy' "$run_dir/state.json")"
+  default_stun="$(jq -r '.stuns_uri' "$run_dir/state.json")"
+  state_tcp_only="$(jq -r '.tcp_only' "$run_dir/state.json")"
+
+  if [ -z "$key_path" ]; then
+    case "$name" in
+      peer-a) key_path="$(jq -r '.peer_a.key' "$run_dir/state.json")" ;;
+      peer-b) key_path="$(jq -r '.peer_b.key' "$run_dir/state.json")" ;;
+      *) die "peer-start requires --key for custom peer name '$name'" ;;
+    esac
+  fi
+  if [ -z "$mem_path" ]; then
+    case "$name" in
+      peer-a) mem_path="$(jq -r '.peer_a.membership' "$run_dir/state.json")" ;;
+      peer-b) mem_path="$(jq -r '.peer_b.membership' "$run_dir/state.json")" ;;
+    esac
+  fi
+  [ -n "$pol_path" ] || pol_path="$default_policy"
+  [ -n "$stun_uri" ] || stun_uri="$default_stun"
+
+  local use_tcp_only="$state_tcp_only"
+  [ -z "$tcp_only_override" ] || use_tcp_only="$tcp_only_override"
+
+  local fifo="$run_dir/fifos/${name}.in"
+  local out_log="$run_dir/logs/${name}.out"
+  local err_log="$run_dir/logs/${name}.err"
+  local pid_file="$run_dir/pids/${name}.pid"
+  local holder_pid_file="$run_dir/pids/${name}-fifo.pid"
+
+  stop_pid_file "$pid_file"
+  stop_pid_file "$holder_pid_file"
+  rm -f "$fifo" "$out_log" "$err_log"
+  mkfifo "$fifo"
+  : > "$out_log"
+  : > "$err_log"
+
+  # Keep FIFO write end open so lighthouse peer does not exit immediately on stdin EOF.
+  sleep 3600 >"$fifo" &
+  echo $! > "$holder_pid_file"
+
+  local args=(
+    peer
+    --key "$key_path"
+    --policy "$pol_path"
+    --hub "$hub_url"
+    --ca "$ca_cert"
+    --stun "$stun_uri"
+  )
+  [ -z "$mem_path" ] || args+=(--membership "$mem_path")
+  [ -z "$connect_id" ] || args+=(--connect "$connect_id")
+  [ -z "$turn_uri" ] || args+=(--turn "$turn_uri")
+  [ -z "$turn_user" ] || args+=(--turn-user "$turn_user")
+  [ -z "$turn_pass" ] || args+=(--turn-pass "$turn_pass")
+  [ "$use_tcp_only" != "true" ] || args+=(--tcp-only)
+  [ "$insecure" != "true" ] || args+=(--insecure)
+  if [ "${#extra_args[@]}" -gt 0 ]; then
+    args+=("${extra_args[@]}")
+  fi
+
+  (
+    cd "$run_dir"
+    run_clean_env "$bin" "${args[@]}" <"$fifo" >"$out_log" 2>"$err_log" &
+    echo $! > "$pid_file"
+  )
+  local pid
+  pid="$(cat "$pid_file")"
+
+  local want_msg='"msg":"registered with lighthouse"'
+  [ -z "$connect_id" ] || want_msg='"msg":"session established"'
+
+  local loops=$(( wait_timeout * 10 ))
+  for _ in $(seq 1 "$loops"); do
+    if grep -q "$want_msg" "$err_log" 2>/dev/null; then
+      jq -n --arg name "$name" --argjson pid "$pid" --arg ready_on "$want_msg" \
+        '{name: $name, pid: $pid, ready: true, marker: $ready_on}'
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      cat "$err_log" >&2 || true
+      stop_pid_file "$holder_pid_file"
+      die "peer '$name' exited before reaching $want_msg"
+    fi
+    sleep 0.1
+  done
+
+  cat "$err_log" >&2 || true
+  die "peer '$name' timed out waiting for $want_msg"
+}
+
+cmd_peer_send() {
+  local run_dir="" name="" msg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --message) msg="$2"; shift 2 ;;
+      *) die "unknown peer-send option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "peer-send requires --run-dir <DIR>"
+  [ -n "$name" ] || die "peer-send requires --name <NAME>"
+  local fifo="$run_dir/fifos/${name}.in"
+  [ -p "$fifo" ] || die "missing peer FIFO: $fifo"
+  printf '%s\n' "$msg" > "$fifo"
+}
+
+cmd_peer_wait() {
+  local run_dir="" name="" stdout_match="" stderr_match="" wait_exit="false" timeout=15
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --stdout-contains) stdout_match="$2"; shift 2 ;;
+      --stderr-contains) stderr_match="$2"; shift 2 ;;
+      --exit) wait_exit="true"; shift ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      *) die "unknown peer-wait option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "peer-wait requires --run-dir <DIR>"
+  [ -n "$name" ] || die "peer-wait requires --name <NAME>"
+
+  local out_log="$run_dir/logs/${name}.out"
+  local err_log="$run_dir/logs/${name}.err"
+  local pid_file="$run_dir/pids/${name}.pid"
+  local loops=$(( timeout * 10 ))
+
+  for _ in $(seq 1 "$loops"); do
+    if [ -n "$stdout_match" ] && grep -Fq "$stdout_match" "$out_log" 2>/dev/null; then
+      return 0
+    fi
+    if [ -n "$stderr_match" ] && grep -Fq "$stderr_match" "$err_log" 2>/dev/null; then
+      return 0
+    fi
+    if [ "$wait_exit" = "true" ]; then
+      if [ ! -f "$pid_file" ] || ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  echo "--- ${name}.out ---" >&2
+  cat "$out_log" >&2 || true
+  echo "--- ${name}.err ---" >&2
+  cat "$err_log" >&2 || true
+  die "peer-wait timed out for '$name'"
+}
+
+cmd_peer_stop() {
+  local run_dir="" name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      *) die "unknown peer-stop option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "peer-stop requires --run-dir <DIR>"
+  [ -n "$name" ] || die "peer-stop requires --name <NAME>"
+  stop_pid_file "$run_dir/pids/${name}.pid"
+  stop_pid_file "$run_dir/pids/${name}-fifo.pid"
+  rm -f "$run_dir/fifos/${name}.in"
+}
+
+cmd_hub_reload() {
+  local run_dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      *) die "unknown hub-reload option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "hub-reload requires --run-dir <DIR>"
+  local hub_pid log_file before after
+  hub_pid="$(cat "$run_dir/pids/hub.pid")"
+  log_file="$run_dir/logs/hub.log"
+  before="$(grep -c '"msg":"policy reloaded"' "$log_file" 2>/dev/null || true)"
+  kill -HUP "$hub_pid"
+  for _ in $(seq 1 50); do
+    after="$(grep -c '"msg":"policy reloaded"' "$log_file" 2>/dev/null || true)"
+    if [ "$after" -gt "$before" ]; then
+      echo '{"reloaded":true}'
+      return 0
+    fi
+    sleep 0.1
+  done
+  cat "$log_file" >&2 || true
+  die "hub did not log policy reload after SIGHUP"
+}
+
+cmd_capture() {
+  local run_dir="" feature="" note=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      --feature) feature="$2"; shift 2 ;;
+      --note) note="$2"; shift 2 ;;
+      *) die "unknown capture option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "capture requires --run-dir <DIR>"
+  [ -n "$feature" ] || die "capture requires --feature <ID>"
+
+  local evidence_dir dst
+  evidence_dir="$(jq -r '.evidence_dir' "$run_dir/state.json")"
+  dst="$evidence_dir/$feature"
+  mkdir -p "$dst"
+
+  cp "$run_dir/state.json" "$dst/state.json"
+  cp "$run_dir/policy.json" "$dst/policy.json"
+  cp -a "$run_dir/logs/." "$dst/" 2>/dev/null || true
+
+  # Snapshot sockets owned strictly by our run PIDs.
+  local pid_regex=""
+  for pf in "$run_dir"/pids/*.pid; do
+    [ -f "$pf" ] || continue
+    local p
+    p="$(tr -d '[:space:]' < "$pf")"
+    [ -n "$p" ] || continue
+    if [ -z "$pid_regex" ]; then
+      pid_regex="pid=${p},"
+    else
+      pid_regex="${pid_regex}|pid=${p},"
+    fi
+  done
+  if [ -n "$pid_regex" ]; then
+    ss -H -lntup 2>/dev/null | grep -E "$pid_regex" > "$dst/sockets.txt" || true
+  else
+    : > "$dst/sockets.txt"
+  fi
+
+  if [ -n "$note" ]; then
+    printf '%s\n' "$note" > "$dst/note.txt"
+  fi
+  jq -n --arg evidence_path "$dst" --arg feature "$feature" '{captured: true, feature: $feature, path: $evidence_path}'
+}
+
+cmd_cleanup() {
+  local run_dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-dir) run_dir="$2"; shift 2 ;;
+      *) die "unknown cleanup option: $1" ;;
+    esac
+  done
+  [ -n "$run_dir" ] || die "cleanup requires --run-dir <DIR>"
+  [ -d "$run_dir" ] || { echo '{"cleaned":true,"note":"run_dir already absent"}'; return 0; }
+
+  local evidence_dir=""
+  if [ -f "$run_dir/state.json" ]; then
+    evidence_dir="$(jq -r '.evidence_dir' "$run_dir/state.json")"
+  fi
+
+  # Kill ONLY processes started by this run (never by process name), peers before hub.
+  for pf in "$run_dir"/pids/*.pid; do
+    [ -f "$pf" ] || continue
+    [ "$(basename "$pf")" = "hub.pid" ] && continue
+    stop_pid_file "$pf"
+  done
+  stop_pid_file "$run_dir/pids/hub.pid"
+
+  # Remove disposable run state and TLS scaffolding; never touch evidence_dir.
+  rm -rf "$run_dir"
+  jq -n --arg run_dir "$run_dir" --arg evidence_dir "$evidence_dir" \
+    '{cleaned: true, removed_run_dir: $run_dir, preserved_evidence_dir: $evidence_dir}'
+}
+
+usage() {
+  cat <<'EOF'
+Usage: control-lighthouse <command> [options]
+
+Commands:
+  launch      Build lighthouse, seed disposable PKI/identities/policy, start isolated hub
+  doctor      Read-only health check (PID, version.go match, sockets, TLS 1.3 vs 1.2, 0600 keys)
+  cli         Run isolated lighthouse CLI command with optional proof capture
+  peer-start  Start live lighthouse peer backed by open stdin FIFO
+  peer-send   Send one line over live peer's data/v1 DataChannel
+  peer-wait   Wait for peer stdout/stderr text or process exit
+  peer-stop   Stop one tracked peer process by PID
+  hub-reload  Send SIGHUP to tracked hub PID and wait for policy reload log
+  capture     Snapshot logs, state, policy, and run-owned sockets into evidence dir
+  cleanup     Stop all tracked PIDs and delete run dir while preserving evidence dir
+EOF
+}
+
+case "${1:-}" in
+  launch) shift; cmd_launch "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  cli) shift; cmd_cli "$@" ;;
+  peer-start) shift; cmd_peer_start "$@" ;;
+  peer-send) shift; cmd_peer_send "$@" ;;
+  peer-wait) shift; cmd_peer_wait "$@" ;;
+  peer-stop) shift; cmd_peer_stop "$@" ;;
+  hub-reload) shift; cmd_hub_reload "$@" ;;
+  capture) shift; cmd_capture "$@" ;;
+  cleanup) shift; cmd_cleanup "$@" ;;
+  -h|--help|"") usage ;;
+  *) die "unknown command: $1" ;;
+esac
