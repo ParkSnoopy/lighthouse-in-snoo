@@ -110,7 +110,10 @@ type Server struct {
 }
 
 // New creates and starts a STUNS (DTLS 1.3/UDP or TLS 1.3/TCP) and/or opt-in insecure STUN Binding server.
-func New(cfg Config) (*Server, error) {
+func New(cfg *Config) (*Server, error) {
+	if cfg == nil {
+		return nil, errors.New("stunserver: config is required")
+	}
 	wantsPlainUDP := cfg.ListenAddr != "" || cfg.PacketConn != nil
 	wantsPlainTCP := cfg.TCPListenAddr != "" || cfg.TCPListener != nil
 	if (wantsPlainUDP || wantsPlainTCP) && !cfg.AllowInsecure {

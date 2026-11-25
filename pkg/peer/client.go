@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"sort"
@@ -45,85 +46,95 @@ type resolvedICEServer struct {
 	Credential string
 }
 
-// Config configures an authenticated WebRTC peer client.
-// By default only encrypted stuns: and turns: (DTLS 1.3 / UDP prioritized) are permitted;
-// plaintext stun: and turn: require explicit opt-in via AllowInsecureICE.
-type Config struct {
-	KeyPair    *identity.KeyPair
-	Membership *identity.MembershipRecord
-	Policy     identity.PolicyConfig
+type knownPeerInfo struct {
+	PublicKey   identity.PublicKey
+	DisplayName string
+	ChannelID   string
+}
 
+// Config configures a consent-driven WebRTC peer client connecting via a zero-config universal hub.
+// Security relies strictly on peer cryptographic signatures, passphrase-scoped broadcasts,
+// local blacklisting, and explicit user Allow/Deny consent for every incoming connection.
+type Config struct {
+	KeyPair       *identity.KeyPair
 	SignalingURL  string // e.g. wss://hub.example.com/v1/signal
 	HubOrigin     string // Optional explicit canonical origin; derived from SignalingURL if empty.
+	HubPassphrase string // Optional offline passphrase when connecting to a passphrase-gated hub.
 	TLSConfig     *tls.Config
-	HTTPTransport http.RoundTripper // Optional custom transport (e.g. for custom dialer in tests).
+	HTTPTransport http.RoundTripper // Optional custom transport (e.g. for tests).
 
-	STUNServerURI       string                    // STUNS/TURNS URI (stuns: or turns: by default; stun:/turn: require AllowInsecureICE).
-	TURNServerURI       string                    // Optional TURNS/TURN URI (turns: prioritized over DTLS 1.3/UDP).
-	TURNUsername        string                    // Username for turns:/turn: server.
-	TURNCredential      string                    // Password/credential for turns:/turn: server.
+	STUNServerURI       string                    // Optional STUNS/TURNS URI (stuns:/turns: by default; stun:/turn: require AllowInsecureICE).
+	TURNServerURI       string                    // Optional explicit TURNS/TURN URI.
+	TURNUsername        string                    // Username for explicit turns:/turn: server.
+	TURNCredential      string                    // Credential for explicit turns:/turn: server.
 	ICEServers          []ICEServerConfig         // Optional additional STUNS/TURNS servers.
+	UseHubRelay         *bool                     // Automatically adopt universal relay credentials advertised by hub (default true).
 	AllowInsecureICE    bool                      // Explicit opt-in required to allow plaintext stun:/turn: URIs.
-	TCPOnly             bool                      // Explicit opt-in to fully disable UDP and use ICE-TCP + TLS 1.3/TCP STUNS only.
-	ICETCPListenAddr    string                    // Optional TCP listen address for passive ICE-TCP candidates when TCPOnly=true (default ":0").
-	AllowRelay          bool                      // Automatically enabled when a validated turns:/turn: server is configured (UDP mode).
+	TCPOnly             bool                      // Explicit opt-in to disable all UDP sockets and use ICE-TCP + TLS 1.3/TCP STUNS only.
+	ICETCPListenAddr    string                    // Optional TCP listen address for passive ICE-TCP candidates when TCPOnly=true.
+	AllowRelay          bool                      // Automatically enabled when a validated turns:/turn: server or universal hub relay is active.
 	ICETransportPolicy  webrtc.ICETransportPolicy // Optional ICE transport policy (default ICETransportPolicyAll).
 	NetworkTypes        []webrtc.NetworkType      // Defaults to [UDP4, UDP6] (or [TCP4, TCP6] when TCPOnly=true).
 	IncludeLoopback     bool
 	VNet                transport.Net // Optional virtual network stack (pion/transport/v5/vnet).
 	PionLoggerFactory   logging.LoggerFactory
 	ProhibitedEndpoints []net.UDPAddr // Additional endpoints forbidden as data destinations.
-	BlockHubHostIP      *bool         // Defaults to true when Hub IP is non-loopback and non-local (disabled when relay enabled).
+	BlockHubHostIP      *bool         // Defaults to true when Hub IP is non-loopback/non-local and relay is disabled.
 
-	EnablePacketChannel     bool // Negotiate optional unordered packet/v1 DataChannel (Section 7).
+	// Security core: explicit user authorization handler for incoming connections.
+	// If nil, ALL incoming connection requests fail closed (ConsentDeny).
+	Consent        ConsentHandler
+	ConsentTimeout time.Duration // Default 60s.
+	Blacklist      *identity.Blacklist
+	BlacklistPath  string // Optional 0600 file path for persisting blacklist mutations.
+
+	EnablePacketChannel     bool // Negotiate unordered packet/v1 DataChannel (used for IP TUN packets).
 	MaxQueueBytes           int
-	OfferToConnectedTimeout time.Duration // Default 30s (Section 9).
-	MaxICERestarts          int           // Default 2 (Section 9).
-	ICERestartBackoff       time.Duration // Default 500ms base backoff.
-	ICEDisconnectedTimeout  time.Duration // Optional override for Pion ICE disconnected timeout.
-	ICEFailedTimeout        time.Duration // Optional override for Pion ICE failed timeout.
-	ICEKeepaliveInterval    time.Duration // Optional override for Pion ICE keepalive interval.
-	HeartbeatInterval       time.Duration // Default 20s (Section 9).
-	SignalingTTL            time.Duration // Default 60s (Section 9).
-	MaxClockSkew            time.Duration // Default 30s (Section 9).
-	MaxCandidatesPerGen     int           // Default 128 (Section 9).
+	OfferToConnectedTimeout time.Duration // Default 30s.
+	MaxICERestarts          int           // Default 2.
+	ICERestartBackoff       time.Duration // Default 400ms base backoff.
+	ICEDisconnectedTimeout  time.Duration
+	ICEFailedTimeout        time.Duration
+	ICEKeepaliveInterval    time.Duration
+	HeartbeatInterval       time.Duration // Default 20s.
+	SignalingTTL            time.Duration // Default 60s.
+	MaxClockSkew            time.Duration // Default 30s.
+	MaxCandidatesPerGen     int           // Default 128.
 
-	// Optional algorithm for per-PeerConnection ephemeral DTLS 1.3 X.509 certificates
-	// (ed25519, nistp-256 [default], nistp-384, nistp-521, rsa).
 	DTLSCertAlgorithm identity.Algorithm
 	DTLSRSABits       int
 
-	// Strictly for T05 negative testing (simulating a non-conformant DTLS 1.2 peer).
-	// Production callers MUST leave both zero (which enforces DTLS 1.3 min and max).
+	// Strictly for negative testing (simulating a non-conformant DTLS 1.2 peer).
 	OverrideDTLSMinVersion dtlsProtocol.Version
 	OverrideDTLSMaxVersion dtlsProtocol.Version
 
-	OnSession func(*Session)
-	Logger    *slog.Logger
+	OnSession       func(*Session)
+	OnSessionClosed func(remotePeerID, reason string)
+	OnPeersChanged  func(channelID string, peers []DiscoveredPeer)
+	Logger          *slog.Logger
 }
 
-type lookupWaiter struct {
-	res protocol.LookupResultMessage
-	err error
-}
-
-// Client manages a peer's identity, authenticated WSS control-plane session,
-// independent trust verification, DTLS 1.3 STUNS/TURNS transport, and WebRTC PeerConnections.
+// Client manages a peer's cryptographic identity, WSS control-plane connection,
+// passphrase-scoped broadcasting/discovery, local blacklist, explicit incoming consent,
+// and DTLS 1.3 WebRTC sessions.
 type Client struct {
 	cfg       Config
 	hubOrigin string
-	trust     *identity.TrustVerifier
+	localVIP  netip.Addr
+	blacklist *identity.Blacklist
 	log       *slog.Logger
 
+	iceMu               sync.RWMutex
 	resolvedICE         []resolvedICEServer
 	webrtcICEServers    []webrtc.ICEServer
 	dtlsUDPTargets      map[string]string
 	tlsTCPTargets       map[string]string
 	allowRelay          bool
-	tcpMux              webrtc.ICETCPMux
-	tcpAddr             net.Addr
 	prohibitedEndpoints []net.UDPAddr
 	prohibitedIPs       []net.IP
+
+	tcpMux  webrtc.ICETCPMux
+	tcpAddr net.Addr
 
 	wsMu      sync.Mutex
 	wsConn    *websocket.Conn
@@ -132,10 +143,12 @@ type Client struct {
 
 	mu                 sync.Mutex
 	vnet               transport.Net
+	channels           map[string]identity.ChannelKeys
+	discovered         map[string][]DiscoveredPeer
+	knownPeers         map[string]knownPeerInfo
 	sessionsByPeer     map[string]*Session
 	sessionsByID       map[string]*Session
 	closedSessionIDs   map[string]time.Time
-	pendingLookups     map[string][]chan lookupWaiter
 	lastSignalRejected atomic.Uint64
 	prohibitedRejected atomic.Uint64
 
@@ -145,19 +158,28 @@ type Client struct {
 	wg       sync.WaitGroup
 }
 
-// NewClient validates configuration and constructs a new peer Client.
-func NewClient(cfg Config) (*Client, error) {
+// NewClient validates configuration and constructs a new consent-driven peer Client.
+func NewClient(cfgIn *Config) (*Client, error) {
+	if cfgIn == nil {
+		return nil, errors.New("peer: Config is required")
+	}
+	cfg := *cfgIn
 	if cfg.KeyPair == nil {
 		return nil, errors.New("peer: KeyPair is required")
 	}
 	if err := identity.ValidatePeerID(cfg.KeyPair.PeerID); err != nil {
 		return nil, err
 	}
-	resolvedICE, webrtcICE, dtlsTargets, tlsTCPTargets, hasTURN, err := compileICEServers(cfg)
+	localVIP, err := identity.VirtualIPv4FromPeerID(cfg.KeyPair.PeerID)
 	if err != nil {
 		return nil, err
 	}
-	allowRelay := (cfg.AllowRelay || hasTURN) && !cfg.TCPOnly
+
+	compiledICE, err := compileICEServers(&cfg)
+	if err != nil {
+		return nil, err
+	}
+	allowRelay := (cfg.AllowRelay || compiledICE.hasTURN) && !cfg.TCPOnly
 	if cfg.TCPOnly {
 		if cfg.ICETransportPolicy == webrtc.ICETransportPolicyRelay {
 			return nil, fmt.Errorf("%w: relay-only policy is unsupported in TCP-only mode", ErrInvalidICEConfig)
@@ -180,8 +202,12 @@ func NewClient(cfg Config) (*Client, error) {
 			cfg.NetworkTypes = []webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6}
 		}
 	}
+
 	if cfg.OfferToConnectedTimeout <= 0 {
 		cfg.OfferToConnectedTimeout = 30 * time.Second
+	}
+	if cfg.ConsentTimeout <= 0 {
+		cfg.ConsentTimeout = 60 * time.Second
 	}
 	if cfg.MaxICERestarts < 0 {
 		cfg.MaxICERestarts = 0
@@ -219,9 +245,16 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
-	trust, err := identity.NewTrustVerifier(cfg.Policy, cfg.MaxClockSkew)
-	if err != nil {
-		return nil, err
+	bl := cfg.Blacklist
+	if bl == nil {
+		if cfg.BlacklistPath != "" {
+			bl, err = identity.LoadBlacklist(cfg.BlacklistPath)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			bl = identity.NewBlacklist()
+		}
 	}
 
 	var (
@@ -229,7 +262,7 @@ func NewClient(cfg Config) (*Client, error) {
 		tcpAddr net.Addr
 	)
 	if cfg.TCPOnly {
-		tcpLn, listenErr := listenICETCP(cfg)
+		tcpLn, listenErr := listenICETCP(&cfg)
 		if listenErr != nil {
 			return nil, fmt.Errorf("peer: listen ICE-TCP: %w", listenErr)
 		}
@@ -243,27 +276,30 @@ func NewClient(cfg Config) (*Client, error) {
 		tcpMux = webrtc.NewICETCPMux(lf.NewLogger("ice-tcp"), tcpLn, 8)
 	}
 
-	prohibitedEPs, prohibitedIPs := deriveProhibitedHubTargets(cfg, resolvedICE, allowRelay)
+	prohibitedEPs, prohibitedIPs := deriveProhibitedHubTargets(&cfg, compiledICE.resolved, allowRelay)
 
 	c := &Client{
 		cfg:                 cfg,
 		hubOrigin:           origin,
-		trust:               trust,
+		localVIP:            localVIP,
+		blacklist:           bl,
 		log:                 cfg.Logger,
-		resolvedICE:         resolvedICE,
-		webrtcICEServers:    webrtcICE,
-		dtlsUDPTargets:      dtlsTargets,
-		tlsTCPTargets:       tlsTCPTargets,
+		resolvedICE:         compiledICE.resolved,
+		webrtcICEServers:    compiledICE.webrtcServers,
+		dtlsUDPTargets:      compiledICE.dtlsUDPTargets,
+		tlsTCPTargets:       compiledICE.tlsTCPTargets,
 		allowRelay:          allowRelay,
 		tcpMux:              tcpMux,
 		tcpAddr:             tcpAddr,
 		prohibitedEndpoints: prohibitedEPs,
 		prohibitedIPs:       prohibitedIPs,
 		vnet:                cfg.VNet,
+		channels:            make(map[string]identity.ChannelKeys),
+		discovered:          make(map[string][]DiscoveredPeer),
+		knownPeers:          make(map[string]knownPeerInfo),
 		sessionsByPeer:      make(map[string]*Session),
 		sessionsByID:        make(map[string]*Session),
 		closedSessionIDs:    make(map[string]time.Time),
-		pendingLookups:      make(map[string][]chan lookupWaiter),
 		signalCh:            make(chan []byte, 512),
 		stopCh:              make(chan struct{}),
 	}
@@ -272,17 +308,15 @@ func NewClient(cfg Config) (*Client, error) {
 	return c, nil
 }
 
-func compileICEServers(cfg Config) (
-	resolved []resolvedICEServer,
-	webrtcServers []webrtc.ICEServer,
-	dtlsUDPTargets map[string]string,
-	tlsTCPTargets map[string]string,
-	hasTURN bool,
-	err error,
-) {
-	dtlsUDPTargets = make(map[string]string)
-	tlsTCPTargets = make(map[string]string)
+type compiledICEServers struct {
+	resolved       []resolvedICEServer
+	webrtcServers  []webrtc.ICEServer
+	dtlsUDPTargets map[string]string
+	tlsTCPTargets  map[string]string
+	hasTURN        bool
+}
 
+func compileICEServers(cfg *Config) (compiledICEServers, error) {
 	var entries []ICEServerConfig
 	if strings.TrimSpace(cfg.STUNServerURI) != "" {
 		entries = append(entries, ICEServerConfig{
@@ -299,14 +333,22 @@ func compileICEServers(cfg Config) (
 		})
 	}
 	entries = append(entries, cfg.ICEServers...)
+	return compileICEServerEntries(entries, cfg.AllowInsecureICE, cfg.TCPOnly)
+}
+
+func compileICEServerEntries(entries []ICEServerConfig, allowInsecure, tcpOnly bool) (compiledICEServers, error) {
+	out := compiledICEServers{
+		dtlsUDPTargets: make(map[string]string),
+		tlsTCPTargets:  make(map[string]string),
+	}
 
 	for _, entry := range entries {
 		if strings.TrimSpace(entry.URI) == "" {
 			continue
 		}
-		parsed, vErr := ValidateICEServerURIWithMode(entry.URI, cfg.AllowInsecureICE, cfg.TCPOnly)
+		parsed, vErr := ValidateICEServerURIWithMode(entry.URI, allowInsecure, tcpOnly)
 		if vErr != nil {
-			return nil, nil, nil, nil, false, vErr
+			return compiledICEServers{}, vErr
 		}
 		if parsed == nil {
 			continue
@@ -314,23 +356,21 @@ func compileICEServers(cfg Config) (
 		isTURN := parsed.Scheme == stun.SchemeTypeTURN || parsed.Scheme == stun.SchemeTypeTURNS
 		if isTURN {
 			if strings.TrimSpace(entry.Username) == "" || entry.Credential == "" {
-				return nil, nil, nil, nil, false, fmt.Errorf("%w: TURN/TURNS URI %q requires username and credential", ErrInvalidICEConfig, entry.URI)
+				return compiledICEServers{}, fmt.Errorf("%w: TURN/TURNS URI %q requires username and credential", ErrInvalidICEConfig, entry.URI)
 			}
-			hasTURN = true
+			out.hasTURN = true
 		}
 
 		hostPort := net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port))
-		resolved = append(resolved, resolvedICEServer{
+		out.resolved = append(out.resolved, resolvedICEServer{
 			URI:        parsed,
 			Username:   entry.Username,
 			Credential: entry.Credential,
 		})
 
-		if cfg.TCPOnly {
-			// In TCP-only mode, zero UDP sockets are created; ICE-TCP runs directly over TCP
-			// and STUNS/TURNS probes use TLS 1.3 over TCP via ProbeSTUNS.
+		if tcpOnly {
 			if parsed.IsSecure() {
-				tlsTCPTargets[hostPort] = parsed.Host
+				out.tlsTCPTargets[hostPort] = parsed.Host
 			}
 			continue
 		}
@@ -338,13 +378,11 @@ func compileICEServers(cfg Config) (
 		var srv webrtc.ICEServer
 		switch {
 		case parsed.Scheme == stun.SchemeTypeSTUNS && parsed.Proto == stun.ProtoTypeUDP:
-			// Route through dtls13TransportNet (strict DTLS 1.3 over UDP on the shared ICE socket).
-			dtlsUDPTargets[hostPort] = parsed.Host
+			out.dtlsUDPTargets[hostPort] = parsed.Host
 			srv = webrtc.ICEServer{URLs: []string{"stun:" + hostPort}}
 
 		case parsed.Scheme == stun.SchemeTypeTURNS && parsed.Proto == stun.ProtoTypeUDP:
-			// Route through dtls13TransportNet (strict DTLS 1.3 over UDP with RootCAs + ServerName).
-			dtlsUDPTargets[hostPort] = parsed.Host
+			out.dtlsUDPTargets[hostPort] = parsed.Host
 			srv = webrtc.ICEServer{
 				URLs:           []string{"turn:" + hostPort + "?transport=udp"},
 				Username:       entry.Username,
@@ -353,8 +391,7 @@ func compileICEServers(cfg Config) (
 			}
 
 		case parsed.Scheme == stun.SchemeTypeTURNS && parsed.Proto == stun.ProtoTypeTCP:
-			// Optional explicit ?transport=tcp fallback routed through TLS 1.3 proxy dialer.
-			tlsTCPTargets[hostPort] = parsed.Host
+			out.tlsTCPTargets[hostPort] = parsed.Host
 			srv = webrtc.ICEServer{
 				URLs:           []string{"turns:" + hostPort + "?transport=tcp"},
 				Username:       entry.Username,
@@ -366,7 +403,6 @@ func compileICEServers(cfg Config) (
 			srv = webrtc.ICEServer{URLs: []string{parsed.String()}}
 
 		case isTURN:
-			// Opt-in plaintext turn: (only reachable when AllowInsecureICE == true).
 			srv = webrtc.ICEServer{
 				URLs:           []string{parsed.String()},
 				Username:       entry.Username,
@@ -375,15 +411,50 @@ func compileICEServers(cfg Config) (
 			}
 
 		default:
-			// Opt-in plaintext stun: (only reachable when AllowInsecureICE == true).
 			srv = webrtc.ICEServer{URLs: []string{parsed.String()}}
 		}
-		webrtcServers = append(webrtcServers, srv)
+		out.webrtcServers = append(out.webrtcServers, srv)
 	}
-	return resolved, webrtcServers, dtlsUDPTargets, tlsTCPTargets, hasTURN, nil
+	return out, nil
 }
 
-func deriveProhibitedHubTargets(cfg Config, servers []resolvedICEServer, allowRelay bool) ([]net.UDPAddr, []net.IP) {
+func (c *Client) applyHubRelay(relay *protocol.RelayInfo) {
+	if relay == nil || len(relay.URIs) == 0 || c.cfg.TCPOnly {
+		return
+	}
+	if c.cfg.UseHubRelay != nil && !*c.cfg.UseHubRelay {
+		return
+	}
+	entries := make([]ICEServerConfig, 0, len(relay.URIs))
+	for _, u := range relay.URIs {
+		entries = append(entries, ICEServerConfig{
+			URI:        u,
+			Username:   relay.Username,
+			Credential: relay.Credential,
+		})
+	}
+	compiled, err := compileICEServerEntries(entries, c.cfg.AllowInsecureICE, false)
+	if err != nil || len(compiled.resolved) == 0 {
+		return
+	}
+
+	c.iceMu.Lock()
+	c.resolvedICE = append(c.resolvedICE, compiled.resolved...)
+	c.webrtcICEServers = append(c.webrtcICEServers, compiled.webrtcServers...)
+	for k, v := range compiled.dtlsUDPTargets {
+		c.dtlsUDPTargets[k] = v
+	}
+	for k, v := range compiled.tlsTCPTargets {
+		c.tlsTCPTargets[k] = v
+	}
+	if compiled.hasTURN {
+		c.allowRelay = true
+	}
+	c.prohibitedEndpoints, c.prohibitedIPs = deriveProhibitedHubTargets(&c.cfg, c.resolvedICE, c.allowRelay)
+	c.iceMu.Unlock()
+}
+
+func deriveProhibitedHubTargets(cfg *Config, servers []resolvedICEServer, allowRelay bool) ([]net.UDPAddr, []net.IP) {
 	endpoints := append([]net.UDPAddr(nil), cfg.ProhibitedEndpoints...)
 	var ips []net.IP
 
@@ -464,9 +535,14 @@ func gatherLocalHostIPs() []net.IP {
 	return out
 }
 
-// PeerID returns this client's persistent peer_id.
+// PeerID returns this client's persistent cryptographic peer_id.
 func (c *Client) PeerID() string {
 	return c.cfg.KeyPair.PeerID
+}
+
+// VirtualIP returns this client's deterministic RFC 6598 TUN IPv4 address.
+func (c *Client) VirtualIP() netip.Addr {
+	return c.localVIP
 }
 
 // ICETCPAddr returns the bound passive ICE-TCP listen address when TCPOnly=true, or nil otherwise.
@@ -474,14 +550,21 @@ func (c *Client) ICETCPAddr() net.Addr {
 	return c.tcpAddr
 }
 
-func (c *Client) candidatePolicy() CandidatePolicy {
+// Online reports whether the WSS control-plane connection to the hub is currently active.
+func (c *Client) Online() bool {
+	return c.wsOnline.Load()
+}
+
+func (c *Client) candidatePolicySnapshot() (policy CandidatePolicy, prohibitedEPs []net.UDPAddr, prohibitedIPs []net.IP) {
+	c.iceMu.RLock()
+	defer c.iceMu.RUnlock()
 	return CandidatePolicy{
 		AllowRelay: c.allowRelay && !c.cfg.TCPOnly,
 		TCPOnly:    c.cfg.TCPOnly,
-	}
+	}, append([]net.UDPAddr(nil), c.prohibitedEndpoints...), append([]net.IP(nil), c.prohibitedIPs...)
 }
 
-func listenICETCP(cfg Config) (net.Listener, error) {
+func listenICETCP(cfg *Config) (net.Listener, error) {
 	var hasTCP4, hasTCP6 bool
 	for _, nt := range cfg.NetworkTypes {
 		if nt == webrtc.NetworkTypeTCP4 {
@@ -516,33 +599,89 @@ func (c *Client) RejectedSignalCount() uint64 {
 	return c.lastSignalRejected.Load()
 }
 
-// ProhibitedCandidateCount returns how many relay/non-UDP/hub-endpoint candidates were blocked.
+// ProhibitedCandidateCount returns how many relay/wrong-transport/hub-endpoint candidates were blocked.
 func (c *Client) ProhibitedCandidateCount() uint64 {
 	return c.prohibitedRejected.Load()
 }
 
-// ReloadPolicy atomically updates local trust and ACL rules and terminates any revoked peer sessions.
-func (c *Client) ReloadPolicy(policy identity.PolicyConfig) error {
-	if err := c.trust.Reload(policy); err != nil {
+// Blacklist blocks peerID locally, drops its broadcasts, and terminates any active session with it.
+func (c *Client) Blacklist(peerID string) error {
+	if err := c.blacklist.Add(peerID); err != nil {
 		return err
 	}
+	if c.cfg.BlacklistPath != "" {
+		if err := c.blacklist.Save(c.cfg.BlacklistPath); err != nil {
+			return err
+		}
+	}
+
 	c.mu.Lock()
-	var revokedSessions []*Session
-	for pid, sess := range c.sessionsByPeer {
-		if c.trust.IsRevoked(pid) {
-			revokedSessions = append(revokedSessions, sess)
+	activeSess := c.sessionsByPeer[peerID]
+	var changedChannels []string
+	var changedSnapshots [][]DiscoveredPeer
+	for chID, list := range c.discovered {
+		filtered := make([]DiscoveredPeer, 0, len(list))
+		removed := false
+		for i := range list {
+			if list[i].PeerID == peerID {
+				removed = true
+				continue
+			}
+			filtered = append(filtered, list[i])
+		}
+		if removed {
+			c.discovered[chID] = filtered
+			changedChannels = append(changedChannels, chID)
+			changedSnapshots = append(changedSnapshots, slices.Clone(filtered))
 		}
 	}
 	c.mu.Unlock()
 
-	for _, sess := range revokedSessions {
-		_ = sess.CloseWithReason("peer_revoked")
+	if activeSess != nil {
+		_ = activeSess.CloseWithReason("blacklisted")
+	}
+	if c.cfg.OnPeersChanged != nil {
+		for i, chID := range changedChannels {
+			go c.cfg.OnPeersChanged(chID, changedSnapshots[i])
+		}
 	}
 	return nil
 }
 
-// UpdateNetwork swaps the virtual network stack (used in T11 network-change simulation)
-// and triggers bounded ICE restart on active sessions.
+// Unblacklist removes peerID from the local blacklist.
+func (c *Client) Unblacklist(peerID string) error {
+	c.blacklist.Remove(peerID)
+	if c.cfg.BlacklistPath != "" {
+		return c.blacklist.Save(c.cfg.BlacklistPath)
+	}
+	return nil
+}
+
+// IsBlacklisted reports whether peerID is currently blacklisted locally.
+func (c *Client) IsBlacklisted(peerID string) bool {
+	return c.blacklist.Contains(peerID)
+}
+
+// BlacklistedPeers returns a sorted snapshot of locally blacklisted peer_ids.
+func (c *Client) BlacklistedPeers() []string {
+	return c.blacklist.List()
+}
+
+// ActiveSessions returns a snapshot of all currently tracked sessions.
+func (c *Client) ActiveSessions() []*Session {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*Session, 0, len(c.sessionsByPeer))
+	for _, s := range c.sessionsByPeer {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].RemotePeerID() < out[j].RemotePeerID()
+	})
+	return out
+}
+
+// UpdateNetwork swaps the virtual network stack and triggers bounded ICE restart on active sessions.
 func (c *Client) UpdateNetwork(newVNet transport.Net) {
 	c.mu.Lock()
 	c.vnet = newVNet
@@ -558,7 +697,7 @@ func (c *Client) UpdateNetwork(newVNet transport.Net) {
 }
 
 // Register connects to the Lighthouse WSS endpoint over TLS 1.3 and completes
-// single-use challenge-response registration.
+// single-use challenge-response registration (plus optional offline hub passphrase proof).
 func (c *Client) Register(ctx context.Context) error {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
@@ -588,7 +727,6 @@ func (c *Client) Register(ctx context.Context) error {
 	}
 	conn.SetReadLimit(protocol.MaxSignalingMessageSize)
 
-	// Read challenge from Hub.
 	mType, rawChal, err := conn.Read(ctx)
 	if err != nil {
 		_ = conn.CloseNow()
@@ -620,15 +758,28 @@ func (c *Client) Register(ctx context.Context) error {
 		return err
 	}
 
+	hubAuth := ""
+	if chal.PassphraseRequired || strings.TrimSpace(c.cfg.HubPassphrase) != "" {
+		if strings.TrimSpace(c.cfg.HubPassphrase) == "" {
+			_ = conn.CloseNow()
+			return errors.New("peer: hub requires an offline passphrase")
+		}
+		hubAuth, err = identity.SignHubPassphraseProof(c.cfg.HubPassphrase, chal.Challenge, c.hubOrigin, c.cfg.KeyPair.PeerID)
+		if err != nil {
+			_ = conn.CloseNow()
+			return err
+		}
+	}
+
 	regPayload, err := json.Marshal(protocol.RegisterMessage{
-		V:          protocol.Version,
-		Type:       protocol.TypeRegister,
-		PeerID:     c.cfg.KeyPair.PeerID,
-		PublicKey:  identity.EncodePublicKey(c.cfg.KeyPair.PublicKey),
-		HubOrigin:  c.hubOrigin,
-		Challenge:  chal.Challenge,
-		Membership: c.cfg.Membership,
-		Proof:      proof,
+		V:         protocol.Version,
+		Type:      protocol.TypeRegister,
+		PeerID:    c.cfg.KeyPair.PeerID,
+		PublicKey: identity.EncodePublicKey(c.cfg.KeyPair.PublicKey),
+		HubOrigin: c.hubOrigin,
+		Challenge: chal.Challenge,
+		Proof:     proof,
+		HubAuth:   hubAuth,
 	})
 	if err != nil {
 		_ = conn.CloseNow()
@@ -672,6 +823,8 @@ func (c *Client) Register(ctx context.Context) error {
 		return errors.New("peer: invalid registered confirmation")
 	}
 
+	c.applyHubRelay(regOK.Relay)
+
 	hbInterval := c.cfg.HeartbeatInterval
 	if regOK.HeartbeatIntervalSec > 0 {
 		srvHB := time.Duration(regOK.HeartbeatIntervalSec) * time.Second
@@ -692,11 +845,105 @@ func (c *Client) Register(ctx context.Context) error {
 	wsDone := make(chan struct{})
 	c.wg.Add(2)
 	go c.wsReadLoop(conn, wsDone)
-	go c.wsHeartbeatLoop(conn, hbInterval, wsDone)
+	go c.wsHeartbeatLoop(hbInterval, wsDone)
 	return nil
 }
 
-// Close shuts down all peer sessions and closes the WSS signaling connection.
+// JoinChannel subscribes to broadcasts scoped to the given offline passphrase without broadcasting self.
+func (c *Client) JoinChannel(ctx context.Context, passphrase string) (string, error) {
+	keys, err := identity.DeriveChannelKeys(passphrase)
+	if err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	c.channels[keys.ChannelID] = keys
+	c.mu.Unlock()
+
+	raw, err := json.Marshal(protocol.ChannelJoinMessage{
+		V:         protocol.Version,
+		Type:      protocol.TypeChannelJoin,
+		ChannelID: keys.ChannelID,
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := c.sendWS(ctx, raw); err != nil {
+		return "", err
+	}
+	return keys.ChannelID, nil
+}
+
+// LeaveChannel unsubscribes from a passphrase-scoped channel (accepting either raw passphrase or channelID).
+func (c *Client) LeaveChannel(ctx context.Context, passphraseOrChannelID string) error {
+	chID := passphraseOrChannelID
+	if identity.ValidateChannelID(chID) != nil {
+		keys, err := identity.DeriveChannelKeys(passphraseOrChannelID)
+		if err != nil {
+			return err
+		}
+		chID = keys.ChannelID
+	}
+	c.mu.Lock()
+	delete(c.channels, chID)
+	delete(c.discovered, chID)
+	c.mu.Unlock()
+
+	raw, err := json.Marshal(protocol.ChannelLeaveMessage{
+		V:         protocol.Version,
+		Type:      protocol.TypeChannelLeave,
+		ChannelID: chID,
+	})
+	if err != nil {
+		return err
+	}
+	return c.sendWS(ctx, raw)
+}
+
+// SetBroadcast explicitly enables or disables broadcasting this peer's presence to peers
+// sharing the exact offline passphrase.
+func (c *Client) SetBroadcast(ctx context.Context, enabled bool, passphrase, displayName string) (string, error) {
+	keys, err := identity.DeriveChannelKeys(passphrase)
+	if err != nil {
+		return "", err
+	}
+	sealed := ""
+	if enabled {
+		sealed, err = identity.SealBroadcastMeta(keys.AuthKey, c.PeerID(), keys.ChannelID, identity.BroadcastMeta{
+			DisplayName: strings.TrimSpace(displayName),
+			VirtualIP:   c.localVIP.String(),
+		})
+		if err != nil {
+			return "", err
+		}
+	}
+	_, raw, err := protocol.SignBroadcast(c.cfg.KeyPair, keys.ChannelID, enabled, sealed, time.Now().Unix())
+	if err != nil {
+		return "", err
+	}
+	if err := c.sendWS(ctx, raw); err != nil {
+		return "", err
+	}
+	return keys.ChannelID, nil
+}
+
+// DiscoveredPeers returns currently active broadcasters for channelID (or across all joined channels if empty).
+func (c *Client) DiscoveredPeers(channelID string) []DiscoveredPeer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if channelID != "" {
+		return slices.Clone(c.discovered[channelID])
+	}
+	var out []DiscoveredPeer
+	for _, list := range c.discovered {
+		out = append(out, list...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].PeerID < out[j].PeerID
+	})
+	return out
+}
+
+// Close shuts down all peer sessions, ICE-TCP mux, and the WSS signaling connection.
 func (c *Client) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
@@ -750,7 +997,7 @@ func (c *Client) sendWS(ctx context.Context, raw []byte) error {
 	return conn.Write(wctx, websocket.MessageText, raw)
 }
 
-func (c *Client) wsHeartbeatLoop(conn *websocket.Conn, interval time.Duration, wsDone <-chan struct{}) {
+func (c *Client) wsHeartbeatLoop(interval time.Duration, wsDone <-chan struct{}) {
 	defer c.wg.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -801,9 +1048,6 @@ func (c *Client) wsReadLoop(conn *websocket.Conn, wsDone chan struct{}) {
 	}
 }
 
-// handleWSLoss implements Section 4.3 & Section 5.2:
-//   - Abandon any negotiation that has not yet reached Connected (so retries use a fresh session_id).
-//   - Preserve already-Connected direct P2P sessions during hub outages (T10).
 func (c *Client) handleWSLoss(lostConn *websocket.Conn) {
 	c.wsMu.Lock()
 	if c.wsConn == lostConn {
@@ -813,12 +1057,6 @@ func (c *Client) handleWSLoss(lostConn *websocket.Conn) {
 	c.wsMu.Unlock()
 
 	c.mu.Lock()
-	for target, waiters := range c.pendingLookups {
-		for _, ch := range waiters {
-			ch <- lookupWaiter{err: ErrHubDisconnected}
-		}
-		delete(c.pendingLookups, target)
-	}
 	var toAbandon []*Session
 	for _, s := range c.sessionsByID {
 		st := s.State()
@@ -841,49 +1079,78 @@ func (c *Client) dispatchControlMessage(raw []byte) {
 	}
 
 	switch hdr.Type {
-	case protocol.TypeLookupResult:
-		var lr protocol.LookupResultMessage
-		if err := jcs.UnmarshalStrict(raw, &lr); err != nil {
-			c.lastSignalRejected.Add(1)
-			return
-		}
-		c.mu.Lock()
-		waiters := c.pendingLookups[lr.Target]
-		delete(c.pendingLookups, lr.Target)
-		c.mu.Unlock()
-		for _, ch := range waiters {
-			ch <- lookupWaiter{res: lr}
-		}
+	case protocol.TypeChannelPeers:
+		c.handleChannelPeers(raw)
 
-	case protocol.TypeError:
-		var em protocol.ErrorMessage
-		if err := jcs.UnmarshalStrict(raw, &em); err != nil {
-			return
-		}
-		c.mu.Lock()
-		if em.SessionID != "" {
-			if sess, ok := c.sessionsByID[em.SessionID]; ok {
-				c.mu.Unlock()
-				sess.failClosed(em.Code, fmt.Errorf("hub error: %s", em.Code))
-				return
-			}
-		}
-		// Wake earliest lookup waiter if error was for a lookup.
-		for target, waiters := range c.pendingLookups {
-			for _, ch := range waiters {
-				ch <- lookupWaiter{err: fmt.Errorf("%w: %s", ErrPeerOfflineOrDenied, em.Code)}
-			}
-			delete(c.pendingLookups, target)
-			break
-		}
-		c.mu.Unlock()
-
-	case protocol.TypeOffer, protocol.TypeAnswer, protocol.TypeCandidate, protocol.TypeEndOfCandidates, protocol.TypeClose:
+	case protocol.TypeError, protocol.TypeOffer, protocol.TypeAnswer, protocol.TypeCandidate, protocol.TypeEndOfCandidates, protocol.TypeClose:
 		cp := append([]byte(nil), raw...)
 		select {
 		case c.signalCh <- cp:
 		case <-c.stopCh:
 		}
+	}
+}
+
+func (c *Client) handleChannelPeers(raw []byte) {
+	var msg protocol.ChannelPeersMessage
+	if err := jcs.UnmarshalStrict(raw, &msg); err != nil {
+		c.lastSignalRejected.Add(1)
+		return
+	}
+
+	c.mu.Lock()
+	keys, joined := c.channels[msg.ChannelID]
+	c.mu.Unlock()
+	if !joined {
+		return
+	}
+
+	peers := make([]DiscoveredPeer, 0, len(msg.Peers))
+	for _, bp := range msg.Peers {
+		if bp.PeerID == c.PeerID() || c.blacklist.Contains(bp.PeerID) {
+			continue
+		}
+		pub, err := protocol.VerifyBroadcastPeer(msg.ChannelID, bp)
+		if err != nil {
+			c.lastSignalRejected.Add(1)
+			continue
+		}
+		meta, err := identity.OpenBroadcastMeta(keys.AuthKey, bp.PeerID, msg.ChannelID, bp.SealedMeta)
+		if err != nil {
+			// Metadata cannot be opened with our offline passphrase -> discard silently.
+			c.lastSignalRejected.Add(1)
+			continue
+		}
+		vip, err := identity.VirtualIPv4FromPeerID(bp.PeerID)
+		if err != nil {
+			continue
+		}
+		dp := DiscoveredPeer{
+			PeerID:      bp.PeerID,
+			PublicKey:   pub,
+			Algorithm:   pub.Algorithm,
+			VirtualIP:   vip,
+			DisplayName: meta.DisplayName,
+			ChannelID:   msg.ChannelID,
+			Timestamp:   bp.Timestamp,
+		}
+		peers = append(peers, dp)
+
+		c.mu.Lock()
+		c.knownPeers[bp.PeerID] = knownPeerInfo{
+			PublicKey:   pub,
+			DisplayName: meta.DisplayName,
+			ChannelID:   msg.ChannelID,
+		}
+		c.mu.Unlock()
+	}
+
+	c.mu.Lock()
+	c.discovered[msg.ChannelID] = peers
+	c.mu.Unlock()
+
+	if c.cfg.OnPeersChanged != nil {
+		go c.cfg.OnPeersChanged(msg.ChannelID, slices.Clone(peers))
 	}
 }
 
@@ -894,6 +1161,11 @@ func (c *Client) signalWorkerLoop() {
 		case <-c.stopCh:
 			return
 		case raw := <-c.signalCh:
+			hdr, hErr := protocol.PeekHeader(raw, protocol.MaxSignalingMessageSize)
+			if hErr == nil && hdr.Type == protocol.TypeError {
+				c.handleHubError(raw)
+				continue
+			}
 			if err := c.handlePeerEnvelope(raw); err != nil {
 				c.lastSignalRejected.Add(1)
 				c.log.Warn("rejected peer signaling envelope", "err", err)
@@ -902,88 +1174,25 @@ func (c *Client) signalWorkerLoop() {
 	}
 }
 
-// Lookup queries the hub for targetPeerID and independently verifies its identity and ACL locally.
-func (c *Client) Lookup(ctx context.Context, targetPeerID string) (*identity.VerifiedPeer, bool, error) {
-	if err := identity.ValidatePeerID(targetPeerID); err != nil {
-		return nil, false, err
+func (c *Client) handleHubError(raw []byte) {
+	var em protocol.ErrorMessage
+	if err := jcs.UnmarshalStrict(raw, &em); err != nil {
+		return
 	}
-	waitCh := make(chan lookupWaiter, 1)
+	if em.SessionID == "" {
+		return
+	}
 	c.mu.Lock()
-	c.pendingLookups[targetPeerID] = append(c.pendingLookups[targetPeerID], waitCh)
+	sess := c.sessionsByID[em.SessionID]
 	c.mu.Unlock()
-
-	reqBytes, err := json.Marshal(protocol.LookupMessage{
-		V:      protocol.Version,
-		Type:   protocol.TypeLookup,
-		Target: targetPeerID,
-	})
-	if err != nil {
-		return nil, false, err
+	if sess == nil {
+		return
 	}
-	if err := c.sendWS(ctx, reqBytes); err != nil {
-		c.removeLookupWaiter(targetPeerID, waitCh)
-		return nil, false, err
+	cause := fmt.Errorf("hub error: %s", em.Code)
+	if em.Code == protocol.ErrCodePeerOffline {
+		cause = fmt.Errorf("%w: %s", ErrPeerOfflineOrDenied, em.Code)
 	}
-
-	select {
-	case <-ctx.Done():
-		c.removeLookupWaiter(targetPeerID, waitCh)
-		return nil, false, ctx.Err()
-	case out := <-waitCh:
-		if out.err != nil {
-			return nil, false, out.err
-		}
-		var pub identity.PublicKey
-		if out.res.PublicKey != "" {
-			pub, err = identity.DecodePublicKey(out.res.PublicKey)
-			if err != nil {
-				return nil, false, err
-			}
-		}
-		// Section 3 & SEC-02: Independently verify peer trust and ACL locally!
-		vp, err := c.trust.VerifyPeer(targetPeerID, pub, out.res.Membership)
-		if err != nil {
-			return nil, false, err
-		}
-		if err := c.trust.AuthorizePair(c.PeerID(), targetPeerID, c.cfg.Membership, vp.Membership); err != nil {
-			return nil, false, err
-		}
-		c.trust.CacheVerifiedPeer(vp)
-		return vp, out.res.Online, nil
-	}
-}
-
-func (c *Client) removeLookupWaiter(target string, targetCh chan lookupWaiter) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	list := c.pendingLookups[target]
-	kept := list[:0]
-	for _, ch := range list {
-		if ch != targetCh {
-			kept = append(kept, ch)
-		}
-	}
-	if len(kept) == 0 {
-		delete(c.pendingLookups, target)
-	} else {
-		c.pendingLookups[target] = kept
-	}
-}
-
-func (c *Client) resolveVerifiedRemotePeer(ctx context.Context, remotePeerID string) (*identity.VerifiedPeer, error) {
-	if vp, err := c.trust.VerifyPeer(remotePeerID, identity.PublicKey{}, nil); err == nil {
-		if aclErr := c.trust.AuthorizePair(c.PeerID(), remotePeerID, c.cfg.Membership, vp.Membership); aclErr != nil {
-			return nil, aclErr
-		}
-		return vp, nil
-	}
-	lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	vp, _, err := c.Lookup(lctx, remotePeerID)
-	if err != nil {
-		return nil, err
-	}
-	return vp, nil
+	sess.failClosed(em.Code, cause)
 }
 
 // InjectRawEnvelopeForTesting feeds a raw signaling JSON payload directly into the
@@ -996,6 +1205,53 @@ func (c *Client) InjectRawEnvelopeForTesting(raw []byte) error {
 	return err
 }
 
+func (c *Client) resolveSenderPublicKey(env *protocol.SignalEnvelope, sess *Session) (identity.PublicKey, error) {
+	if env.PublicKey != "" {
+		pub, err := identity.DecodePublicKey(env.PublicKey)
+		if err != nil {
+			return identity.PublicKey{}, err
+		}
+		derived, err := identity.PeerIDFromPublicKey(pub)
+		if err != nil || derived != env.From {
+			return identity.PublicKey{}, identity.ErrPeerIDMismatch
+		}
+		if sess != nil && !sess.remotePub.IsZero() && !sess.remotePub.Equal(pub) {
+			return identity.PublicKey{}, identity.ErrPeerIDMismatch
+		}
+		return pub, nil
+	}
+	if sess != nil && !sess.remotePub.IsZero() {
+		return sess.remotePub, nil
+	}
+	c.mu.Lock()
+	kp, ok := c.knownPeers[env.From]
+	c.mu.Unlock()
+	if ok && !kp.PublicKey.IsZero() {
+		return kp.PublicKey, nil
+	}
+	return identity.PublicKey{}, protocol.ErrInvalidSignature
+}
+
+func (c *Client) sendImmediateClose(toPeerID, sessionID string, gen uint32, reason string) {
+	if !c.wsOnline.Load() {
+		return
+	}
+	_, raw, err := protocol.SignEnvelope(
+		c.cfg.KeyPair,
+		protocol.TypeClose,
+		toPeerID,
+		sessionID,
+		gen,
+		0,
+		time.Now().Add(c.cfg.SignalingTTL).Unix(),
+		protocol.CloseBody{Reason: reason},
+	)
+	if err != nil {
+		return
+	}
+	_ = c.sendWS(context.Background(), raw)
+}
+
 func (c *Client) handlePeerEnvelope(raw []byte) error {
 	env, err := protocol.ParseUnsignedEnvelope(raw, protocol.MaxSignalingMessageSize)
 	if err != nil {
@@ -1005,87 +1261,191 @@ func (c *Client) handlePeerEnvelope(raw []byte) error {
 		return protocol.ErrInvalidEnvelope
 	}
 
-	vp, err := c.resolveVerifiedRemotePeer(context.Background(), env.From)
-	if err != nil {
-		return err
-	}
-
-	if err := protocol.VerifyEnvelopeSignature(env, vp.PublicKey, time.Now(), c.cfg.SignalingTTL, c.cfg.MaxClockSkew); err != nil {
-		return err
-	}
-
 	c.mu.Lock()
 	if _, wasClosed := c.closedSessionIDs[env.SessionID]; wasClosed {
 		c.mu.Unlock()
 		return ErrReplayedSignaling
 	}
-
 	sessByID := c.sessionsByID[env.SessionID]
 	sessByPeer := c.sessionsByPeer[env.From]
+	known := c.knownPeers[env.From]
+	c.mu.Unlock()
 
-	// Handle incoming offer (new session, glare resolution, or ICE restart generation).
+	senderPub, err := c.resolveSenderPublicKey(env, sessByID)
+	if err != nil {
+		return err
+	}
+	if err := protocol.VerifyEnvelopeSignature(env, senderPub, time.Now(), c.cfg.SignalingTTL, c.cfg.MaxClockSkew); err != nil {
+		return err
+	}
+
 	if env.Type == protocol.TypeOffer {
+		// Blacklisted peers are rejected immediately without bothering the user.
+		if c.blacklist.Contains(env.From) {
+			c.sendImmediateClose(env.From, env.SessionID, env.Generation, "blacklisted")
+			return ErrPeerBlacklisted
+		}
+
+		// Pre-validate remote SDP before prompting the user or creating WebRTC state.
+		var body protocol.SDPBody
+		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
+			return err
+		}
+		candPolicy, prohibEPs, prohibIPs := c.candidatePolicySnapshot()
+		info, err := ValidateAndInspectRemoteSDPWithCandidatePolicy(body.SDP, prohibEPs, prohibIPs, candPolicy)
+		if err != nil {
+			if errors.Is(err, ErrProhibitedCandidate) || errors.Is(err, ErrProhibitedEndpoint) {
+				c.prohibitedRejected.Add(1)
+			}
+			return err
+		}
+
+		// Existing session (e.g., ICE restart generation on an already-allowed session).
 		if sessByID != nil {
-			c.mu.Unlock()
 			return sessByID.receiveVerifiedEnvelope(env, raw)
 		}
 
-		// Glare check (Section 5): concurrent offers for the same peer pair.
+		// Glare check: concurrent offers for the same peer pair (local user already chose Connect).
 		if sessByPeer != nil {
 			st := sessByPeer.State()
 			if st == StateDiscovering || st == StateNegotiating {
-				// Offer from lexicographically smaller peer_id wins!
 				if c.PeerID() < env.From {
-					// Local outgoing offer wins; ignore remote losing offer.
-					c.mu.Unlock()
 					return nil
 				}
-				// Remote offer wins! Supersede our outgoing negotiation cleanly and adopt env.SessionID.
+				c.mu.Lock()
 				delete(c.sessionsByID, sessByPeer.SessionID())
 				c.closedSessionIDs[sessByPeer.SessionID()] = time.Now()
 				c.sessionsByID[env.SessionID] = sessByPeer
 				c.mu.Unlock()
-				return sessByPeer.adoptWinningRemoteOffer(env, raw, vp)
-			}
-			if st == StateConnected || st == StateAuthenticating || st == StateReconnecting {
-				// Replace old session if remote peer re-established fresh session.
-				delete(c.sessionsByID, sessByPeer.SessionID())
-				c.closedSessionIDs[sessByPeer.SessionID()] = time.Now()
-				c.mu.Unlock()
-				sessByPeer.failClosed("superseded_by_new_offer", ErrSessionClosed)
-				c.mu.Lock()
+				return sessByPeer.adoptWinningRemoteOffer(env, raw, senderPub)
 			}
 		}
 
 		if env.Seq != 0 {
-			c.mu.Unlock()
 			return ErrReplayedSignaling
 		}
 
-		sess := newSession(c, vp, env.SessionID, false)
-		c.sessionsByPeer[env.From] = sess
+		// Explicit user Allow/Deny/Blacklist consent core: fail closed if no ConsentHandler is set.
+		if c.cfg.Consent == nil {
+			c.sendImmediateClose(env.From, env.SessionID, env.Generation, "user_denied")
+			return ErrUserDenied
+		}
+
+		vip, err := identity.VirtualIPv4FromPeerID(env.From)
+		if err != nil {
+			return err
+		}
+		req := &IncomingRequest{
+			PeerID:           env.From,
+			PublicKey:        senderPub,
+			Algorithm:        senderPub.Algorithm,
+			VirtualIP:        vip,
+			DisplayName:      known.DisplayName,
+			ChannelID:        known.ChannelID,
+			DTLSFingerprints: slices.Clone(info.SHA256Fingerprints),
+			SessionID:        env.SessionID,
+		}
+
+		sess := newSession(c, env.From, senderPub, env.SessionID, false)
+		sess.mu.Lock()
+		sess.awaitingConsent = true
+		sess.mu.Unlock()
+
+		c.mu.Lock()
 		c.sessionsByID[env.SessionID] = sess
 		c.mu.Unlock()
 
-		if err := sess.receiveVerifiedEnvelope(env, raw); err != nil {
-			c.removeSession(sess, true)
-			return err
-		}
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.processIncomingConsent(sess, env, raw, req)
+		}()
 		return nil
 	}
 
-	if sessByID == nil || sessByID.remotePeer.PeerID != env.From {
-		c.mu.Unlock()
+	if sessByID == nil || sessByID.remotePeerID != env.From {
 		return ErrReplayedSignaling
 	}
-	c.mu.Unlock()
-
+	sessByID.setRemotePublicKey(senderPub)
 	return sessByID.receiveVerifiedEnvelope(env, raw)
 }
 
-// Connect initiates a direct-only authenticated WebRTC session to targetPeerID
-// and blocks until StateConnected is reached or OfferToConnectedTimeout/ctx expires.
+func (c *Client) processIncomingConsent(sess *Session, offerEnv *protocol.SignalEnvelope, rawOffer []byte, req *IncomingRequest) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ConsentTimeout)
+	defer cancel()
+
+	go func() {
+		select {
+		case <-c.stopCh:
+			cancel()
+		case <-sess.closedCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	decision := c.cfg.Consent.AuthorizeIncoming(ctx, req)
+	if ctx.Err() != nil && decision == ConsentAllow {
+		decision = ConsentDeny
+	}
+
+	switch decision {
+	case ConsentAllow:
+		if c.blacklist.Contains(req.PeerID) {
+			c.sendImmediateClose(req.PeerID, offerEnv.SessionID, offerEnv.Generation, "blacklisted")
+			sess.failClosed("blacklisted", ErrPeerBlacklisted)
+			return
+		}
+		var superseded *Session
+		c.mu.Lock()
+		if old := c.sessionsByPeer[req.PeerID]; old != nil && old != sess {
+			delete(c.sessionsByID, old.SessionID())
+			c.closedSessionIDs[old.SessionID()] = time.Now()
+			superseded = old
+		}
+		c.sessionsByPeer[req.PeerID] = sess
+		c.mu.Unlock()
+		if superseded != nil {
+			superseded.failClosed("superseded_by_new_offer", ErrSessionClosed)
+		}
+
+		sess.mu.Lock()
+		sess.awaitingConsent = false
+		queued := slices.Clone(sess.preConsentQueue)
+		sess.preConsentQueue = nil
+		sess.mu.Unlock()
+
+		if err := sess.receiveVerifiedEnvelope(offerEnv, rawOffer); err != nil {
+			c.removeSession(sess, true)
+			return
+		}
+		for _, item := range queued {
+			_ = sess.receiveVerifiedEnvelope(item.env, item.raw)
+		}
+
+	case ConsentBlacklist:
+		_ = c.Blacklist(req.PeerID)
+		c.sendImmediateClose(req.PeerID, offerEnv.SessionID, offerEnv.Generation, "blacklisted")
+		sess.failClosed("blacklisted", ErrPeerBlacklisted)
+
+	default:
+		c.sendImmediateClose(req.PeerID, offerEnv.SessionID, offerEnv.Generation, "user_denied")
+		sess.failClosed("user_denied", ErrUserDenied)
+	}
+}
+
+// Connect explicitly initiates a WebRTC session to targetPeerID and blocks until
+// StateConnected is reached, the remote user denies/blacklists, or timeout expires.
 func (c *Client) Connect(ctx context.Context, targetPeerID string) (*Session, error) {
+	if err := identity.ValidatePeerID(targetPeerID); err != nil {
+		return nil, err
+	}
+	if targetPeerID == c.PeerID() {
+		return nil, errors.New("peer: cannot connect to self")
+	}
+	if c.blacklist.Contains(targetPeerID) {
+		return nil, ErrPeerBlacklisted
+	}
 	if !c.wsOnline.Load() {
 		return nil, ErrHubDisconnected
 	}
@@ -1095,38 +1455,31 @@ func (c *Client) Connect(ctx context.Context, targetPeerID string) (*Session, er
 		return nil, err
 	}
 
-	sess := newSession(c, &identity.VerifiedPeer{PeerID: targetPeerID}, sessionID, true)
+	c.mu.Lock()
+	var knownPub identity.PublicKey
+	if kp, ok := c.knownPeers[targetPeerID]; ok {
+		knownPub = kp.PublicKey
+	}
+	if existing, ok := c.sessionsByPeer[targetPeerID]; ok {
+		st := existing.State()
+		if st == StateNegotiating || st == StateAuthenticating || st == StateConnected {
+			c.mu.Unlock()
+			deadlineCtx, cancel := context.WithTimeout(ctx, c.cfg.OfferToConnectedTimeout)
+			defer cancel()
+			return existing.waitConnected(deadlineCtx)
+		}
+	}
+	sess := newSession(c, targetPeerID, knownPub, sessionID, true)
+	c.sessionsByPeer[targetPeerID] = sess
+	c.sessionsByID[sessionID] = sess
+	c.mu.Unlock()
+
 	sess.setState(StateDiscovering, "")
 
 	deadlineCtx, cancel := context.WithTimeout(ctx, c.cfg.OfferToConnectedTimeout)
 	defer cancel()
 
-	// Step 1: Discovering -> Authorized Lookup + local independent trust verification.
-	vp, online, err := c.Lookup(deadlineCtx, targetPeerID)
-	if err != nil || !online {
-		sess.failClosed("offline_or_denied", ErrPeerOfflineOrDenied)
-		if err != nil {
-			return nil, err
-		}
-		return nil, ErrPeerOfflineOrDenied
-	}
-	sess.remotePeer = vp
-
-	c.mu.Lock()
-	if existing, ok := c.sessionsByPeer[targetPeerID]; ok {
-		st := existing.State()
-		if st == StateNegotiating || st == StateAuthenticating || st == StateConnected {
-			c.mu.Unlock()
-			return existing.waitConnected(deadlineCtx)
-		}
-	}
-	c.sessionsByPeer[targetPeerID] = sess
-	c.sessionsByID[sessionID] = sess
-	c.mu.Unlock()
-
-	// Step 2: Negotiating -> Create data-only offer and exchange signed SDP & Trickle ICE.
 	if err := sess.startAsOfferer(deadlineCtx, 0); err != nil {
-		// Check if glare switched this session to responder in the meantime.
 		if sess.State() != StateNegotiating && sess.State() != StateAuthenticating && sess.State() != StateConnected {
 			c.removeSession(sess, true)
 			return nil, err
@@ -1142,9 +1495,9 @@ func (c *Client) removeSession(sess *Session, markClosed bool) {
 	if cur := c.sessionsByID[sess.sessionID]; cur == sess {
 		delete(c.sessionsByID, sess.sessionID)
 	}
-	if sess.remotePeer != nil {
-		if cur := c.sessionsByPeer[sess.remotePeer.PeerID]; cur == sess {
-			delete(c.sessionsByPeer, sess.remotePeer.PeerID)
+	if sess.remotePeerID != "" {
+		if cur := c.sessionsByPeer[sess.remotePeerID]; cur == sess {
+			delete(c.sessionsByPeer, sess.remotePeerID)
 		}
 	}
 	if markClosed && sess.sessionID != "" {
@@ -1153,10 +1506,14 @@ func (c *Client) removeSession(sess *Session, markClosed bool) {
 }
 
 // ProbeSTUNS verifies reachability and server certificate trust of the configured encrypted
-// STUNS (or TURNS) server over DTLS 1.3 / UDP by default, or TLS 1.3 / TCP when TCPOnly is set.
+// STUNS/TURNS server over DTLS 1.3 / UDP by default, or TLS 1.3 / TCP when TCPOnly is set.
 func (c *Client) ProbeSTUNS(ctx context.Context) (*stun.XORMappedAddress, error) {
+	c.iceMu.RLock()
+	servers := slices.Clone(c.resolvedICE)
+	c.iceMu.RUnlock()
+
 	var target *stun.URI
-	for _, srv := range c.resolvedICE {
+	for _, srv := range servers {
 		if srv.URI == nil || !srv.URI.IsSecure() {
 			continue
 		}
@@ -1201,7 +1558,6 @@ func (c *Client) buildWebRTCAPI() (*webrtc.API, error) {
 	if c.cfg.OverrideDTLSMaxVersion != 0 {
 		maxVer = c.cfg.OverrideDTLSMaxVersion
 	}
-	// Section 6 & 8.1: Enforce DTLS 1.3 exclusively, replay protection enabled, fingerprint verification enabled.
 	se.SetDTLSMinVersion(minVer)
 	se.SetDTLSMaxVersion(maxVer)
 	se.SetDTLSReplayProtectionWindow(64)
@@ -1233,30 +1589,42 @@ func (c *Client) buildWebRTCAPI() (*webrtc.API, error) {
 	c.mu.Lock()
 	vnet := c.vnet
 	c.mu.Unlock()
-	if c.cfg.TCPOnly {
+
+	c.iceMu.RLock()
+	dtlsTargets := make(map[string]string, len(c.dtlsUDPTargets))
+	for k, v := range c.dtlsUDPTargets {
+		dtlsTargets[k] = v
+	}
+	tlsTargets := make(map[string]string, len(c.tlsTCPTargets))
+	for k, v := range c.tlsTCPTargets {
+		tlsTargets[k] = v
+	}
+	prohibitedIPs := append([]net.IP(nil), c.prohibitedIPs...)
+	c.iceMu.RUnlock()
+
+	switch {
+	case c.cfg.TCPOnly:
 		se.SetICETCPMux(c.tcpMux)
-	} else if len(c.dtlsUDPTargets) > 0 {
-		dtlsNet, err := newDTLS13TransportNet(vnet, c.dtlsUDPTargets, c.cfg.TLSConfig, c.cfg.PionLoggerFactory)
+	case len(dtlsTargets) > 0:
+		dtlsNet, err := newDTLS13TransportNet(vnet, dtlsTargets, c.cfg.TLSConfig, c.cfg.PionLoggerFactory)
 		if err != nil {
 			return nil, err
 		}
 		se.SetNet(dtlsNet)
-	} else if vnet != nil {
+	case vnet != nil:
 		se.SetNet(vnet)
 	}
 
-	if !c.cfg.TCPOnly && len(c.tlsTCPTargets) > 0 {
+	if !c.cfg.TCPOnly && len(tlsTargets) > 0 {
 		se.SetICEProxyDialer(&turnTCPProxyDialer{
-			tlsHosts: c.tlsTCPTargets,
+			tlsHosts: tlsTargets,
 			tlsCfg:   c.cfg.TLSConfig,
 		})
 	}
 
-	// Filter remote IPs if any non-local Hub host IPs are prohibited.
-	if len(c.prohibitedIPs) > 0 {
-		blocked := append([]net.IP(nil), c.prohibitedIPs...)
+	if len(prohibitedIPs) > 0 {
 		se.SetRemoteIPFilter(func(ip net.IP) bool {
-			for _, bip := range blocked {
+			for _, bip := range prohibitedIPs {
 				if bip.Equal(ip) {
 					return false
 				}
@@ -1273,13 +1641,17 @@ type queuedEnvelope struct {
 	raw []byte
 }
 
-// Session represents a direct-only authenticated WebRTC connection with one remote peer.
+// Session represents a user-authorized, end-to-end DTLS 1.3 WebRTC connection with one remote peer.
 type Session struct {
-	client     *Client
-	remotePeer *identity.VerifiedPeer
+	client       *Client
+	remotePeerID string
 
 	sendSignalMu       sync.Mutex
 	mu                 sync.Mutex
+	remotePub          identity.PublicKey
+	remoteVIP          netip.Addr
+	awaitingConsent    bool
+	preConsentQueue    []queuedEnvelope
 	closed             bool
 	sessionID          string
 	isInitiator        bool
@@ -1323,10 +1695,13 @@ type Session struct {
 	stateHooks   []func(ConnectionState)
 }
 
-func newSession(client *Client, remote *identity.VerifiedPeer, sessionID string, initiator bool) *Session {
+func newSession(client *Client, remotePeerID string, remotePub identity.PublicKey, sessionID string, initiator bool) *Session {
+	vip, _ := identity.VirtualIPv4FromPeerID(remotePeerID)
 	s := &Session{
 		client:             client,
-		remotePeer:         remote,
+		remotePeerID:       remotePeerID,
+		remotePub:          remotePub,
+		remoteVIP:          vip,
 		sessionID:          sessionID,
 		isInitiator:        initiator,
 		seenRemoteSeqHash:  make(map[uint64][32]byte),
@@ -1354,6 +1729,17 @@ func newSession(client *Client, remote *identity.VerifiedPeer, sessionID string,
 	return s
 }
 
+func (s *Session) setRemotePublicKey(pub identity.PublicKey) {
+	if pub.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	if s.remotePub.IsZero() {
+		s.remotePub = pub
+	}
+	s.mu.Unlock()
+}
+
 // SessionID returns the active 128-bit base64url negotiation session ID.
 func (s *Session) SessionID() string {
 	s.mu.Lock()
@@ -1363,10 +1749,12 @@ func (s *Session) SessionID() string {
 
 // RemotePeerID returns the authenticated remote peer_id.
 func (s *Session) RemotePeerID() string {
-	if s.remotePeer == nil {
-		return ""
-	}
-	return s.remotePeer.PeerID
+	return s.remotePeerID
+}
+
+// RemoteVirtualIP returns the deterministic RFC 6598 TUN IPv4 address of the remote peer.
+func (s *Session) RemoteVirtualIP() netip.Addr {
+	return s.remoteVIP
 }
 
 // State returns the current ConnectionState.
@@ -1376,7 +1764,12 @@ func (s *Session) State() ConnectionState {
 	return s.state
 }
 
-// IsPathVerified reports whether DTLS 1.3, certificate fingerprint, direct ICE pair,
+// Closed returns a channel closed when the session terminates.
+func (s *Session) Closed() <-chan struct{} {
+	return s.closedCh
+}
+
+// IsPathVerified reports whether DTLS 1.3, certificate fingerprint, ICE pair,
 // and data/v1 DataChannel are all currently verified and active.
 func (s *Session) IsPathVerified() bool {
 	return s.pathVerified.Load()
@@ -1389,8 +1782,7 @@ func (s *Session) OnStateChange(fn func(ConnectionState)) {
 	s.mu.Unlock()
 }
 
-// Send transmits an ordered, reliable binary message over "data/v1" (<= 16 KiB)
-// with bounded queue backpressure.
+// Send transmits an ordered, reliable binary message over "data/v1" (<= 16 KiB).
 func (s *Session) Send(ctx context.Context, payload []byte) error {
 	st := s.State()
 	if st == StateFailed || st == StateDisconnected {
@@ -1399,7 +1791,12 @@ func (s *Session) Send(ctx context.Context, payload []byte) error {
 	return s.dataCh.enqueue(ctx, payload)
 }
 
-// SendPacket transmits an optional unordered, non-retransmitted datagram over "packet/v1".
+// HasPacketChannel reports whether the unordered "packet/v1" channel is bound.
+func (s *Session) HasPacketChannel() bool {
+	return s.packetCh.isBound()
+}
+
+// SendPacket transmits an unordered, non-retransmitted datagram over "packet/v1".
 func (s *Session) SendPacket(ctx context.Context, payload []byte) error {
 	st := s.State()
 	if st == StateFailed || st == StateDisconnected {
@@ -1408,7 +1805,7 @@ func (s *Session) SendPacket(ctx context.Context, payload []byte) error {
 	return s.packetCh.enqueue(ctx, payload)
 }
 
-// Messages returns the receive channel for verified "data/v1" binary payloads.
+// Messages returns the receive channel for verified "data/v1" payloads.
 func (s *Session) Messages() <-chan []byte {
 	return s.recvDataCh
 }
@@ -1418,18 +1815,17 @@ func (s *Session) Packets() <-chan []byte {
 	return s.recvPacketCh
 }
 
-// Diagnostics returns an observability snapshot of transport security and ICE metrics (Section 9 & 10).
+// Diagnostics returns an observability snapshot of transport security and ICE metrics.
 func (s *Session) Diagnostics() SessionDiagnostics {
 	s.mu.Lock()
 	diag := SessionDiagnostics{
+		RemotePeerID:     s.remotePeerID,
+		RemoteVirtualIP:  s.remoteVIP.String(),
 		SessionID:        s.sessionID,
 		Generation:       s.generation,
 		State:            s.state,
 		RemoteCertSHA256: s.verifiedRemoteFP,
 		FailureCode:      s.failureCode,
-	}
-	if s.remotePeer != nil {
-		diag.RemotePeerID = s.remotePeer.PeerID
 	}
 	pc := s.pc
 	s.mu.Unlock()
@@ -1485,7 +1881,7 @@ func (s *Session) CloseWithReason(reason string) error {
 	s.dataCh.close()
 	s.packetCh.close()
 
-	if s.remotePeer != nil && sid != "" && s.client.wsOnline.Load() {
+	if s.remotePeerID != "" && sid != "" && s.client.wsOnline.Load() {
 		_ = s.sendSignedEnvelope(context.Background(), gen, protocol.TypeClose, protocol.CloseBody{Reason: reason})
 	}
 
@@ -1496,6 +1892,9 @@ func (s *Session) CloseWithReason(reason string) error {
 	s.client.removeSession(s, true)
 	for _, fn := range hooks {
 		fn(StateDisconnected)
+	}
+	if s.client.cfg.OnSessionClosed != nil {
+		go s.client.cfg.OnSessionClosed(s.remotePeerID, reason)
 	}
 	return nil
 }
@@ -1572,6 +1971,9 @@ func (s *Session) failClosed(code string, cause error) {
 	for _, fn := range hooks {
 		fn(StateFailed)
 	}
+	if s.client.cfg.OnSessionClosed != nil {
+		go s.client.cfg.OnSessionClosed(s.remotePeerID, code)
+	}
 }
 
 func (s *Session) resetGenerationLocked(gen uint32) *webrtc.PeerConnection {
@@ -1607,8 +2009,12 @@ func (s *Session) newPeerConnectionLocked(gen uint32, offerer bool) (*webrtc.Pee
 	if err != nil {
 		return nil, err
 	}
+	s.client.iceMu.RLock()
+	iceSrvs := slices.Clone(s.client.webrtcICEServers)
+	s.client.iceMu.RUnlock()
+
 	pcCfg := webrtc.Configuration{
-		ICEServers:         slices.Clone(s.client.webrtcICEServers),
+		ICEServers:         iceSrvs,
 		ICETransportPolicy: s.client.cfg.ICETransportPolicy,
 	}
 	if s.client.cfg.DTLSCertAlgorithm != "" {
@@ -1624,7 +2030,6 @@ func (s *Session) newPeerConnectionLocked(gen uint32, offerer bool) (*webrtc.Pee
 	}
 	s.pc = pc
 
-	// Enforce offer-to-connected deadline for every negotiation/restart generation.
 	timeout := s.client.cfg.OfferToConnectedTimeout
 	go func(targetGen uint32, targetPC *webrtc.PeerConnection) {
 		timer := time.NewTimer(timeout)
@@ -1642,12 +2047,10 @@ func (s *Session) newPeerConnectionLocked(gen uint32, offerer bool) (*webrtc.Pee
 		}
 	}(gen, pc)
 
-	// Trickle ICE candidate emission.
 	pc.OnICECandidate(func(cand *webrtc.ICECandidate) {
 		s.onLocalICECandidate(gen, pc, cand)
 	})
 
-	// Monitor ICE transport pair nomination and runtime path changes (Section 5.1).
 	iceT := pc.SCTP().Transport().ICETransport()
 	iceT.OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
 		s.onSelectedPairChange(gen, pc, pair)
@@ -1656,7 +2059,6 @@ func (s *Session) newPeerConnectionLocked(gen uint32, offerer bool) (*webrtc.Pee
 		s.onICEStateChange(gen, pc, st)
 	})
 
-	// Monitor DTLS 1.3 handshake state and certificate fingerprint (Section 6).
 	dtlsT := pc.SCTP().Transport()
 	dtlsT.OnStateChange(func(st webrtc.DTLSTransportState) {
 		s.onDTLSStateChange(gen, pc, st)
@@ -1706,7 +2108,6 @@ func (s *Session) bindDataV1(gen uint32, pc *webrtc.PeerConnection, dc *webrtc.D
 	if dc.ReadyState() == webrtc.DataChannelStateOpen {
 		s.markDataChannelOpen(gen, pc)
 	}
-	// Wrap OnOpen while preserving managedChannel's state update.
 	dc.OnOpen(func() {
 		s.dataCh.mu.Lock()
 		if s.dataCh.dc == dc {
@@ -1728,7 +2129,6 @@ func (s *Session) onIncomingDataChannel(gen uint32, pc *webrtc.PeerConnection, d
 	maxMsg := s.negotiatedMaxMsg
 	s.mu.Unlock()
 
-	// Section 7: Answerer accepts ONLY negotiated, recognized labels and exact reliability settings.
 	switch dc.Label() {
 	case ChannelLabelDataV1:
 		if !dc.Ordered() || dc.MaxRetransmits() != nil || dc.MaxPacketLifeTime() != nil || dc.Negotiated() {
@@ -1747,7 +2147,6 @@ func (s *Session) onIncomingDataChannel(gen uint32, pc *webrtc.PeerConnection, d
 		s.packetCh.bindDataChannel(dc, maxMsg)
 
 	default:
-		// Reject unrecognized DataChannel labels immediately.
 		_ = dc.Close()
 	}
 }
@@ -1785,11 +2184,11 @@ func (s *Session) startAsOfferer(ctx context.Context, gen uint32) error {
 	return nil
 }
 
-func (s *Session) adoptWinningRemoteOffer(env *protocol.SignalEnvelope, raw []byte, vp *identity.VerifiedPeer) error {
+func (s *Session) adoptWinningRemoteOffer(env *protocol.SignalEnvelope, raw []byte, remotePub identity.PublicKey) error {
 	s.mu.Lock()
 	oldPC := s.resetGenerationLocked(env.Generation)
 	s.sessionID = env.SessionID
-	s.remotePeer = vp
+	s.remotePub = remotePub
 	s.isInitiator = false
 	s.mu.Unlock()
 	if oldPC != nil {
@@ -1804,6 +2203,20 @@ func (s *Session) receiveVerifiedEnvelope(env *protocol.SignalEnvelope, raw []by
 		s.mu.Unlock()
 		return ErrSessionClosed
 	}
+	if s.awaitingConsent {
+		if env.Type == protocol.TypeClose {
+			s.mu.Unlock()
+			s.failClosed("remote_closed", ErrSessionClosed)
+			return nil
+		}
+		if len(s.preConsentQueue) >= s.client.cfg.MaxCandidatesPerGen {
+			s.mu.Unlock()
+			return ErrCandidateLimit
+		}
+		s.preConsentQueue = append(s.preConsentQueue, queuedEnvelope{env: env, raw: append([]byte(nil), raw...)})
+		s.mu.Unlock()
+		return nil
+	}
 
 	if env.Generation < s.generation {
 		s.mu.Unlock()
@@ -1811,7 +2224,6 @@ func (s *Session) receiveVerifiedEnvelope(env *protocol.SignalEnvelope, raw []by
 	}
 
 	if env.Generation > s.generation {
-		// New generation must begin with an offer at seq 0 (ICE restart).
 		if env.Type != protocol.TypeOffer || env.Seq != 0 {
 			s.mu.Unlock()
 			return ErrStaleGeneration
@@ -1828,8 +2240,6 @@ func (s *Session) receiveVerifiedEnvelope(env *protocol.SignalEnvelope, raw []by
 
 	payloadHash := sha256.Sum256(raw)
 	if prevHash, seen := s.seenRemoteSeqHash[env.Seq]; seen {
-		// Section 4.3 & T07: Reject replayed offers/answers/closes or modified retransmissions;
-		// deduplicate identical candidate/end_of_candidates retransmissions without reinstalling.
 		s.mu.Unlock()
 		if env.Type == protocol.TypeCandidate || env.Type == protocol.TypeEndOfCandidates {
 			if prevHash == payloadHash {
@@ -1852,7 +2262,6 @@ func (s *Session) receiveVerifiedEnvelope(env *protocol.SignalEnvelope, raw []by
 		return nil
 	}
 
-	// Process contiguous envelopes starting from s.nextRemoteSeq.
 	queue := []queuedEnvelope{{env: env, raw: raw}}
 	s.seenRemoteSeqHash[env.Seq] = payloadHash
 	s.nextRemoteSeq++
@@ -1877,13 +2286,15 @@ func (s *Session) receiveVerifiedEnvelope(env *protocol.SignalEnvelope, raw []by
 }
 
 func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
+	candPolicy, prohibEPs, prohibIPs := s.client.candidatePolicySnapshot()
+
 	switch env.Type {
 	case protocol.TypeOffer:
 		var body protocol.SDPBody
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
-		info, err := ValidateAndInspectRemoteSDPWithCandidatePolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy())
+		info, err := ValidateAndInspectRemoteSDPWithCandidatePolicy(body.SDP, prohibEPs, prohibIPs, candPolicy)
 		if err != nil {
 			if errors.Is(err, ErrProhibitedCandidate) || errors.Is(err, ErrProhibitedEndpoint) {
 				s.client.prohibitedRejected.Add(1)
@@ -1942,7 +2353,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
-		info, err := ValidateAndInspectRemoteSDPWithCandidatePolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy())
+		info, err := ValidateAndInspectRemoteSDPWithCandidatePolicy(body.SDP, prohibEPs, prohibIPs, candPolicy)
 		if err != nil {
 			if errors.Is(err, ErrProhibitedCandidate) || errors.Is(err, ErrProhibitedEndpoint) {
 				s.client.prohibitedRejected.Add(1)
@@ -1975,8 +2386,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
-		// Section 5.1 & T08: Reject prohibited candidates BEFORE buffering or installing into WebRTC!
-		if err := ValidateTrickleCandidateWithCandidatePolicy(body, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy()); err != nil {
+		if err := ValidateTrickleCandidateWithCandidatePolicy(body, prohibEPs, prohibIPs, candPolicy); err != nil {
 			s.client.prohibitedRejected.Add(1)
 			return err
 		}
@@ -2017,6 +2427,15 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
+		switch body.Reason {
+		case "user_denied":
+			s.failClosed(body.Reason, ErrUserDenied)
+			return nil
+		case "blacklisted":
+			s.failClosed(body.Reason, ErrPeerBlacklisted)
+			return nil
+		}
+
 		s.mu.Lock()
 		s.closed = true
 		pc := s.pc
@@ -2035,6 +2454,9 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		s.client.removeSession(s, true)
 		for _, fn := range hooks {
 			fn(StateDisconnected)
+		}
+		if s.client.cfg.OnSessionClosed != nil {
+			go s.client.cfg.OnSessionClosed(s.remotePeerID, body.Reason)
 		}
 		return nil
 	}
@@ -2089,12 +2511,12 @@ func (s *Session) onLocalICECandidate(gen uint32, pc *webrtc.PeerConnection, can
 		return
 	}
 
-	// Never emit prohibited relay or wrong-transport candidates locally either.
+	candPolicy, _, _ := s.client.candidatePolicySnapshot()
 	wantProto := webrtc.ICEProtocolUDP
-	if s.client.cfg.TCPOnly {
+	if candPolicy.TCPOnly {
 		wantProto = webrtc.ICEProtocolTCP
 	}
-	if !isAllowedWebRTCCandidateType(cand.Typ, s.client.candidatePolicy().AllowRelay) || cand.Protocol != wantProto {
+	if !isAllowedWebRTCCandidateType(cand.Typ, candPolicy.AllowRelay) || cand.Protocol != wantProto {
 		return
 	}
 	initJSON := cand.ToJSON()
@@ -2127,7 +2549,7 @@ func (s *Session) onLocalICECandidate(gen uint32, pc *webrtc.PeerConnection, can
 }
 
 func extractICEUfragFromSDP(rawSDP string) string {
-	for _, line := range strings.Split(rawSDP, "\n") {
+	for line := range strings.SplitSeq(rawSDP, "\n") {
 		line = strings.TrimSpace(line)
 		if after, ok := strings.CutPrefix(line, "a=ice-ufrag:"); ok && after != "" {
 			return after
@@ -2165,14 +2587,14 @@ func (s *Session) sendSignedEnvelope(ctx context.Context, gen uint32, msgType st
 	defer s.sendSignalMu.Unlock()
 
 	s.mu.Lock()
-	if s.generation != gen || s.remotePeer == nil {
+	if s.generation != gen || s.remotePeerID == "" {
 		s.mu.Unlock()
 		return ErrStaleGeneration
 	}
 	seq := s.localSeq
 	s.localSeq++
 	sid := s.sessionID
-	to := s.remotePeer.PeerID
+	to := s.remotePeerID
 	s.mu.Unlock()
 
 	exp := time.Now().Add(s.client.cfg.SignalingTTL).Unix()
@@ -2193,8 +2615,8 @@ func (s *Session) sendSignedEnvelope(ctx context.Context, gen uint32, msgType st
 }
 
 func (s *Session) onSelectedPairChange(gen uint32, pc *webrtc.PeerConnection, pair *webrtc.ICECandidatePair) {
-	if err := ValidateSelectedPairWithCandidatePolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy()); err != nil {
-		// Section 5.1: Immediately suspend traffic and close on prohibited/unverifiable path!
+	candPolicy, prohibEPs, prohibIPs := s.client.candidatePolicySnapshot()
+	if err := ValidateSelectedPairWithCandidatePolicy(pair, prohibEPs, prohibIPs, candPolicy); err != nil {
 		s.pathVerified.Store(false)
 		s.dataCh.setPathAllowed(false)
 		s.packetCh.setPathAllowed(false)
@@ -2225,7 +2647,6 @@ func (s *Session) onICEStateChange(gen uint32, pc *webrtc.PeerConnection, st web
 			s.onSelectedPairChange(gen, pc, pair)
 		}
 	case webrtc.ICETransportStateDisconnected:
-		// Suspend application traffic while path is unverified and attempt bounded ICE restart.
 		s.onTransportLost(gen, pc, "ice_disconnected")
 	case webrtc.ICETransportStateFailed:
 		s.onTransportLost(gen, pc, "ice_failed")
@@ -2237,7 +2658,6 @@ func (s *Session) onDTLSStateChange(gen uint32, pc *webrtc.PeerConnection, st we
 	case webrtc.DTLSTransportStateConnected:
 		dtlsT := pc.SCTP().Transport()
 		tStats := dtlsT.Stats()
-		// Section 6 & SEC-01: Enforce DTLS 1.3 (0xFEFC) exclusively; downgrade MUST fail!
 		if !strings.EqualFold(tStats.TLSVersion, ExpectedDTLS13HexVersion) {
 			s.failClosed("dtls_version_downgrade", ErrDTLSVersionDowngrade)
 			return
@@ -2251,7 +2671,6 @@ func (s *Session) onDTLSStateChange(gen uint32, pc *webrtc.PeerConnection, st we
 		expectedFPs := append([]string(nil), s.expectedSHA256FPs...)
 		s.mu.Unlock()
 
-		// Section 3 & 6: Verify remote DTLS certificate SHA-256 matches Ed25519-signed SDP!
 		actualFP, err := VerifyRemoteCertSHA256(dtlsT.GetRemoteCertificate(), expectedFPs)
 		if err != nil {
 			s.failClosed("dtls_fingerprint_mismatch", err)
@@ -2281,9 +2700,9 @@ func (s *Session) markDataChannelOpen(gen uint32, pc *webrtc.PeerConnection) {
 }
 
 func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
-	// Double-check live selected candidate pair right before enabling user payloads.
+	candPolicy, prohibEPs, prohibIPs := s.client.candidatePolicySnapshot()
 	pair, err := pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
-	if err != nil || ValidateSelectedPairWithCandidatePolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy()) != nil {
+	if err != nil || ValidateSelectedPairWithCandidatePolicy(pair, prohibEPs, prohibIPs, candPolicy) != nil {
 		return
 	}
 
@@ -2297,7 +2716,6 @@ func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 		return
 	}
 	firstConnect := !s.notifiedApp
-	isInitiator := s.isInitiator
 	s.notifiedApp = true
 	s.pathVerified.Store(true)
 	prevState := s.state
@@ -2319,7 +2737,7 @@ func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 			fn(StateConnected)
 		}
 	}
-	if firstConnect && !isInitiator && s.client.cfg.OnSession != nil {
+	if firstConnect && s.client.cfg.OnSession != nil {
 		go s.client.cfg.OnSession(s)
 	}
 }
@@ -2370,17 +2788,15 @@ func (s *Session) onTransportLost(gen uint32, pc *webrtc.PeerConnection, reason 
 		return
 	}
 	if s.state != StateConnected && s.state != StateReconnecting {
-		// Initial negotiation failed before ever reaching Connected -> fail closed immediately.
 		if reason == "ice_failed" || reason == "peer_connection_failed" {
 			s.mu.Unlock()
-			s.failClosed(reason, errors.New("peer: direct ICE negotiation failed"))
+			s.failClosed(reason, errors.New("peer: ICE negotiation failed"))
 			return
 		}
 		s.mu.Unlock()
 		return
 	}
 
-	// Section 5.2: Suspend new payload transmission immediately when path is not verified.
 	s.pathVerified.Store(false)
 	s.dataCh.setPathAllowed(false)
 	s.packetCh.setPathAllowed(false)
@@ -2390,7 +2806,6 @@ func (s *Session) onTransportLost(gen uint32, pc *webrtc.PeerConnection, reason 
 		return
 	}
 	if !s.client.wsOnline.Load() {
-		// Hub unavailable: cannot coordinate signed ICE restart -> fail closed once path dies.
 		if reason == "ice_failed" || reason == "peer_connection_failed" || reason == "network_change" {
 			s.mu.Unlock()
 			s.failClosed("hub_unavailable_for_restart", ErrHubDisconnected)
@@ -2400,8 +2815,6 @@ func (s *Session) onTransportLost(gen uint32, pc *webrtc.PeerConnection, reason 
 		return
 	}
 
-	// Deterministic restart initiator: lexicographically smaller peer_id drives offerer role
-	// unless network_change was explicitly triggered on this endpoint.
 	shouldDriveOffer := (s.client.PeerID() < s.RemotePeerID()) || reason == "network_change"
 	if !shouldDriveOffer {
 		s.mu.Unlock()

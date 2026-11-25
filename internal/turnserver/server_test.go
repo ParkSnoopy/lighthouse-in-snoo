@@ -62,7 +62,7 @@ func TestTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 	t.Parallel()
 
 	// Reject plaintext UDP TURN unless AllowInsecure=true.
-	if _, err := turnserver.New(turnserver.Config{
+	if _, err := turnserver.New(&turnserver.Config{
 		UDPListenAddr: "127.0.0.1:0",
 		SharedSecret:  "top-secret",
 	}); !errors.Is(err, turnserver.ErrInsecureTURNProhibited) {
@@ -70,7 +70,7 @@ func TestTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 	}
 
 	srvTLS, roots := makeTestTURNSCert(t)
-	srv, err := turnserver.New(turnserver.Config{
+	srv, err := turnserver.New(&turnserver.Config{
 		DTLSListenAddr:   "127.0.0.1:0",
 		TLSConfig:        srvTLS,
 		SharedSecret:     "turn-shared-secret",
@@ -151,7 +151,7 @@ func TestTURNSTCPOnlyTLS13AndInsecureTCP(t *testing.T) {
 	t.Parallel()
 
 	// Reject plaintext TCP TURN without AllowInsecure=true.
-	if _, err := turnserver.New(turnserver.Config{
+	if _, err := turnserver.New(&turnserver.Config{
 		TCPListenAddr: "127.0.0.1:0",
 		SharedSecret:  "top-secret",
 	}); !errors.Is(err, turnserver.ErrInsecureTURNProhibited) {
@@ -159,7 +159,7 @@ func TestTURNSTCPOnlyTLS13AndInsecureTCP(t *testing.T) {
 	}
 
 	srvTLS, roots := makeTestTURNSCert(t)
-	srv, err := turnserver.New(turnserver.Config{
+	srv, err := turnserver.New(&turnserver.Config{
 		TLSListenAddr:    "127.0.0.1:0",
 		TLSConfig:        srvTLS,
 		SharedSecret:     "turn-tcp-only-secret",

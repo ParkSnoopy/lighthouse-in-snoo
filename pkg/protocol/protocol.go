@@ -13,44 +13,51 @@ import (
 )
 
 const (
-	// Version is the control-plane protocol version (Section 4.3).
-	Version = 1
+	// Version is the v0.2.0 control-plane protocol version.
+	Version = 2
 
-	// DomainSignalV1 is the ASCII domain separator followed by one zero byte (Section 4.3).
-	DomainSignalV1 = "LIGHTHOUSE-SIGNAL-V1\x00"
+	// DomainSignalV2 is the ASCII domain separator for peer-to-peer signaling envelopes.
+	DomainSignalV2 = "LIGHTHOUSE-SIGNAL-V2\x00"
+	// DomainBroadcastV2 is the ASCII domain separator for signed channel broadcast announcements.
+	DomainBroadcastV2 = "LIGHTHOUSE-BROADCAST-V2\x00"
 
-	// MaxSignalingMessageSize is the default maximum control-plane JSON size (64 KiB, Section 9).
+	// MaxSignalingMessageSize is the maximum control-plane JSON size (64 KiB).
 	MaxSignalingMessageSize = 64 * 1024
 
-	// DefaultSignalingTTL is the default signaling message lifetime (60 s, Section 9).
+	// DefaultSignalingTTL is the default signaling message lifetime (60 s).
 	DefaultSignalingTTL = 60 * time.Second
 
-	// DefaultMaxClockSkew is the maximum tolerated clock skew (30 s, Section 9).
+	// DefaultMaxClockSkew is the maximum tolerated clock skew (30 s).
 	DefaultMaxClockSkew = 30 * time.Second
 
-	// DefaultMaxCandidatesPerGeneration bounds trickled candidates per sender/generation (Section 9).
+	// DefaultMaxCandidatesPerGeneration bounds trickled candidates per sender/generation.
 	DefaultMaxCandidatesPerGeneration = 128
 
-	// ChallengeBytes is the minimum single-use registration challenge length (32 bytes, Section 3).
+	// ChallengeBytes is the single-use registration challenge length (32 bytes).
 	ChallengeBytes = 32
 
-	// ChallengeTTL is the registration challenge lifetime (60 s, Section 3).
+	// ChallengeTTL is the registration challenge lifetime (60 s).
 	ChallengeTTL = 60 * time.Second
 
-	// SessionIDBytes is 128 bits (16 bytes, Section 4.3).
+	// SessionIDBytes is 128 bits (16 bytes).
 	SessionIDBytes = 16
 	// SessionIDEncodedLen is the base64url unpadded length of 16 bytes.
 	SessionIDEncodedLen = 22
+
+	// MaxSealedMetaBytes bounds AEAD-encrypted broadcast metadata strings.
+	MaxSealedMetaBytes = 2048
 )
 
-// Control-plane message types (Section 4.2).
+// Control-plane message types.
 const (
 	TypeChallenge       = "challenge"
 	TypeRegister        = "register"
 	TypeRegistered      = "registered"
 	TypeHeartbeat       = "heartbeat"
-	TypeLookup          = "lookup"
-	TypeLookupResult    = "lookup_result"
+	TypeChannelJoin     = "channel_join"
+	TypeChannelLeave    = "channel_leave"
+	TypeBroadcast       = "broadcast"
+	TypeChannelPeers    = "channel_peers"
 	TypeOffer           = "offer"
 	TypeAnswer          = "answer"
 	TypeCandidate       = "candidate"
@@ -59,7 +66,7 @@ const (
 	TypeError           = "error"
 )
 
-// Machine-readable failure codes (Section 4.2).
+// Machine-readable failure codes.
 const (
 	ErrCodeMalformedMessage   = "malformed_message"
 	ErrCodeMessageTooLarge    = "message_too_large"
@@ -68,8 +75,6 @@ const (
 	ErrCodeUnauthenticated    = "unauthenticated"
 	ErrCodeChallengeInvalid   = "challenge_invalid"
 	ErrCodeAuthFailed         = "auth_failed"
-	ErrCodeUnknownPeer        = "unknown_peer"
-	ErrCodeUnauthorizedPair   = "unauthorized_pair"
 	ErrCodePeerOffline        = "peer_offline"
 	ErrCodeSenderMismatch     = "sender_mismatch"
 	ErrCodeInvalidSignature   = "invalid_signature"
@@ -88,8 +93,9 @@ var (
 	ErrInvalidEnvelope  = errors.New("protocol: invalid signaling envelope")
 	ErrInvalidSessionID = errors.New("protocol: invalid 128-bit session_id")
 	ErrExpiredEnvelope  = errors.New("protocol: signaling message expired or outside clock skew")
-	ErrInvalidSignature = errors.New("protocol: invalid Ed25519 envelope signature")
+	ErrInvalidSignature = errors.New("protocol: invalid envelope signature")
 	ErrInvalidBody      = errors.New("protocol: invalid message body")
+	ErrInvalidBroadcast = errors.New("protocol: invalid broadcast message")
 )
 
 // BaseHeader inspects the version and type of an incoming JSON control-plane message.
@@ -113,7 +119,6 @@ func PeekHeader(raw []byte, maxBytes int) (BaseHeader, error) {
 	if err != nil {
 		return BaseHeader{}, err
 	}
-	// Extract only "v" and "type" from top-level object after strict parse.
 	var partial struct {
 		V    *int    `json:"v"`
 		Type *string `json:"type"`
@@ -121,7 +126,6 @@ func PeekHeader(raw []byte, maxBytes int) (BaseHeader, error) {
 	if err := json.Unmarshal(raw, &partial); err != nil {
 		return BaseHeader{}, jcs.ErrInvalidJSON
 	}
-	// Ensure top-level JSON value is an object.
 	if _, isSlice := val.([]any); isSlice || partial.V == nil || partial.Type == nil {
 		return BaseHeader{}, jcs.ErrInvalidJSON
 	}
@@ -134,12 +138,13 @@ func PeekHeader(raw []byte, maxBytes int) (BaseHeader, error) {
 	return BaseHeader{V: *partial.V, Type: *partial.Type}, nil
 }
 
-// IsKnownType reports whether msgType is one of the 12 specification-defined types.
+// IsKnownType reports whether msgType is a valid v0.2.0 control-plane message type.
 func IsKnownType(msgType string) bool {
 	switch msgType {
 	case TypeChallenge, TypeRegister, TypeRegistered, TypeHeartbeat,
-		TypeLookup, TypeLookupResult, TypeOffer, TypeAnswer,
-		TypeCandidate, TypeEndOfCandidates, TypeClose, TypeError:
+		TypeChannelJoin, TypeChannelLeave, TypeBroadcast, TypeChannelPeers,
+		TypeOffer, TypeAnswer, TypeCandidate, TypeEndOfCandidates,
+		TypeClose, TypeError:
 		return true
 	default:
 		return false
@@ -156,60 +161,108 @@ func IsPeerSignalType(msgType string) bool {
 	}
 }
 
-// ChallengeMessage is sent by Hub -> Peer upon WSS connection (Section 3 & 4.2).
+// ChallengeMessage is sent by Hub -> Peer upon WSS connection.
 type ChallengeMessage struct {
+	V                  int    `json:"v"`
+	Type               string `json:"type"`
+	Challenge          string `json:"challenge"`
+	HubOrigin          string `json:"hub_origin"`
+	ExpiresAt          int64  `json:"expires_at"`
+	PassphraseRequired bool   `json:"passphrase_required,omitempty"`
+}
+
+// RegisterMessage is sent by Peer -> Hub to prove identity key ownership and optional hub passphrase.
+type RegisterMessage struct {
 	V         int    `json:"v"`
 	Type      string `json:"type"`
-	Challenge string `json:"challenge"`
+	PeerID    string `json:"peer_id"`
+	PublicKey string `json:"public_key"`
 	HubOrigin string `json:"hub_origin"`
-	ExpiresAt int64  `json:"expires_at"`
+	Challenge string `json:"challenge"`
+	Proof     string `json:"proof"`
+	HubAuth   string `json:"hub_auth,omitempty"`
 }
 
-// RegisterMessage is sent by Peer -> Hub to authenticate and register presence (Section 3 & 4.2).
-type RegisterMessage struct {
-	V          int                        `json:"v"`
-	Type       string                     `json:"type"`
-	PeerID     string                     `json:"peer_id"`
-	PublicKey  string                     `json:"public_key"`
-	HubOrigin  string                     `json:"hub_origin"`
-	Challenge  string                     `json:"challenge"`
-	Membership *identity.MembershipRecord `json:"membership,omitempty"`
-	Proof      string                     `json:"proof"`
+// RelayInfo advertises universal public relay URIs and ephemeral credentials minted by the hub.
+type RelayInfo struct {
+	URIs       []string `json:"uris"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+	ExpiresAt  int64    `json:"expires_at,omitempty"`
 }
 
-// RegisteredMessage is sent by Hub -> Peer on successful registration (Section 4.2).
+// RegisteredMessage is sent by Hub -> Peer on successful registration.
 type RegisteredMessage struct {
-	V                    int    `json:"v"`
-	Type                 string `json:"type"`
-	PeerID               string `json:"peer_id"`
-	ExpiresAt            int64  `json:"expires_at"`
-	HeartbeatIntervalSec int    `json:"heartbeat_interval_sec"`
+	V                    int        `json:"v"`
+	Type                 string     `json:"type"`
+	PeerID               string     `json:"peer_id"`
+	ExpiresAt            int64      `json:"expires_at"`
+	HeartbeatIntervalSec int        `json:"heartbeat_interval_sec"`
+	Relay                *RelayInfo `json:"relay,omitempty"`
 }
 
-// HeartbeatMessage refreshes an authenticated peer's presence lease (Section 4.2).
+// HeartbeatMessage refreshes a peer's ephemeral presence lease.
 type HeartbeatMessage struct {
 	V    int    `json:"v"`
 	Type string `json:"type"`
 }
 
-// LookupMessage requests target peer presence and identity material (Section 4.2).
-type LookupMessage struct {
-	V      int    `json:"v"`
-	Type   string `json:"type"`
-	Target string `json:"target"`
+// ChannelJoinMessage subscribes a peer to passphrase-scoped broadcasts in ChannelID.
+type ChannelJoinMessage struct {
+	V         int    `json:"v"`
+	Type      string `json:"type"`
+	ChannelID string `json:"channel_id"`
 }
 
-// LookupResultMessage returns authorized target availability and identity (Section 4.2).
-type LookupResultMessage struct {
-	V          int                        `json:"v"`
-	Type       string                     `json:"type"`
-	Target     string                     `json:"target"`
-	Online     bool                       `json:"online"`
-	PublicKey  string                     `json:"public_key,omitempty"`
-	Membership *identity.MembershipRecord `json:"membership,omitempty"`
+// ChannelLeaveMessage unsubscribes a peer from ChannelID and withdraws any broadcast in it.
+type ChannelLeaveMessage struct {
+	V         int    `json:"v"`
+	Type      string `json:"type"`
+	ChannelID string `json:"channel_id"`
 }
 
-// ErrorMessage delivers bounded, machine-readable failure codes from Hub -> Peer (Section 4.2).
+// BroadcastMessage announces or withdraws a peer's presence in a passphrase-scoped channel.
+type BroadcastMessage struct {
+	V          int    `json:"v"`
+	Type       string `json:"type"`
+	ChannelID  string `json:"channel_id"`
+	Active     bool   `json:"active"`
+	PeerID     string `json:"peer_id"`
+	PublicKey  string `json:"public_key"`
+	SealedMeta string `json:"sealed_meta,omitempty"`
+	Timestamp  int64  `json:"ts"`
+	Sig        string `json:"sig"`
+}
+
+type unsignedBroadcastMessage struct {
+	V          int    `json:"v"`
+	Type       string `json:"type"`
+	ChannelID  string `json:"channel_id"`
+	Active     bool   `json:"active"`
+	PeerID     string `json:"peer_id"`
+	PublicKey  string `json:"public_key"`
+	SealedMeta string `json:"sealed_meta,omitempty"`
+	Timestamp  int64  `json:"ts"`
+}
+
+// BroadcastPeer is an active signed broadcaster entry distributed within ChannelPeersMessage.
+type BroadcastPeer struct {
+	PeerID     string `json:"peer_id"`
+	PublicKey  string `json:"public_key"`
+	SealedMeta string `json:"sealed_meta,omitempty"`
+	Timestamp  int64  `json:"ts"`
+	Sig        string `json:"sig"`
+}
+
+// ChannelPeersMessage pushes the current active broadcasters for one passphrase-derived channel.
+type ChannelPeersMessage struct {
+	V         int             `json:"v"`
+	Type      string          `json:"type"`
+	ChannelID string          `json:"channel_id"`
+	Peers     []BroadcastPeer `json:"peers"`
+}
+
+// ErrorMessage delivers bounded, machine-readable failure codes from Hub -> Peer.
 type ErrorMessage struct {
 	V         int    `json:"v"`
 	Type      string `json:"type"`
@@ -218,12 +271,14 @@ type ErrorMessage struct {
 	SessionID string `json:"session_id,omitempty"`
 }
 
-// SignalEnvelope is the signed peer-to-peer signaling envelope (Section 4.3).
+// SignalEnvelope is the signed peer-to-peer signaling envelope.
+// Offers and answers embed the sender's PublicKey so recipients verify identity without hub ACLs.
 type SignalEnvelope struct {
 	V          int             `json:"v"`
 	Type       string          `json:"type"`
 	From       string          `json:"from"`
 	To         string          `json:"to"`
+	PublicKey  string          `json:"public_key,omitempty"`
 	SessionID  string          `json:"session_id"`
 	Generation uint32          `json:"generation"`
 	Seq        uint64          `json:"seq"`
@@ -237,6 +292,7 @@ type unsignedSignalEnvelope struct {
 	Type       string          `json:"type"`
 	From       string          `json:"from"`
 	To         string          `json:"to"`
+	PublicKey  string          `json:"public_key,omitempty"`
 	SessionID  string          `json:"session_id"`
 	Generation uint32          `json:"generation"`
 	Seq        uint64          `json:"seq"`
@@ -249,7 +305,7 @@ type SDPBody struct {
 	SDP string `json:"sdp"`
 }
 
-// CandidateBody is the body of signed "candidate" envelopes (Section 4.3).
+// CandidateBody is the body of signed "candidate" envelopes.
 type CandidateBody struct {
 	Candidate        string  `json:"candidate"`
 	SDPMid           *string `json:"sdpMid,omitempty"`
@@ -257,12 +313,12 @@ type CandidateBody struct {
 	UsernameFragment string  `json:"usernameFragment,omitempty"`
 }
 
-// EndOfCandidatesBody is the body of signed "end_of_candidates" envelopes (Section 4.3).
+// EndOfCandidatesBody is the body of signed "end_of_candidates" envelopes.
 type EndOfCandidatesBody struct {
 	UsernameFragment string `json:"usernameFragment"`
 }
 
-// CloseBody is the body of signed "close" envelopes (Section 4.3).
+// CloseBody is the body of signed "close" envelopes.
 type CloseBody struct {
 	Reason string `json:"reason"`
 }
@@ -291,7 +347,7 @@ func ValidateSessionID(id string) error {
 	return nil
 }
 
-// NewChallenge generates a cryptographically random single-use challenge (>= 32 bytes) as unpadded base64url.
+// NewChallenge generates a cryptographically random single-use challenge (32 bytes) as unpadded base64url.
 func NewChallenge() (string, error) {
 	var b [ChallengeBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -300,12 +356,135 @@ func NewChallenge() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
+// SignBroadcast signs a BroadcastMessage using kp's identity key and RFC 8785 JCS.
+func SignBroadcast(
+	kp *identity.KeyPair,
+	channelID string,
+	active bool,
+	sealedMeta string,
+	ts int64,
+) (*BroadcastMessage, []byte, error) {
+	if kp == nil {
+		return nil, nil, identity.ErrInvalidPrivateKey
+	}
+	if err := identity.ValidatePeerID(kp.PeerID); err != nil {
+		return nil, nil, err
+	}
+	if err := identity.ValidateChannelID(channelID); err != nil {
+		return nil, nil, err
+	}
+	if len(sealedMeta) > MaxSealedMetaBytes {
+		return nil, nil, ErrInvalidBroadcast
+	}
+
+	unsigned := unsignedBroadcastMessage{
+		V:          Version,
+		Type:       TypeBroadcast,
+		ChannelID:  channelID,
+		Active:     active,
+		PeerID:     kp.PeerID,
+		PublicKey:  identity.EncodePublicKey(kp.PublicKey),
+		SealedMeta: sealedMeta,
+		Timestamp:  ts,
+	}
+	canon, err := jcs.MarshalCanonical(unsigned)
+	if err != nil {
+		return nil, nil, err
+	}
+	signingInput := make([]byte, 0, len(DomainBroadcastV2)+len(canon))
+	signingInput = append(signingInput, DomainBroadcastV2...)
+	signingInput = append(signingInput, canon...)
+	sigEnc, err := kp.SignBase64URL(signingInput)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	msg := &BroadcastMessage{
+		V:          unsigned.V,
+		Type:       unsigned.Type,
+		ChannelID:  unsigned.ChannelID,
+		Active:     unsigned.Active,
+		PeerID:     unsigned.PeerID,
+		PublicKey:  unsigned.PublicKey,
+		SealedMeta: unsigned.SealedMeta,
+		Timestamp:  unsigned.Timestamp,
+		Sig:        sigEnc,
+	}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(raw) > MaxSignalingMessageSize {
+		return nil, nil, ErrMessageTooLarge
+	}
+	return msg, raw, nil
+}
+
+// VerifyBroadcast validates a BroadcastMessage's schema, public key binding, and cryptographic signature.
+func VerifyBroadcast(msg *BroadcastMessage) (identity.PublicKey, error) {
+	if msg == nil || msg.V != Version || msg.Type != TypeBroadcast {
+		return identity.PublicKey{}, ErrInvalidBroadcast
+	}
+	if err := identity.ValidateChannelID(msg.ChannelID); err != nil {
+		return identity.PublicKey{}, ErrInvalidBroadcast
+	}
+	if err := identity.ValidatePeerID(msg.PeerID); err != nil {
+		return identity.PublicKey{}, ErrInvalidBroadcast
+	}
+	if len(msg.SealedMeta) > MaxSealedMetaBytes {
+		return identity.PublicKey{}, ErrInvalidBroadcast
+	}
+	pub, err := identity.DecodePublicKey(msg.PublicKey)
+	if err != nil {
+		return identity.PublicKey{}, ErrInvalidBroadcast
+	}
+	derivedID, err := identity.PeerIDFromPublicKey(pub)
+	if err != nil || derivedID != msg.PeerID {
+		return identity.PublicKey{}, identity.ErrPeerIDMismatch
+	}
+	unsigned := unsignedBroadcastMessage{
+		V:          msg.V,
+		Type:       msg.Type,
+		ChannelID:  msg.ChannelID,
+		Active:     msg.Active,
+		PeerID:     msg.PeerID,
+		PublicKey:  msg.PublicKey,
+		SealedMeta: msg.SealedMeta,
+		Timestamp:  msg.Timestamp,
+	}
+	canon, err := jcs.MarshalCanonical(unsigned)
+	if err != nil {
+		return identity.PublicKey{}, err
+	}
+	signingInput := make([]byte, 0, len(DomainBroadcastV2)+len(canon))
+	signingInput = append(signingInput, DomainBroadcastV2...)
+	signingInput = append(signingInput, canon...)
+	if err := pub.VerifyBase64URL(signingInput, msg.Sig); err != nil {
+		return identity.PublicKey{}, ErrInvalidSignature
+	}
+	return pub, nil
+}
+
+// VerifyBroadcastPeer verifies an active BroadcastPeer entry received in ChannelPeersMessage.
+func VerifyBroadcastPeer(channelID string, bp BroadcastPeer) (identity.PublicKey, error) {
+	return VerifyBroadcast(&BroadcastMessage{
+		V:          Version,
+		Type:       TypeBroadcast,
+		ChannelID:  channelID,
+		Active:     true,
+		PeerID:     bp.PeerID,
+		PublicKey:  bp.PublicKey,
+		SealedMeta: bp.SealedMeta,
+		Timestamp:  bp.Timestamp,
+		Sig:        bp.Sig,
+	})
+}
+
 // SignEnvelope constructs, validates, and signs a peer-to-peer SignalEnvelope using RFC 8785 JCS.
+// Offers and answers automatically embed the sender's PublicKey for hub-independent verification.
 func SignEnvelope(
 	kp *identity.KeyPair,
-	msgType string,
-	toPeerID string,
-	sessionID string,
+	msgType, toPeerID, sessionID string,
 	generation uint32,
 	seq uint64,
 	expiresAt int64,
@@ -331,11 +510,17 @@ func SignEnvelope(
 		return nil, nil, err
 	}
 
+	pubEnc := ""
+	if msgType == TypeOffer || msgType == TypeAnswer || msgType == TypeClose {
+		pubEnc = identity.EncodePublicKey(kp.PublicKey)
+	}
+
 	unsigned := unsignedSignalEnvelope{
 		V:          Version,
 		Type:       msgType,
 		From:       kp.PeerID,
 		To:         toPeerID,
+		PublicKey:  pubEnc,
 		SessionID:  sessionID,
 		Generation: generation,
 		Seq:        seq,
@@ -346,8 +531,8 @@ func SignEnvelope(
 	if err != nil {
 		return nil, nil, err
 	}
-	signingInput := make([]byte, 0, len(DomainSignalV1)+len(canon))
-	signingInput = append(signingInput, DomainSignalV1...)
+	signingInput := make([]byte, 0, len(DomainSignalV2)+len(canon))
+	signingInput = append(signingInput, DomainSignalV2...)
 	signingInput = append(signingInput, canon...)
 	sigEnc, err := kp.SignBase64URL(signingInput)
 	if err != nil {
@@ -359,6 +544,7 @@ func SignEnvelope(
 		Type:       unsigned.Type,
 		From:       unsigned.From,
 		To:         unsigned.To,
+		PublicKey:  unsigned.PublicKey,
 		SessionID:  unsigned.SessionID,
 		Generation: unsigned.Generation,
 		Seq:        unsigned.Seq,
@@ -385,12 +571,12 @@ func ParseUnsignedEnvelope(raw []byte, maxBytes int) (*SignalEnvelope, error) {
 	if len(raw) > maxBytes {
 		return nil, ErrMessageTooLarge
 	}
-	// Ensure all required envelope fields exist and no extra fields or duplicate keys appear.
 	var strictCheck struct {
 		V          *int             `json:"v"`
 		Type       *string          `json:"type"`
 		From       *string          `json:"from"`
 		To         *string          `json:"to"`
+		PublicKey  *string          `json:"public_key,omitempty"`
 		SessionID  *string          `json:"session_id"`
 		Generation *int64           `json:"generation"`
 		Seq        *int64           `json:"seq"`
@@ -432,11 +618,17 @@ func ParseUnsignedEnvelope(raw []byte, maxBytes int) (*SignalEnvelope, error) {
 		return nil, err
 	}
 
+	pubEnc := ""
+	if strictCheck.PublicKey != nil {
+		pubEnc = *strictCheck.PublicKey
+	}
+
 	return &SignalEnvelope{
 		V:          *strictCheck.V,
 		Type:       *strictCheck.Type,
 		From:       *strictCheck.From,
 		To:         *strictCheck.To,
+		PublicKey:  pubEnc,
 		SessionID:  *strictCheck.SessionID,
 		Generation: uint32(*strictCheck.Generation),
 		Seq:        uint64(*strictCheck.Seq),
@@ -447,13 +639,12 @@ func ParseUnsignedEnvelope(raw []byte, maxBytes int) (*SignalEnvelope, error) {
 }
 
 // VerifyEnvelopeSignature checks expiry bounds and verifies the signature over
-// "LIGHTHOUSE-SIGNAL-V1\x00" + JCS(envelope without sig).
+// "LIGHTHOUSE-SIGNAL-V2\x00" + JCS(envelope without sig).
 func VerifyEnvelopeSignature(
 	env *SignalEnvelope,
 	senderPub identity.PublicKey,
 	now time.Time,
-	maxTTL time.Duration,
-	clockSkew time.Duration,
+	maxTTL, clockSkew time.Duration,
 ) error {
 	if env == nil {
 		return ErrInvalidEnvelope
@@ -461,6 +652,12 @@ func VerifyEnvelopeSignature(
 	derivedID, err := identity.PeerIDFromPublicKey(senderPub)
 	if err != nil || derivedID != env.From {
 		return ErrInvalidSignature
+	}
+	if env.PublicKey != "" {
+		embeddedPub, decErr := identity.DecodePublicKey(env.PublicKey)
+		if decErr != nil || !embeddedPub.Equal(senderPub) {
+			return ErrInvalidSignature
+		}
 	}
 	nowUnix := now.Unix()
 	skewSec := int64(clockSkew / time.Second)
@@ -474,6 +671,7 @@ func VerifyEnvelopeSignature(
 		Type:       env.Type,
 		From:       env.From,
 		To:         env.To,
+		PublicKey:  env.PublicKey,
 		SessionID:  env.SessionID,
 		Generation: env.Generation,
 		Seq:        env.Seq,
@@ -484,8 +682,8 @@ func VerifyEnvelopeSignature(
 	if err != nil {
 		return err
 	}
-	signingInput := make([]byte, 0, len(DomainSignalV1)+len(canon))
-	signingInput = append(signingInput, DomainSignalV1...)
+	signingInput := make([]byte, 0, len(DomainSignalV2)+len(canon))
+	signingInput = append(signingInput, DomainSignalV2...)
 	signingInput = append(signingInput, canon...)
 	if err := senderPub.VerifyBase64URL(signingInput, env.Sig); err != nil {
 		return ErrInvalidSignature
@@ -504,7 +702,7 @@ func ValidateBody(msgType string, rawBody []byte) error {
 		if err := jcs.UnmarshalStrict(rawBody, &b); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidBody, err)
 		}
-		if len(b.SDP) == 0 {
+		if b.SDP == "" {
 			return fmt.Errorf("%w: empty SDP", ErrInvalidBody)
 		}
 		return nil
@@ -514,7 +712,7 @@ func ValidateBody(msgType string, rawBody []byte) error {
 		if err := jcs.UnmarshalStrict(rawBody, &b); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidBody, err)
 		}
-		if len(b.Candidate) == 0 || len(b.Candidate) > 2048 || len(b.UsernameFragment) > 256 {
+		if b.Candidate == "" || len(b.Candidate) > 2048 || len(b.UsernameFragment) > 256 {
 			return fmt.Errorf("%w: invalid candidate fields", ErrInvalidBody)
 		}
 		return nil
@@ -524,7 +722,7 @@ func ValidateBody(msgType string, rawBody []byte) error {
 		if err := jcs.UnmarshalStrict(rawBody, &b); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidBody, err)
 		}
-		if len(b.UsernameFragment) == 0 || len(b.UsernameFragment) > 256 {
+		if b.UsernameFragment == "" || len(b.UsernameFragment) > 256 {
 			return fmt.Errorf("%w: invalid usernameFragment", ErrInvalidBody)
 		}
 		return nil
@@ -545,7 +743,7 @@ func ValidateBody(msgType string, rawBody []byte) error {
 }
 
 func isValidReasonCode(reason string) bool {
-	if len(reason) == 0 || len(reason) > 64 {
+	if reason == "" || len(reason) > 64 {
 		return false
 	}
 	for i := 0; i < len(reason); i++ {

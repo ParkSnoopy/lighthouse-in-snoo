@@ -134,7 +134,6 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 
 	matrix := []struct {
 		name      string
-		authAlgo  identity.Algorithm
 		hubCA     identity.Algorithm
 		hubLeaf   identity.Algorithm
 		peerAID   identity.Algorithm
@@ -143,8 +142,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 		peerBDTLS identity.Algorithm
 	}{
 		{
-			name:      "Auth=ed448_TLS=rsa->ed25519_A=ed25519/ed25519_B=rsa/rsa",
-			authAlgo:  identity.AlgorithmEd448,
+			name:      "TLS=rsa->ed25519_A=ed25519/ed25519_B=rsa/rsa",
 			hubCA:     identity.AlgorithmRSA,
 			hubLeaf:   identity.AlgorithmEd25519,
 			peerAID:   identity.AlgorithmEd25519,
@@ -153,8 +151,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			peerBDTLS: identity.AlgorithmRSA,
 		},
 		{
-			name:      "Auth=rsa_TLS=p521->p256_A=p256/p256_B=ed448/p384",
-			authAlgo:  identity.AlgorithmRSA,
+			name:      "TLS=p521->p256_A=p256/p256_B=ed448/p384",
 			hubCA:     identity.AlgorithmNISTP521,
 			hubLeaf:   identity.AlgorithmNISTP256,
 			peerAID:   identity.AlgorithmNISTP256,
@@ -163,8 +160,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			peerBDTLS: identity.AlgorithmNISTP384,
 		},
 		{
-			name:      "Auth=p521_TLS=ed25519->rsa_A=p384/p384_B=p521/p521",
-			authAlgo:  identity.AlgorithmNISTP521,
+			name:      "TLS=ed25519->rsa_A=p384/p384_B=p521/p521",
 			hubCA:     identity.AlgorithmEd25519,
 			hubLeaf:   identity.AlgorithmRSA,
 			peerAID:   identity.AlgorithmNISTP384,
@@ -173,8 +169,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			peerBDTLS: identity.AlgorithmNISTP521,
 		},
 		{
-			name:      "Auth=p384_TLS=p256->p521_A=ed448/ed25519_B=p256/rsa",
-			authAlgo:  identity.AlgorithmNISTP384,
+			name:      "TLS=p256->p521_A=ed448/ed25519_B=p256/rsa",
 			hubCA:     identity.AlgorithmNISTP256,
 			hubLeaf:   identity.AlgorithmNISTP521,
 			peerAID:   identity.AlgorithmEd448,
@@ -183,8 +178,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			peerBDTLS: identity.AlgorithmRSA,
 		},
 		{
-			name:      "Auth=p256_TLS=p384->p384_A=rsa/p521_B=ed25519/p256",
-			authAlgo:  identity.AlgorithmNISTP256,
+			name:      "TLS=p384->p384_A=rsa/p521_B=ed25519/p256",
 			hubCA:     identity.AlgorithmNISTP384,
 			hubLeaf:   identity.AlgorithmNISTP384,
 			peerAID:   identity.AlgorithmRSA,
@@ -211,25 +205,8 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			authKP := genKey(t, tc.authAlgo)
 			peerA := genKey(t, tc.peerAID)
 			peerB := genKey(t, tc.peerBID)
-
-			now := time.Now().Unix()
-			memA, err := identity.IssueMembership(authKP, peerA.PublicKey, now-60, now+3600, []string{peerB.PeerID})
-			if err != nil {
-				t.Fatalf("IssueMembership A: %v", err)
-			}
-			memB, err := identity.IssueMembership(authKP, peerB.PublicKey, now-60, now+3600, []string{peerA.PeerID})
-			if err != nil {
-				t.Fatalf("IssueMembership B: %v", err)
-			}
-
-			policy := identity.PolicyConfig{
-				Version:            1,
-				TrustedAuthorities: []string{identity.EncodePublicKey(authKP.PublicKey)},
-				ACLRules:           []identity.ACLRule{{PeerA: peerA.PeerID, PeerB: peerB.PeerID}},
-			}
 
 			pki := generateInterAlgoPKI(t, tc.hubCA, tc.hubLeaf)
 			rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -239,13 +216,12 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			boundAddr := rawLn.Addr().String()
 			wsURL := "wss://" + boundAddr + "/v1/signal"
 
-			srv, err := hub.New(hub.Config{
+			srv, err := hub.New(&hub.Config{
 				HTTPSListener:   rawLn,
 				TLSConfig:       pki.serverTLS,
 				HubOrigin:       "wss://" + boundAddr,
 				EnableSTUN:      true,
 				STUNSListenAddr: "127.0.0.1:0",
-				Policy:          policy,
 			})
 			if err != nil {
 				_ = rawLn.Close()
@@ -256,10 +232,8 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			stunURI := "stuns:" + srv.STUNSAddr().String()
 			sessBCh := make(chan *peer.Session, 1)
 
-			clientA, err := peer.NewClient(peer.Config{
+			clientA, err := peer.NewClient(&peer.Config{
 				KeyPair:           peerA,
-				Membership:        memA,
-				Policy:            policy,
 				SignalingURL:      wsURL,
 				TLSConfig:         pki.clientTLS,
 				STUNServerURI:     stunURI,
@@ -267,16 +241,15 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 				IncludeLoopback:   true,
 				DTLSCertAlgorithm: tc.peerADTLS,
 				DTLSRSABits:       2048,
+				Consent:           allowAllConsent(),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer clientA.Close()
 
-			clientB, err := peer.NewClient(peer.Config{
+			clientB, err := peer.NewClient(&peer.Config{
 				KeyPair:           peerB,
-				Membership:        memB,
-				Policy:            policy,
 				SignalingURL:      wsURL,
 				TLSConfig:         pki.clientTLS,
 				STUNServerURI:     stunURI,
@@ -284,6 +257,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 				IncludeLoopback:   true,
 				DTLSCertAlgorithm: tc.peerBDTLS,
 				DTLSRSABits:       2048,
+				Consent:           allowAllConsent(),
 				OnSession:         func(s *peer.Session) { sessBCh <- s },
 			})
 			if err != nil {
@@ -321,7 +295,6 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 				t.Fatalf("expected DTLS 1.3 (FEFC) on both peers, got A=%q B=%q", diagA.DTLSVersion, diagB.DTLSVersion)
 			}
 
-			// Bidirectional payload round-trip.
 			ping := []byte("ping-" + tc.name)
 			pong := []byte("pong-" + tc.name)
 			if err := sessA.Send(ctx, ping); err != nil {

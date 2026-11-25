@@ -1,64 +1,79 @@
 # Verification Procedures and Invariants
 
-## 1. Build and Static Analysis Commands
+## 1. Build, Static Analysis, and Linting
 
-Verify static `linux/amd64` compilation (`CGO_ENABLED=0`), hub dependency isolation, and `go vet` from a fresh clone:
+Run all build, vet, dependency isolation, and `go-critic` checks from a fresh clone:
 
 ```bash
-CGO_ENABLED=0 GOARCH=amd64 go build ./...
-go vet ./...
+make lint
+make build
+make build-ui
+```
+
+`make lint` runs:
+
+1. `go vet ./...`
+2. `go tool gocritic check ./...` (standard profile across the entire repository)
+3. `go tool gocritic check -enableAll ./pkg/identity/... ./pkg/protocol/... ./pkg/peer/... ./pkg/tun/... ./internal/hub/... ./internal/jcs/... ./internal/ratelimit/... ./internal/stunserver/... ./internal/turnserver/...` (maximum profile across all security-critical packages)
+
+Verify dependency isolation:
+
+```bash
 go list -deps ./internal/hub | grep 'github\.com/pion/webrtc' && exit 1 || true
 go list -deps ./internal/stunserver | grep -E 'github\.com/pion/(webrtc|turn)' && exit 1 || true
+go list -deps ./cmd/lighthouse | grep -E 'fyne\.io/fyne|modernc\.org/sqlite' && exit 1 || true
 ```
 
 ### Verifiable Build Invariants
 
-- `cmd/lighthouse` compiles into a single static `linux/amd64` Go binary (`CGO_ENABLED=0`) containing the `hub`, `peer`, and `admin` subcommands.
-- `go list -deps ./internal/hub` never includes `github.com/pion/webrtc`, proving the hub cannot instantiate a WebRTC `PeerConnection` or terminate peer DTLS 1.3 sessions.
-- `go list -deps ./internal/stunserver` includes neither `github.com/pion/webrtc` nor `github.com/pion/turn`.
+- `cmd/lighthouse` builds into a static `linux/amd64` binary (`CGO_ENABLED=0`) with zero Fyne or SQLite dependencies.
+- `cmd/lighthouse-ui` builds the Fyne desktop TUN interface application and reports the exact same single-source version (`pkg/version/version.go`) as `cmd/lighthouse`.
+- `internal/hub` never depends on `github.com/pion/webrtc`, and `internal/stunserver` depends on neither `github.com/pion/webrtc` nor `github.com/pion/turn`.
 
 ## 2. Full Automated Verification Suite
 
-Run all unit and acceptance tests with the Go race detector enabled:
+Run all unit, TUN, Fyne headless UI, CLI, and acceptance tests under the race detector:
 
 ```bash
-go test -race -v ./...
+go test -race -count=1 ./...
 ```
 
-## 3. Acceptance Criteria Mapping (`T01`–`T13`, Inter-Algorithm, STUNS/TURNS)
-
-Each acceptance requirement in `test/acceptance` exercises independently authenticated `pkg/peer.Client` instances coordinated by an `internal/hub.Server` instance.
+## 3. Acceptance Test Matrix (`test/acceptance`)
 
 | ID | Test Function | Reproducible Command | Verifiable Invariants |
 | --- | --- | --- | --- |
-| `ARCH` | `TestArchitectureAndControlPlaneInvariants` | `go test -race -v ./test/acceptance -run TestArchitectureAndControlPlaneInvariants` | `internal/hub` excludes `pion/webrtc`; `internal/stunserver` excludes `pion/webrtc` and `pion/turn`; `GET /healthz` exposes only `{"status":"ok"}`; TLS 1.2 WSS clients fail handshake. |
-| `T01` | `TestT01_SameLANDirectHostConnectivity` | `go test -race -v ./test/acceptance -run TestT01_SameLANDirectHostConnectivity` | DTLS 1.3 / UDP `stuns:` probe succeeds; direct `host`–`host` UDP pair selected; `DTLSVersion == "FEFC"` (DTLS 1.3); `data/v1` and `packet/v1` deliver payloads; `> 16 KiB` messages return `ErrMessageTooLarge`; logs omit SDP, ICE passwords, keys, candidates, and payloads. |
-| `T02` | `TestT02_PublicIPv4AndIPv6Connectivity` | `go test -race -v ./test/acceptance -run TestT02_PublicIPv4AndIPv6Connectivity` | Separate `IPv4` (`udp4`) and `IPv6` (`udp6`) runs establish direct connectivity over DTLS 1.3 (`FEFC`) with DTLS 1.3 `stuns:`. |
-| `T03` | `TestT03_CompatibleNATsSeparateNetworks` | `go test -race -v ./test/acceptance -run TestT03_CompatibleNATsSeparateNetworks` | Peers behind separate `192.168.10.0/24` and `192.168.20.0/24` cone NATs discover `srflx` mappings over DTLS 1.3 / UDP `stuns:203.0.113.10:5349` and establish a non-relayed `srflx`/`prflx` pair over DTLS 1.3. |
-| `T04` | `TestT04_RestrictiveNATsFailClosed` | `go test -race -v ./test/acceptance -run TestT04_RestrictiveNATsFailClosed` | Peers behind symmetric NATs with blocked direct UDP and no TURNS relay fail closed (`ErrConnectTimeout`, `StateFailed`) within the configured deadline. |
-| `T05` | `TestT05_PeerSupportsOnlyDTLS12Fails` | `go test -race -v ./test/acceptance -run TestT05_PeerSupportsOnlyDTLS12Fails` | Connection between a conformant DTLS 1.3 peer and a DTLS 1.2-only peer fails handshake; zero application bytes are delivered. |
-| `T06` | `TestT06_CompromisedHubTamperingFails` | `go test -race -v ./test/acceptance -run TestT06_CompromisedHubTamperingFails` | Hub mutations to SDP `sha-256` fingerprint, `ice-pwd`, or `from` sender identity fail signature verification at the recipient prior to WebRTC installation. |
-| `T07` | `TestT07_UnknownForbiddenAndReplayedSignalingRejected` | `go test -race -v ./test/acceptance -run TestT07_UnknownForbiddenAndReplayedSignalingRejected` | Unrecognized peers fail registration; unauthorized peer pairs fail lookup/signaling (`unauthorized_pair`); replayed signed envelopes are rejected at both hub (`replayed_signaling`) and peer (`ErrReplayedSignaling`). |
-| `T08` | `TestT08_RelayAndHubEndpointCandidatesRejected` | `go test -race -v ./test/acceptance -run TestT08_RelayAndHubEndpointCandidatesRejected` | Plaintext `stun:`/`turn:` fail without `--insecure` (`ErrInsecureICEProhibited`); `turns:` without credentials fails; `typ relay` candidates in SDP or Trickle ICE fail when TURN is not configured; hub endpoint candidates fail validation. |
-| `T09` | `TestT09_LargeBinaryTransferPacketCapture` | `go test -race -v ./test/acceptance -run TestT09_LargeBinaryTransferPacketCapture` | A `512 KiB` (`32 x 16 KiB`) SHA-256-verified transfer records `>= 512 KiB` of direct peer-to-peer UDP bytes, `0` signaling messages forwarded during transfer, and zero application bytes traversing the hub STUNS port. |
-| `T10` | `TestT10_StopHubDuringHealthyDirectSession` | `go test -race -v ./test/acceptance -run TestT10_StopHubDuringHealthyDirectSession` | Stopping the hub leaves an established `Connected` direct session transferring `64 KiB` of data uninterrupted while new `Connect` attempts fail closed. |
-| `T11` | `TestT11_NetworkChangeAndNATExpiryICERestart` | `go test -race -v ./test/acceptance -run TestT11_NetworkChangeAndNATExpiryICERestart` | Switching a peer's network interface suspends unverified traffic, performs a signed ICE restart (`generation >= 1`), and resumes direct transfer on the new IP; unrecoverable path loss exhausts `MaxICERestarts` and transitions to `StateFailed`. |
-| `T12` | `TestT12_FloodOversizedSignalingAndMalformedSTUN` | `go test -race -v ./test/acceptance -run TestT12_FloodOversizedSignalingAndMalformedSTUN` | `80 KiB` WSS frames close with `StatusMessageTooBig`; connection bursts trigger HTTP `429` rate limits; malformed, oversized, and plaintext TURN `Allocate` UDP floods to the DTLS 1.3 STUNS port increment rejection counters while legitimate peers connect. |
-| `T13` | `TestT13_TamperDTLSProtectedRecordNotDelivered` | `go test -race -v ./test/acceptance -run TestT13_TamperDTLSProtectedRecordNotDelivered` | In-flight bit flips on DTLS 1.3 ciphertext records (`IsDTLS13Ciphertext`) are dropped by AEAD verification and never delivered to `Session.Packets()`, while subsequent untampered records arrive intact. |
-| `ALGO` | `TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix` | `go test -race -v ./test/acceptance -run TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix` | Interoperability across `ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, and `rsa` identities, cross-algorithm CA/leaf TLS 1.3 WSS + DTLS 1.3 / UDP STUNS certificates, and cross-algorithm peer DTLS 1.3 certificates. |
-| `ICE-SEC` | `TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn` | `go test -race -v ./test/acceptance -run TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn` | Plaintext `stun:`/`turn:` rejected by default; untrusted STUNS CA rejected; DTLS 1.3 / UDP `turns:` relay establishes end-to-end DTLS 1.3 (`FEFC`) sessions on loopback and across symmetric NATs; opt-in `--insecure` enables plaintext `stun:`/`turn:`. |
-| `TCP-ONLY` | `TestTCPOnlyModeZeroUDPEndToEnd` | `go test -race -v ./test/acceptance -run TestTCPOnlyModeZeroUDPEndToEnd` | `--tcp-only` hub binds zero UDP sockets and serves TLS 1.3 / TCP STUNS; peers reject UDP configs/candidates, verify STUNS over TLS 1.3 / TCP, and exchange `data/v1` and `packet/v1` payloads over IPv4 and IPv6 ICE-TCP with DTLS 1.3 (`FEFC`). |
+| `ARCH` | `TestArchitectureAndControlPlaneInvariants` | `go test -race -v ./test/acceptance -run TestArchitectureAndControlPlaneInvariants` | Hub excludes `pion/webrtc`, `fyne`, and `sqlite`; stunserver excludes `pion/webrtc` and `pion/turn`; `GET /healthz` returns `{"status":"ok"}`; TLS 1.2 WSS rejected. |
+| `T01` | `TestT01_SameLANDirectHostConnectivity` | `go test -race -v ./test/acceptance -run TestT01_SameLANDirectHostConnectivity` | DTLS 1.3/UDP `stuns:` probe succeeds; direct `host`–`host` UDP pair with `DTLSVersion == "FEFC"`; `data/v1` and `packet/v1` deliver payloads; `> 16 KiB` rejected; logs redact SDP, ICE passwords, keys, and payloads. |
+| `T02` | `TestT02_PublicIPv4AndIPv6Connectivity` | `go test -race -v ./test/acceptance -run TestT02_PublicIPv4AndIPv6Connectivity` | Separate `IPv4` (`udp4`) and `IPv6` (`udp6`) runs establish direct DTLS 1.3 (`FEFC`) connectivity. |
+| `T03` | `TestT03_CompatibleNATsSeparateNetworks` | `go test -race -v ./test/acceptance -run TestT03_CompatibleNATsSeparateNetworks` | Peers behind separate cone NATs traverse via DTLS 1.3/UDP `stuns:` without relay. |
+| `T04` | `TestT04_RestrictiveNATsFailClosed` | `go test -race -v ./test/acceptance -run TestT04_RestrictiveNATsFailClosed` | Symmetric NATs with blocked direct UDP and no relay fail closed within timeout. |
+| `T05` | `TestT05_PeerSupportsOnlyDTLS12Fails` | `go test -race -v ./test/acceptance -run TestT05_PeerSupportsOnlyDTLS12Fails` | DTLS 1.2-only remote peer fails handshake; zero bytes delivered. |
+| `T06` | `TestT06_CompromisedHubTamperingFails` | `go test -race -v ./test/acceptance -run TestT06_CompromisedHubTamperingFails` | Hub mutations to SDP fingerprint, `ice-pwd`, or sender identity fail signature verification before WebRTC installation. |
+| `T07` | `TestT07_DeniedBlacklistedAndReplayedSignalingRejected` | `go test -race -v ./test/acceptance -run TestT07_DeniedBlacklistedAndReplayedSignalingRejected` | Nil `Consent` fails closed (`ErrUserDenied`); blacklisted peers fail with `ErrPeerBlacklisted`; replayed v2 signaling rejected at both hub and peer. |
+| `T08` | `TestT08_RelayAndHubEndpointCandidatesRejected` | `go test -race -v ./test/acceptance -run TestT08_RelayAndHubEndpointCandidatesRejected` | Plaintext `stun:`/`turn:` fail without `--insecure`; unauthenticated `turns:` fails; relay and hub-endpoint candidates rejected when relay disabled. |
+| `T09` | `TestT09_LargeBinaryTransferPacketCapture` | `go test -race -v ./test/acceptance -run TestT09_LargeBinaryTransferPacketCapture` | `512 KiB` SHA-256-verified direct transfer records `0` hub signaling messages and direct peer UDP flow. |
+| `T10` | `TestT10_StopHubDuringHealthyDirectSession` | `go test -race -v ./test/acceptance -run TestT10_StopHubDuringHealthyDirectSession` | Active direct session continues uninterrupted when hub stops; fresh negotiations fail closed. |
+| `T11` | `TestT11_NetworkChangeAndNATExpiryICERestart` | `go test -race -v ./test/acceptance -run TestT11_NetworkChangeAndNATExpiryICERestart` | Network interface switch completes signed ICE restart (`generation >= 1`); unrecoverable loss fails closed. |
+| `T12` | `TestT12_FloodOversizedSignalingAndMalformedSTUN` | `go test -race -v ./test/acceptance -run TestT12_FloodOversizedSignalingAndMalformedSTUN` | `80 KiB` WSS frames, connection bursts, and malformed UDP floods trigger bounds/rate limits while legitimate peers still connect. |
+| `T13` | `TestT13_TamperDTLSProtectedRecordNotDelivered` | `go test -race -v ./test/acceptance -run TestT13_TamperDTLSProtectedRecordNotDelivered` | Bit-flipped in-flight DTLS 1.3 ciphertext records are rejected by AEAD without delivering corrupted bytes. |
+| `ALGO` | `TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix` | `go test -race -v ./test/acceptance -run TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix` | End-to-end interoperability across `ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, and `rsa` identities, TLS 1.3 hub certs, and DTLS 1.3 peer certs. |
+| `ICE-SEC` | `TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn` | `go test -race -v ./test/acceptance -run TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn` | Plaintext ICE rejected by default; untrusted STUNS CA rejected; DTLS 1.3/UDP TURNS relay connects across loopback and symmetric NATs; opt-in `--insecure` works. |
+| `TCP-ONLY` | `TestTCPOnlyModeZeroUDPEndToEnd` | `go test -race -v ./test/acceptance -run TestTCPOnlyModeZeroUDPEndToEnd` | `--tcp-only` binds zero UDP sockets, verifies TLS 1.3/TCP STUNS, rejects UDP candidates, and exchanges `data/v1` and `packet/v1` over ICE-TCP + DTLS 1.3. |
+| `CONSENT-TUN` | `TestPassphraseBroadcastIsolationAndUserConsent` | `go test -race -v ./test/acceptance -run TestPassphraseBroadcastIsolationAndUserConsent` | Broadcasts stay strictly isolated to matching offline passphrase; Deny rejects; Allow binds TUN IPv4 routing; Blacklist tears down active tunnel, hides broadcasts, and blocks reconnects. |
+| `UNIVERSAL-RELAY` | `TestUniversalPublicRelayAutoProvisionedAcrossSymmetricNATs` | `go test -race -v ./test/acceptance -run TestUniversalPublicRelayAutoProvisionedAcrossSymmetricNATs` | Zero-config hub auto-mints ephemeral DTLS 1.3/UDP TURNS credentials in `registered.relay`, connecting symmetric-NAT peers and routing TUN IPv4 packets with zero manual TURN setup. |
+| `HUB-PASSPHRASE` | `TestHubOfflinePassphraseGate` | `go test -race -v ./test/acceptance -run TestHubOfflinePassphraseGate` | Hub configured with offline `--passphrase` rejects missing/wrong passphrases and admits matching peers via challenge-bound HMAC proof. |
 
-## 4. Unit Test Suites
+## 4. Unit, TUN, and Headless Fyne UI Suites
 
 | Package | Command | Covered Invariants |
 | --- | --- | --- |
-| `cmd/lighthouse` | `go test -race ./cmd/lighthouse` | Clap/POSIX flag rules, single-source `version.go` (no duplicated `ARG VERSION` or hardcoded README version), runtime-only `LIGHTHOUSE_*` env/`.env` loading, `--insecure` and `--tcp-only` CLI validation |
-| `internal/jcs` | `go test -race ./internal/jcs` | RFC 8785 UTF-16 key sorting, ES6 number canonicalization, duplicate-key rejection, strict field decoding |
-| `pkg/identity` | `go test -race ./pkg/identity` | Multi-algorithm keygen, `0600` file mode enforcement, `peer_id` derivation, registration proofs, authority memberships, ACLs, revocations |
-| `pkg/protocol` | `go test -race ./pkg/protocol` | 12 message schemas, `64 KiB` limit, JCS envelope signatures, clock skew and TTL bounds |
-| `internal/stunserver` | `go test -race ./internal/stunserver` | DTLS 1.3 / UDP and TLS 1.3 / TCP `XOR-MAPPED-ADDRESS`, DTLS 1.2 and TLS 1.2 rejection, TURN `Allocate` error rejection, opt-in `AllowInsecure` plaintext UDP/TCP |
-| `internal/turnserver` | `go test -race ./internal/turnserver` | DTLS 1.3 / UDP and TLS 1.3 / TCP TURNS + STUNS Binding, HMAC TURN REST authentication, `AllowInsecure` gate for plaintext UDP/TCP TURN |
-| `internal/store` | `go test -race ./internal/store` | Pure-Go SQLite persistence of authorities, peers, memberships, ACL rules, and revocations |
-| `internal/hub` | `go test -race ./internal/hub` | Unauthenticated gating, single-use challenges, concurrent-session caps, live revocation eviction |
-| `pkg/peer` | `go test -race ./pkg/peer` | `stuns:`/`turns:` default enforcement, UDP prioritization, `--insecure` opt-in, `--tcp-only` policy enforcement, audio/video and `ice-lite` SDP rejection, candidate filtering |
+| `cmd/lighthouse` | `go test -race ./cmd/lighthouse` | Zero-config hub CLI flags, POSIX double-dash enforcement, single-source `pkg/version/version.go` alignment across `lighthouse` and `lighthouse-ui`, runtime `.env`/`LIGHTHOUSE_*` loading |
+| `pkg/identity` | `go test -race ./pkg/identity` | Multi-algorithm keygen, `0600` key and blacklist permissions, Argon2id `DeriveChannelKeys`, XChaCha20-Poly1305 `SealBroadcastMeta`/`OpenBroadcastMeta`, hub passphrase HMAC proofs, RFC 6598 virtual IP derivation |
+| `pkg/protocol` | `go test -race ./pkg/protocol` | v2 wire schemas, `64 KiB` limit, JCS signaling and broadcast signatures, embedded `public_key` binding |
+| `pkg/tun` | `go test -race ./pkg/tun` | IPv4/IPv6 header endpoint parsing, bidirectional TUN packet forwarding over DTLS 1.3 WebRTC, outbound and inbound cryptographic source-IP anti-spoofing |
+| `internal/ui` | `go test -race ./internal/ui` | Headless Fyne v2 controller binding TUN interface, passphrase-scoped broadcast discovery, explicit Allow/Deny/Blacklist modal workflow, live TUN routing, and blacklist teardown/unblacklist |
+| `internal/hub` | `go test -race ./internal/hub` | Zero-config AutoTLS startup, optional hub passphrase gate, auto-minted universal relay credentials, single-use challenges, session limits, passphrase-scoped broadcast isolation and disconnect withdrawal |
+| `internal/stunserver` | `go test -race ./internal/stunserver` | DTLS 1.3/UDP and TLS 1.3/TCP STUNS Binding, DTLS/TLS 1.2 rejection, TURN `Allocate` rejection, opt-in `AllowInsecure` |
+| `internal/turnserver` | `go test -race ./internal/turnserver` | DTLS 1.3/UDP and TLS 1.3/TCP TURNS + STUNS Binding, HMAC TURN REST authentication, `AllowInsecure` gate |
+| `internal/jcs` | `go test -race ./internal/jcs` | RFC 8785 UTF-16 sorting, ES6 number canonicalization, duplicate-key rejection |
+| `pkg/peer` | `go test -race ./pkg/peer` | `stuns:`/`turns:` defaults, UDP prioritization, `--insecure` and `--tcp-only` guardrails, SDP and candidate filtering |

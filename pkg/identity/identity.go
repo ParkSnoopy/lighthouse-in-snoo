@@ -18,10 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
 
@@ -31,8 +28,6 @@ import (
 const (
 	// DomainRegisterV1 is the domain separator for hub registration proofs.
 	DomainRegisterV1 = "LIGHTHOUSE-REGISTER-V1\x00"
-	// DomainMembershipV1 is the domain separator for offline authority membership records.
-	DomainMembershipV1 = "LIGHTHOUSE-MEMBERSHIP-V1\x00"
 
 	// PeerIDEncodedLen is the base64url (unpadded) length of a 32-byte SHA-256 digest.
 	PeerIDEncodedLen = 43
@@ -45,7 +40,7 @@ const (
 	MaxRSABits = 8192
 )
 
-// Algorithm identifies a supported asymmetric signing algorithm for peer/authority identities.
+// Algorithm identifies a supported asymmetric signing algorithm for peer identities.
 type Algorithm string
 
 const (
@@ -64,13 +59,12 @@ var (
 	ErrInvalidPrivateKey    = errors.New("identity: invalid private key")
 	ErrInvalidPeerID        = errors.New("identity: invalid peer_id")
 	ErrPeerIDMismatch       = errors.New("identity: peer_id does not match public key")
-	ErrUntrustedPeer        = errors.New("identity: untrusted peer identity")
-	ErrRevokedPeer          = errors.New("identity: peer identity is revoked")
-	ErrMembershipExpired    = errors.New("identity: membership record expired or not yet valid")
-	ErrUnauthorizedPair     = errors.New("identity: peer pair denied by ACL")
 	ErrInvalidProof         = errors.New("identity: invalid signature proof")
 	ErrInvalidOrigin        = errors.New("identity: invalid hub origin")
 	ErrInsecureFilePerms    = errors.New("identity: key file permissions are too permissive")
+	ErrEmptyPassphrase      = errors.New("identity: passphrase must not be empty")
+	ErrInvalidChannelID     = errors.New("identity: invalid channel_id")
+	ErrInvalidSealedMeta    = errors.New("identity: invalid or undecryptable broadcast metadata")
 )
 
 // ParseAlgorithm normalizes user-supplied algorithm names and aliases.
@@ -125,14 +119,11 @@ func (p PublicKey) BitLen() int {
 }
 
 // PeerID derives the unpadded base64url SHA-256 peer_id for p.
-// For Ed25519, this is SHA-256 over the raw 32-byte public key (Section 3).
-// For other algorithms, the hash is domain-separated by "<algorithm>\x00" || canonical_bytes.
 func (p PublicKey) PeerID() (string, error) {
 	return PeerIDFromPublicKey(p)
 }
 
 // Encode serializes p into its canonical wire string representation.
-// Ed25519 keys encode as raw 32-byte unpadded base64url; other algorithms prefix "<algo>:".
 func (p PublicKey) Encode() string {
 	return EncodePublicKey(p)
 }
@@ -201,7 +192,7 @@ func (p PublicKey) VerifyBase64URL(message []byte, sigBase64 string) error {
 	return nil
 }
 
-// KeyPair holds a peer or authority asymmetric identity key pair.
+// KeyPair holds a peer asymmetric identity key pair.
 type KeyPair struct {
 	Algorithm  Algorithm
 	PeerID     string
@@ -431,7 +422,10 @@ func KeyPairFromSeed(seed []byte) (*KeyPair, error) {
 		return nil, ErrInvalidPrivateKey
 	}
 	priv := ed25519.NewKeyFromSeed(seed)
-	pub := priv.Public().(ed25519.PublicKey)
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		return nil, ErrInvalidPrivateKey
+	}
 	return buildKeyPair(AlgorithmEd25519, pub, priv)
 }
 
@@ -471,7 +465,6 @@ func ValidatePeerID(peerID string) error {
 }
 
 // EncodePublicKey encodes pub into canonical string form.
-// Ed25519 emits raw 32-byte unpadded base64url; other algorithms emit "<algo>:<base64url>".
 func EncodePublicKey(pub PublicKey) string {
 	if pub.IsZero() {
 		return ""
@@ -620,7 +613,10 @@ func unmarshalPrivateKey(algo Algorithm, raw []byte) (*KeyPair, error) {
 			return nil, ErrInvalidPrivateKey
 		}
 		priv := ed448.NewKeyFromSeed(raw)
-		pub := priv.Public().(ed448.PublicKey)
+		pub, ok := priv.Public().(ed448.PublicKey)
+		if !ok {
+			return nil, ErrInvalidPrivateKey
+		}
 		return buildKeyPair(AlgorithmEd448, pub, priv)
 	case AlgorithmNISTP256, AlgorithmNISTP384, AlgorithmNISTP521:
 		parsed, err := x509.ParsePKCS8PrivateKey(raw)
@@ -736,7 +732,7 @@ type registerChallengeDoc struct {
 }
 
 // SignRegistrationChallenge signs the domain-separated registration proof over
-// peer_id, challenge, and canonical hub_origin (Section 3).
+// peer_id, challenge, and canonical hub_origin.
 func (kp *KeyPair) SignRegistrationChallenge(challenge, hubOrigin string) (string, error) {
 	origin, err := CanonicalizeOrigin(hubOrigin)
 	if err != nil {
@@ -784,438 +780,4 @@ func VerifyRegistrationChallenge(pub PublicKey, peerID, challenge, hubOrigin, pr
 	msg = append(msg, DomainRegisterV1...)
 	msg = append(msg, canon...)
 	return pub.VerifyBase64URL(msg, proof)
-}
-
-// MembershipRecord is a peer membership assertion signed by an offline authority.
-type MembershipRecord struct {
-	Version      int      `json:"v"`
-	PeerID       string   `json:"peer_id"`
-	PublicKey    string   `json:"public_key"`
-	IssuedAt     int64    `json:"issued_at"`
-	ExpiresAt    int64    `json:"expires_at"`
-	AllowedPeers []string `json:"allowed_peers,omitempty"`
-	Issuer       string   `json:"issuer"`
-	Sig          string   `json:"sig"`
-}
-
-type unsignedMembershipRecord struct {
-	Version      int      `json:"v"`
-	PeerID       string   `json:"peer_id"`
-	PublicKey    string   `json:"public_key"`
-	IssuedAt     int64    `json:"issued_at"`
-	ExpiresAt    int64    `json:"expires_at"`
-	AllowedPeers []string `json:"allowed_peers,omitempty"`
-	Issuer       string   `json:"issuer"`
-}
-
-// IssueMembership signs a MembershipRecord using an offline authority KeyPair.
-func IssueMembership(authority *KeyPair, peerPub PublicKey, issuedAt, expiresAt int64, allowedPeers []string) (*MembershipRecord, error) {
-	peerID, err := PeerIDFromPublicKey(peerPub)
-	if err != nil {
-		return nil, err
-	}
-	pubEnc := EncodePublicKey(peerPub)
-	unsigned := unsignedMembershipRecord{
-		Version:      1,
-		PeerID:       peerID,
-		PublicKey:    pubEnc,
-		IssuedAt:     issuedAt,
-		ExpiresAt:    expiresAt,
-		AllowedPeers: slices.Clone(allowedPeers),
-		Issuer:       authority.PeerID,
-	}
-	canon, err := jcs.MarshalCanonical(unsigned)
-	if err != nil {
-		return nil, err
-	}
-	msg := make([]byte, 0, len(DomainMembershipV1)+len(canon))
-	msg = append(msg, DomainMembershipV1...)
-	msg = append(msg, canon...)
-	sigEnc, err := authority.SignBase64URL(msg)
-	if err != nil {
-		return nil, err
-	}
-	return &MembershipRecord{
-		Version:      unsigned.Version,
-		PeerID:       unsigned.PeerID,
-		PublicKey:    unsigned.PublicKey,
-		IssuedAt:     unsigned.IssuedAt,
-		ExpiresAt:    unsigned.ExpiresAt,
-		AllowedPeers: unsigned.AllowedPeers,
-		Issuer:       unsigned.Issuer,
-		Sig:          sigEnc,
-	}, nil
-}
-
-// VerifyMembershipRecord validates a signed MembershipRecord against a map of
-// trusted offline authority public keys (keyed by authority ID).
-func VerifyMembershipRecord(rec *MembershipRecord, authorities map[string]PublicKey, now time.Time, skew time.Duration) (PublicKey, error) {
-	if rec == nil || rec.Version != 1 {
-		return PublicKey{}, ErrUntrustedPeer
-	}
-	pub, err := DecodePublicKey(rec.PublicKey)
-	if err != nil {
-		return PublicKey{}, err
-	}
-	derivedID, err := PeerIDFromPublicKey(pub)
-	if err != nil {
-		return PublicKey{}, err
-	}
-	if derivedID != rec.PeerID {
-		return PublicKey{}, ErrPeerIDMismatch
-	}
-	authPub, ok := authorities[rec.Issuer]
-	if !ok {
-		return PublicKey{}, ErrUntrustedPeer
-	}
-	nowUnix := now.Unix()
-	skewSec := int64(skew / time.Second)
-	if rec.ExpiresAt+skewSec < nowUnix || rec.IssuedAt-skewSec > nowUnix || rec.ExpiresAt <= rec.IssuedAt {
-		return PublicKey{}, ErrMembershipExpired
-	}
-	unsigned := unsignedMembershipRecord{
-		Version:      rec.Version,
-		PeerID:       rec.PeerID,
-		PublicKey:    rec.PublicKey,
-		IssuedAt:     rec.IssuedAt,
-		ExpiresAt:    rec.ExpiresAt,
-		AllowedPeers: rec.AllowedPeers,
-		Issuer:       rec.Issuer,
-	}
-	canon, err := jcs.MarshalCanonical(unsigned)
-	if err != nil {
-		return PublicKey{}, err
-	}
-	msg := make([]byte, 0, len(DomainMembershipV1)+len(canon))
-	msg = append(msg, DomainMembershipV1...)
-	msg = append(msg, canon...)
-	if err := authPub.VerifyBase64URL(msg, rec.Sig); err != nil {
-		return PublicKey{}, ErrInvalidProof
-	}
-	return pub, nil
-}
-
-// TrustedPeerEntry binds a peer_id to its canonical public_key string in config.
-type TrustedPeerEntry struct {
-	PeerID    string `json:"peer_id"`
-	PublicKey string `json:"public_key"`
-}
-
-// ACLRule authorizes communication between PeerA and PeerB (bidirectional by default).
-type ACLRule struct {
-	PeerA          string `json:"peer_a"`
-	PeerB          string `json:"peer_b"`
-	Unidirectional bool   `json:"unidirectional,omitempty"`
-}
-
-// PolicyConfig represents the serialized trust and authorization policy file.
-type PolicyConfig struct {
-	Version            int                `json:"v"`
-	TrustedAuthorities []string           `json:"trusted_authorities,omitempty"`
-	TrustedPeers       []TrustedPeerEntry `json:"trusted_peers,omitempty"`
-	Memberships        []MembershipRecord `json:"memberships,omitempty"`
-	ACLRules           []ACLRule          `json:"acl_rules,omitempty"`
-	RevokedPeers       []string           `json:"revoked_peers,omitempty"`
-}
-
-// VerifiedPeer stores verified identity material for an authorized peer.
-type VerifiedPeer struct {
-	PeerID     string
-	PublicKey  PublicKey
-	Membership *MembershipRecord
-}
-
-// TrustVerifier enforces independent peer trust, membership validity, revocations,
-// and default-deny connection ACLs on either a Hub or a Peer.
-type TrustVerifier struct {
-	mu             sync.RWMutex
-	authorities    map[string]PublicKey
-	pinnedPeers    map[string]PublicKey
-	memberships    map[string]*MembershipRecord
-	aclAllowed     map[[2]string]bool
-	aclWildcard    map[string]bool
-	hasExplicitACL bool
-	revoked        map[string]struct{}
-	clockSkew      time.Duration
-	nowFunc        func() time.Time
-}
-
-// NewTrustVerifier builds a validated TrustVerifier from PolicyConfig.
-func NewTrustVerifier(cfg PolicyConfig, clockSkew time.Duration) (*TrustVerifier, error) {
-	tv := &TrustVerifier{
-		authorities: make(map[string]PublicKey),
-		pinnedPeers: make(map[string]PublicKey),
-		memberships: make(map[string]*MembershipRecord),
-		aclAllowed:  make(map[[2]string]bool),
-		aclWildcard: make(map[string]bool),
-		revoked:     make(map[string]struct{}),
-		clockSkew:   clockSkew,
-		nowFunc:     time.Now,
-	}
-	if err := tv.Reload(cfg); err != nil {
-		return nil, err
-	}
-	return tv, nil
-}
-
-// SetClock overrides the time source (used for deterministic expiry testing).
-func (tv *TrustVerifier) SetClock(nowFunc func() time.Time) {
-	tv.mu.Lock()
-	defer tv.mu.Unlock()
-	tv.nowFunc = nowFunc
-}
-
-// Reload atomically validates and replaces the active trust and ACL policy.
-func (tv *TrustVerifier) Reload(cfg PolicyConfig) error {
-	if cfg.Version != 0 && cfg.Version != 1 {
-		return fmt.Errorf("unsupported policy version %d", cfg.Version)
-	}
-	authorities := make(map[string]PublicKey, len(cfg.TrustedAuthorities))
-	for _, enc := range cfg.TrustedAuthorities {
-		pub, err := DecodePublicKey(enc)
-		if err != nil {
-			return fmt.Errorf("invalid authority key: %w", err)
-		}
-		id, err := PeerIDFromPublicKey(pub)
-		if err != nil {
-			return err
-		}
-		authorities[id] = pub
-	}
-
-	pinned := make(map[string]PublicKey, len(cfg.TrustedPeers))
-	for _, tp := range cfg.TrustedPeers {
-		pub, err := DecodePublicKey(tp.PublicKey)
-		if err != nil {
-			return fmt.Errorf("invalid trusted peer key for %s: %w", tp.PeerID, err)
-		}
-		derived, err := PeerIDFromPublicKey(pub)
-		if err != nil {
-			return err
-		}
-		if tp.PeerID != "" && tp.PeerID != derived {
-			return fmt.Errorf("%w: %s", ErrPeerIDMismatch, tp.PeerID)
-		}
-		pinned[derived] = pub
-	}
-
-	memberships := make(map[string]*MembershipRecord, len(cfg.Memberships))
-	for i := range cfg.Memberships {
-		rec := cfg.Memberships[i]
-		if _, err := VerifyMembershipRecord(&rec, authorities, time.Unix(rec.IssuedAt, 0), tv.clockSkew); err != nil {
-			return fmt.Errorf("invalid preloaded membership for %s: %w", rec.PeerID, err)
-		}
-		recCopy := rec
-		memberships[rec.PeerID] = &recCopy
-	}
-
-	aclAllowed := make(map[[2]string]bool, len(cfg.ACLRules)*2)
-	aclWildcard := make(map[string]bool)
-	for _, rule := range cfg.ACLRules {
-		if rule.PeerA == "" || rule.PeerB == "" || rule.PeerA == rule.PeerB {
-			return fmt.Errorf("invalid ACL rule (%q, %q)", rule.PeerA, rule.PeerB)
-		}
-		if rule.PeerB == "*" {
-			if err := ValidatePeerID(rule.PeerA); err != nil {
-				return err
-			}
-			aclWildcard[rule.PeerA] = true
-			continue
-		}
-		if err := ValidatePeerID(rule.PeerA); err != nil {
-			return err
-		}
-		if err := ValidatePeerID(rule.PeerB); err != nil {
-			return err
-		}
-		aclAllowed[[2]string{rule.PeerA, rule.PeerB}] = true
-		if !rule.Unidirectional {
-			aclAllowed[[2]string{rule.PeerB, rule.PeerA}] = true
-		}
-	}
-
-	revoked := make(map[string]struct{}, len(cfg.RevokedPeers))
-	for _, pid := range cfg.RevokedPeers {
-		if err := ValidatePeerID(pid); err != nil {
-			return err
-		}
-		revoked[pid] = struct{}{}
-	}
-
-	tv.mu.Lock()
-	tv.authorities = authorities
-	tv.pinnedPeers = pinned
-	tv.memberships = memberships
-	tv.aclAllowed = aclAllowed
-	tv.aclWildcard = aclWildcard
-	tv.hasExplicitACL = len(cfg.ACLRules) > 0
-	tv.revoked = revoked
-	tv.mu.Unlock()
-	return nil
-}
-
-// LoadPolicyFile loads a PolicyConfig strictly from disk.
-func LoadPolicyFile(path string) (PolicyConfig, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return PolicyConfig{}, fmt.Errorf("read policy file %s: %w", path, err)
-	}
-	var cfg PolicyConfig
-	if err := jcs.UnmarshalStrict(raw, &cfg); err != nil {
-		return PolicyConfig{}, fmt.Errorf("parse policy file %s: %w", path, err)
-	}
-	return cfg, nil
-}
-
-// VerifyPeer authenticates a peer's identity and membership against pinned keys
-// or offline-authority-signed membership records, enforcing revocation checks.
-func (tv *TrustVerifier) VerifyPeer(peerID string, pub PublicKey, rec *MembershipRecord) (*VerifiedPeer, error) {
-	if err := ValidatePeerID(peerID); err != nil {
-		return nil, err
-	}
-	tv.mu.RLock()
-	defer tv.mu.RUnlock()
-
-	if _, isRevoked := tv.revoked[peerID]; isRevoked {
-		return nil, ErrRevokedPeer
-	}
-
-	now := tv.nowFunc()
-
-	if pub.IsZero() {
-		if p, ok := tv.pinnedPeers[peerID]; ok {
-			pub = p
-		} else if m, ok := tv.memberships[peerID]; ok && rec == nil {
-			rec = m
-		}
-	}
-
-	if !pub.IsZero() {
-		derived, err := PeerIDFromPublicKey(pub)
-		if err != nil {
-			return nil, err
-		}
-		if derived != peerID {
-			return nil, ErrPeerIDMismatch
-		}
-	}
-
-	if rec == nil {
-		if storedRec, ok := tv.memberships[peerID]; ok {
-			rec = storedRec
-		}
-	}
-
-	if rec != nil {
-		recPub, err := VerifyMembershipRecord(rec, tv.authorities, now, tv.clockSkew)
-		if err != nil {
-			return nil, err
-		}
-		if rec.PeerID != peerID {
-			return nil, ErrPeerIDMismatch
-		}
-		if !pub.IsZero() && !pub.Equal(recPub) {
-			return nil, ErrPeerIDMismatch
-		}
-		recCopy := *rec
-		return &VerifiedPeer{
-			PeerID:     peerID,
-			PublicKey:  recPub,
-			Membership: &recCopy,
-		}, nil
-	}
-
-	if pinnedPub, ok := tv.pinnedPeers[peerID]; ok {
-		if !pub.IsZero() && !pub.Equal(pinnedPub) {
-			return nil, ErrPeerIDMismatch
-		}
-		return &VerifiedPeer{
-			PeerID:    peerID,
-			PublicKey: pinnedPub,
-		}, nil
-	}
-
-	return nil, ErrUntrustedPeer
-}
-
-// CacheVerifiedPeer records an authority-verified peer membership in memory.
-func (tv *TrustVerifier) CacheVerifiedPeer(vp *VerifiedPeer) {
-	if vp == nil || vp.Membership == nil {
-		return
-	}
-	tv.mu.Lock()
-	defer tv.mu.Unlock()
-	recCopy := *vp.Membership
-	tv.memberships[vp.PeerID] = &recCopy
-}
-
-// IsRevoked reports whether peerID is currently revoked.
-func (tv *TrustVerifier) IsRevoked(peerID string) bool {
-	tv.mu.RLock()
-	defer tv.mu.RUnlock()
-	_, ok := tv.revoked[peerID]
-	return ok
-}
-
-// AuthorizePair enforces the default-deny connection ACL between fromPeer and toPeer.
-func (tv *TrustVerifier) AuthorizePair(fromPeer, toPeer string, fromRec, toRec *MembershipRecord) error {
-	if fromPeer == "" || toPeer == "" || fromPeer == toPeer {
-		return ErrUnauthorizedPair
-	}
-	if err := ValidatePeerID(fromPeer); err != nil {
-		return ErrUnauthorizedPair
-	}
-	if err := ValidatePeerID(toPeer); err != nil {
-		return ErrUnauthorizedPair
-	}
-
-	tv.mu.RLock()
-	defer tv.mu.RUnlock()
-
-	if _, bad := tv.revoked[fromPeer]; bad {
-		return ErrRevokedPeer
-	}
-	if _, bad := tv.revoked[toPeer]; bad {
-		return ErrRevokedPeer
-	}
-
-	if fromRec == nil {
-		fromRec = tv.memberships[fromPeer]
-	}
-	if toRec == nil {
-		toRec = tv.memberships[toPeer]
-	}
-
-	if fromRec != nil && len(fromRec.AllowedPeers) > 0 && !peerListAllows(fromRec.AllowedPeers, toPeer) {
-		return ErrUnauthorizedPair
-	}
-	if toRec != nil && len(toRec.AllowedPeers) > 0 && !peerListAllows(toRec.AllowedPeers, fromPeer) {
-		return ErrUnauthorizedPair
-	}
-
-	if tv.hasExplicitACL {
-		if tv.aclAllowed[[2]string{fromPeer, toPeer}] {
-			return nil
-		}
-		if tv.aclWildcard[fromPeer] && (tv.aclWildcard[toPeer] || tv.aclAllowed[[2]string{toPeer, fromPeer}]) {
-			return nil
-		}
-		return ErrUnauthorizedPair
-	}
-
-	if fromRec != nil && len(fromRec.AllowedPeers) > 0 && peerListAllows(fromRec.AllowedPeers, toPeer) &&
-		toRec != nil && len(toRec.AllowedPeers) > 0 && peerListAllows(toRec.AllowedPeers, fromPeer) {
-		return nil
-	}
-
-	return ErrUnauthorizedPair
-}
-
-func peerListAllows(allowed []string, target string) bool {
-	for _, p := range allowed {
-		if p == "*" || p == target {
-			return true
-		}
-	}
-	return false
 }

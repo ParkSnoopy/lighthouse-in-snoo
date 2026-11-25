@@ -1,42 +1,43 @@
 # Lighthouse
 
-Lighthouse coordinates authenticated, end-to-end encrypted peer-to-peer WebRTC DataChannel connections through a single `linux/amd64` hub. It provides a single `lighthouse` binary for running the hub, connecting peers, and managing keys and policies.
+Lighthouse binds a local OS virtual network interface (`lh0`) through a Fyne desktop app (`lighthouse-ui`) and connects peers over end-to-end encrypted WebRTC tunnels via one zero-config universal hub and relay (`lighthouse hub`).
+
+There are no hub configuration files or ACLs. Every incoming connection is gated strictly by an explicit user **Allow**, **Deny**, or **Blacklist** action.
 
 ## How It Works
 
 ```mermaid
 flowchart TB
-    subgraph Hub["Lighthouse Hub"]
+    subgraph Hub["Zero-Config Universal Hub"]
         S["Signaling (:8443/tcp, TLS 1.3 WSS)"]
-        T["STUNS / TURNS (:5349/udp DTLS 1.3, or :5349/tcp TLS 1.3)"]
-        P[("Trust Policy & Presence")]
-        S --- P
+        R["Universal STUNS / TURNS Relay (:5349/udp DTLS 1.3)"]
     end
-    A["Peer A"]
-    B["Peer B"]
-    A -. "Authenticated Signaling" .-> S
-    B -. "Authenticated Signaling" .-> S
-    A -. "Address Discovery / Optional Relay" .-> T
-    B -. "Address Discovery / Optional Relay" .-> T
-    A <-->|"End-to-End Encrypted DataChannel (DTLS 1.3)"| B
+    A["Peer A (Fyne UI + TUN lh0)"]
+    B["Peer B (Fyne UI + TUN lh0)"]
+    A -. "Passphrase-Scoped Broadcast & Signed Signaling" .-> S
+    B -. "Passphrase-Scoped Broadcast & Signed Signaling" .-> S
+    A -. "Address Discovery / Universal Relay" .-> R
+    B -. "Address Discovery / Universal Relay" .-> R
+    A <-->|"End-to-End Encrypted DTLS 1.3 Tunnel (IPv4 over TUN)"| B
 ```
 
-1. **Identity & Trust**: Peers authenticate using persistent key pairs (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, or `rsa`) verified against local pinned keys or offline-authority-signed membership records and ACL rules.
-2. **Signaling**: Peers register with the hub over TLS 1.3 WebSockets and exchange signed session offers, answers, and ICE candidates.
-3. **Transport**: Address discovery and optional relaying use encrypted DTLS 1.3 over UDP (`stuns:`/`turns:`) by default. Pass `--tcp-only` on hub and peers to disable UDP and use TLS 1.3 over TCP and ICE-TCP, or `--insecure` to opt in to plaintext `stun:`/`turn:`.
-4. **Direct Data**: Once connected, peers exchange application data over end-to-end DTLS 1.3 encrypted WebRTC DataChannels directly (or via a configured TURN relay); the hub never decrypts peer traffic.
+1. **Zero-Config Universal Hub & Relay**: `lighthouse hub` runs statelessly with no ACLs, policy files, or databases. It serves TLS 1.3 WSS signaling and an integrated DTLS 1.3 / UDP STUNS + TURNS relay (generating an ephemeral TLS certificate and relay credentials automatically when omitted). Operators running a private hub may optionally set `--passphrase` (`LIGHTHOUSE_PASSPHRASE`) to restrict hub registration via an offline shared passphrase.
+2. **Passphrase-Scoped Broadcasting**: Broadcasting is off by default. When a user enables broadcast with an offline shared passphrase, only peers listening on the exact same passphrase receive that broadcast and decrypt its peer label. The raw passphrase is never sent over the network.
+3. **Explicit User Consent & Blacklist**: Every peer holds a local cryptographic identity (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, or `rsa`) mapped to a deterministic virtual IP (`100.64.0.0/10`). Incoming connection requests display the verified peer ID, key algorithm, virtual IP, and DTLS fingerprint and require explicit **Allow**, **Deny**, or **Blacklist** action. Blacklisted peers are dropped immediately and blocked from future offers.
+4. **Bound Virtual Network Interface**: Allowing a peer installs a route on the local TUN interface (`lh0`) backed by an end-to-end DTLS 1.3 WebRTC tunnel with source-IP anti-spoofing. UDP is prioritized by default; pass `--tcp-only` to disable UDP completely and operate over TLS 1.3 / TCP and ICE-TCP, or `--insecure` to allow plaintext `stun:`/`turn:`.
 
 ## Usage
 
 ### 1. Build or Pull
 
-Build the binary locally:
+Build both binaries locally:
 
 ```bash
-make build
+make build      # static linux/amd64 hub -> bin/lighthouse
+make build-ui   # Fyne desktop TUN app -> bin/lighthouse-ui
 ```
 
-Or run the hub container via GHCR / Docker Compose (`linux/amd64`):
+Or run the universal hub container (`linux/amd64`):
 
 ```bash
 docker pull ghcr.io/<owner>/<repo>:latest
@@ -45,127 +46,70 @@ docker compose up -d --build
 
 All `LIGHTHOUSE_*` environment variables and optional local `.env` entries are read at runtime.
 
-### 2. Provision Keys and Policy
+### 2. Run the Universal Hub
 
-Generate an authority key and peer keys:
-
-```bash
-./bin/lighthouse admin keygen --out config/authority.key
-./bin/lighthouse admin keygen --algo ed448 --out peer-a.key
-./bin/lighthouse admin keygen --algo nistp-384 --out peer-b.key
-```
-
-Issue membership records for each peer:
+Start with zero configuration (ephemeral self-signed TLS + universal DTLS 1.3 / UDP relay):
 
 ```bash
-./bin/lighthouse admin issue-membership \
-  --authority config/authority.key \
-  --peer-pub <PEER_A_PUBLIC_KEY> \
-  --allow <PEER_B_ID> \
-  --ttl 720h \
-  --out peer-a-membership.json
-
-./bin/lighthouse admin issue-membership \
-  --authority config/authority.key \
-  --peer-pub <PEER_B_PUBLIC_KEY> \
-  --allow <PEER_A_ID> \
-  --ttl 720h \
-  --out peer-b-membership.json
+./bin/lighthouse hub
 ```
 
-Create `config/policy.json` for the hub and peers:
-
-```json
-{
-  "v": 1,
-  "trusted_authorities": [
-    "<AUTHORITY_PUBLIC_KEY>"
-  ],
-  "acl_rules": [
-    {
-      "peer_a": "<PEER_A_ID>",
-      "peer_b": "<PEER_B_ID>"
-    }
-  ]
-}
-```
-
-### 3. Run the Hub
+Run with a TLS certificate and an optional offline hub passphrase:
 
 ```bash
 ./bin/lighthouse hub \
-  --policy config/policy.json \
   --tls-cert tls.crt \
   --tls-key tls.key \
-  --hub-origin wss://hub.example.com
+  --hub-origin wss://hub.example.com \
+  --turn-public-ip 203.0.113.10 \
+  --passphrase "<OFFLINE_SHARED_PASSPHRASE>"
 ```
-
-Send `SIGHUP` to reload updated policies and revocations without restarting.
 
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
 | `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS/WSS signaling |
 | `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | Encrypted STUNS/TURNS address (UDP default; TCP with `--tcp-only`) |
-| `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext STUN/TURN address (requires `--insecure`, default `:3478`) |
-| `--tcp-only` | `LIGHTHOUSE_TCP_ONLY` | `false` | Disable UDP; use TLS 1.3 over TCP only |
-| `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Allow plaintext `stun:`/`turn:` listener |
-| `--turn-secret` | `LIGHTHOUSE_TURN_SECRET` | *(disabled)* | Shared secret for HMAC TURN REST credentials |
-| `--turn-users` | `LIGHTHOUSE_TURN_USERS` | *(disabled)* | Static `user=pass[,user=pass]` TURN credentials |
+| `-P, --passphrase` | `LIGHTHOUSE_PASSPHRASE` | *(open)* | Optional offline shared passphrase gating hub registration |
+| `--no-relay` | `LIGHTHOUSE_NO_RELAY` | `false` | Disable integrated universal TURNS relay |
+| `--turn-public-ip` | `LIGHTHOUSE_TURN_PUBLIC_IP` | *(auto)* | Public IP advertised in TURN relay allocations |
+| `--turn-advertise-host` | `LIGHTHOUSE_TURN_ADVERTISE_HOST` | *(auto)* | Host advertised to peers in universal relay URIs |
+| `--turn-secret` | `LIGHTHOUSE_TURN_SECRET` | *(ephemeral)* | Optional HMAC secret for universal relay credentials |
 | `--turn-realm` | `LIGHTHOUSE_TURN_REALM` | `lighthouse` | TURN authentication realm |
-| `--turn-public-ip` | `LIGHTHOUSE_TURN_PUBLIC_IP` | *(auto)* | Static public IP advertised for TURN relay allocations |
 | `--turn-tls-addr` | `LIGHTHOUSE_TURN_TLS_ADDR` | *(disabled)* | Optional TLS 1.3 / TCP TURNS fallback address |
 | `--hub-origin` | `LIGHTHOUSE_HUB_ORIGIN` | `wss://localhost:8443` | Canonical WSS origin verified during registration |
-| `--tls-cert` | `LIGHTHOUSE_TLS_CERT` | `/etc/lighthouse/tls.crt` | Server certificate PEM path |
-| `--tls-key` | `LIGHTHOUSE_TLS_KEY` | `/etc/lighthouse/tls.key` | Server private key PEM path |
-| `-p, --policy` | `LIGHTHOUSE_POLICY` | `/etc/lighthouse/policy.json` | Policy JSON path |
-| `--sqlite` | `LIGHTHOUSE_SQLITE` | *(disabled)* | Optional SQLite state database path |
-| `--presence-heartbeat` | — | `20s` | Peer heartbeat interval |
-| `--presence-ttl` | — | `60s` | Presence lease lifetime |
+| `--tls-cert` | `LIGHTHOUSE_TLS_CERT` | *(ephemeral)* | TLS/DTLS certificate PEM path |
+| `--tls-key` | `LIGHTHOUSE_TLS_KEY` | *(ephemeral)* | TLS/DTLS private key PEM path |
+| `--tcp-only` | `LIGHTHOUSE_TCP_ONLY` | `false` | Disable UDP; serve STUNS over TLS 1.3 / TCP only |
+| `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Opt in to plaintext `stun:`/`turn:` listener on `--stun-addr` |
+| `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext STUN/TURN address (requires `--insecure`, default `:3478`) |
 
-### 4. Connect Peers
+### 3. Run the Desktop Interface App
 
-Start a listening peer:
-
-```bash
-./bin/lighthouse peer \
-  --key peer-b.key \
-  --membership peer-b-membership.json \
-  --policy config/policy.json \
-  --hub wss://hub.example.com/v1/signal \
-  --stun stuns:hub.example.com:5349
-```
-
-Connect from a second peer:
+Launch `lighthouse-ui` (requires `CAP_NET_ADMIN` / TUN privileges to bind `lh0` on Linux):
 
 ```bash
-./bin/lighthouse peer \
-  --key peer-a.key \
-  --membership peer-a-membership.json \
-  --policy config/policy.json \
-  --hub wss://hub.example.com/v1/signal \
-  --stun stuns:hub.example.com:5349 \
-  --connect <PEER_B_ID>
+./bin/lighthouse-ui --hub wss://hub.example.com/v1/signal --ifname lh0
 ```
 
-Optional transport modes:
+Inside the app:
 
-```bash
-# Authenticated TURNS relay (restrictive NATs)
-./bin/lighthouse peer \
-  --key peer-a.key --membership peer-a-membership.json --policy config/policy.json \
-  --hub wss://hub.example.com/v1/signal \
-  --turn turns:hub.example.com:5349 --turn-user <USER> --turn-pass <PASS> \
-  --connect <PEER_B_ID>
+1. Click **Bind & Connect** to bind the local virtual network interface (`lh0`, `100.64.x.x/10`) and connect to the hub.
+2. Enter a shared passphrase and click **Join** to listen for peers on that passphrase. Toggle **Broadcast** only when you want peers with the same passphrase to discover you.
+3. Click **Connect** next to a discovered peer (or enter a Peer ID directly).
+4. On the receiving peer, review the incoming connection prompt and click **Allow**, **Deny**, or **Blacklist**. Manage active tunnels and blacklisted peers from their respective tabs.
 
-# TCP-only mode (disables all UDP)
-./bin/lighthouse hub --tcp-only --stuns-addr :5349 --policy config/policy.json --tls-cert tls.crt --tls-key tls.key
-./bin/lighthouse peer --tcp-only --key peer-a.key --policy config/policy.json --stun stuns:hub.example.com:5349 --connect <PEER_B_ID>
-
-# Opt-in plaintext STUN/TURN
-./bin/lighthouse peer --insecure --key peer-a.key --policy config/policy.json --stun stun:hub.example.com:3478 --connect <PEER_B_ID>
-```
-
-Run `lighthouse --help` or `lighthouse help <subcommand>` for full CLI options.
+| Flag | Environment Variable | Default | Description |
+| --- | --- | --- | --- |
+| `--hub` | `LIGHTHOUSE_HUB_URL` | `wss://localhost:8443/v1/signal` | Universal hub WSS signaling URL |
+| `--hub-passphrase` | `LIGHTHOUSE_PASSPHRASE` | *(none)* | Optional offline hub registration passphrase |
+| `--ifname` | `LIGHTHOUSE_IFNAME` | `lh0` | OS TUN virtual network interface name |
+| `--ca` | `LIGHTHOUSE_CA` | *(system)* | Optional PEM Root CA bundle |
+| `-s, --stun` | `LIGHTHOUSE_STUN_URI` | *(auto)* | Optional explicit STUNS/TURNS URI |
+| `-k, --key` | — | `~/.config/lighthouse/identity.key` | Local identity key path (generated if absent) |
+| `-a, --algo` | — | `ed25519` | Identity key algorithm (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) |
+| `--blacklist` | — | `~/.config/lighthouse/blacklist.json` | Local peer blacklist file path |
+| `--tcp-only` | `LIGHTHOUSE_TCP_ONLY` | `false` | Disable UDP; use ICE-TCP and TLS 1.3 / TCP only |
+| `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Allow plaintext `stun:`/`turn:` URIs |
 
 ## Documentation
 

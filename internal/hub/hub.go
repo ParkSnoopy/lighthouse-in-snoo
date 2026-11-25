@@ -2,13 +2,23 @@ package hub
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,48 +30,52 @@ import (
 
 	"lighthouse-in-snoo/internal/jcs"
 	"lighthouse-in-snoo/internal/ratelimit"
-	"lighthouse-in-snoo/internal/store"
 	"lighthouse-in-snoo/internal/stunserver"
 	"lighthouse-in-snoo/internal/turnserver"
 	"lighthouse-in-snoo/pkg/identity"
 	"lighthouse-in-snoo/pkg/protocol"
 )
 
-// Config configures the Lighthouse control-plane hub and integrated STUNS/TURNS service.
-// By default STUNS/TURNS run over DTLS 1.3 / UDP (:5349/udp); plaintext UDP requires AllowInsecure=true.
+// Config configures the zero-config Lighthouse universal public hub and relay.
+// The hub stores no ACLs, policy files, or SQLite state; security relies strictly
+// on peer cryptographic signatures, passphrase-scoped broadcasts, and explicit user allow actions.
 type Config struct {
 	HTTPSListenAddr string
 	HTTPSListener   net.Listener // Optional pre-bound TCP listener (used in tests).
 	TLSConfig       *tls.Config
 	TLSCertFile     string
 	TLSKeyFile      string
+	AutoTLS         bool   // Generate an ephemeral self-signed TLS 1.3 cert when cert/key are omitted.
 	HubOrigin       string // Canonical wss://host[:port] expected in registration proofs.
 
-	TCPOnly          bool           // Explicit opt-in to disable all UDP sockets and serve STUNS/TURNS over TLS 1.3/TCP only.
-	AllowInsecure    bool           // Explicit opt-in required to serve plaintext UDP (or TCP in TCPOnly) STUN/TURN.
-	EnableSTUN       bool           // Enable STUNS (DTLS 1.3/UDP default; TLS 1.3/TCP when TCPOnly) and plaintext if AllowInsecure.
-	STUNSListenAddr  string         // Encrypted STUNS/TURNS listen address (default :5349; UDP unless TCPOnly).
-	STUNSPacketConn  net.PacketConn // Optional pre-bound UDP PacketConn for DTLS 1.3 STUNS/TURNS (prohibited when TCPOnly).
+	// Optional offline shared passphrase gating registration on this hub (never sent in plaintext).
+	// Leave empty to run as an open universal public relay where clients scope broadcasts per passphrase.
+	Passphrase string
+
+	TCPOnly          bool           // Explicit opt-in to disable all UDP sockets and serve TLS 1.3/TCP only.
+	AllowInsecure    bool           // Explicit opt-in required for plaintext STUN/TURN.
+	EnableSTUN       bool           // Enable STUNS (DTLS 1.3/UDP default; TLS 1.3/TCP when TCPOnly).
+	STUNSListenAddr  string         // Encrypted STUNS/TURNS listen address (default :5349).
+	STUNSPacketConn  net.PacketConn // Optional pre-bound UDP PacketConn (prohibited when TCPOnly).
 	STUNSTLSListener net.Listener   // Optional pre-bound TCP listener for TLS 1.3 STUNS/TURNS (TCPOnly).
-	STUNListenAddr   string         // Plaintext STUN/TURN listen address (requires AllowInsecure; UDP unless TCPOnly).
-	STUNPacketConn   net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure; prohibited when TCPOnly).
+	STUNListenAddr   string         // Plaintext STUN/TURN listen address (requires AllowInsecure).
+	STUNPacketConn   net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure).
 	STUNTCPListener  net.Listener   // Optional pre-bound plaintext TCP listener (requires AllowInsecure and TCPOnly).
 
-	EnableTURN         bool              // Enable authenticated DTLS 1.3 TURNS (and plaintext TURN if AllowInsecure).
+	EnableTURN         bool              // Enable universal TURNS relay (auto-mints credentials per registered peer).
 	TURNSTLSListenAddr string            // Optional secondary TLS 1.3 TCP listen address for ?transport=tcp fallback.
 	TURNRealm          string            // TURN authentication realm (default "lighthouse").
-	TURNSecret         string            // Shared secret for time-limited HMAC TURN REST credentials.
+	TURNSecret         string            // Optional HMAC shared secret (auto-generated ephemerally when EnableTURN is true).
 	TURNUsers          map[string]string // Optional static username -> password TURN credentials.
 	TURNAuthHandler    turn.AuthHandler  // Optional custom TURN AuthHandler.
 	TURNPublicIP       net.IP            // Optional advertised public relay IP for TURN allocations.
+	TURNAdvertiseHost  string            // Optional hostname/IP advertised in RegisteredMessage.Relay URIs.
 	TURNRelayBindAddr  string            // Local bind IP for TURN UDP relay sockets.
 	TURNRelayMinPort   uint16
 	TURNRelayMaxPort   uint16
 	TURNNet            transport.Net
 	PionLoggerFactory  logging.LoggerFactory
 
-	Policy              identity.PolicyConfig
-	SQLitePath          string
 	PresenceHeartbeat   time.Duration
 	PresenceTTL         time.Duration
 	ChallengeTTL        time.Duration
@@ -70,27 +84,26 @@ type Config struct {
 	MaxMessageBytes     int
 	MaxCandidatesPerGen int
 	MaxSessionsPerPeer  int
+	MaxChannelsPerPeer  int
 	MaxConnsPerIP       int
 	MaxTotalConns       int
 	PerIPConnRPS        float64
 	PerIPConnBurst      int
 	PerPeerMsgRPS       float64
 	PerPeerMsgBurst     int
-	PerPeerLookupRPS    float64
-	PerPeerLookupBurst  int
 	MaxTrackedSessions  int
 	STUNPerIPRPS        float64
 	STUNPerIPBurst      int
 	Logger              *slog.Logger
 }
 
-// Stats exposes aggregate non-sensitive control-plane and STUN counters (Section 9).
+// Stats exposes aggregate non-sensitive control-plane and STUN counters.
 type Stats struct {
 	ActiveSessions      int
+	ActiveChannels      int
 	RegistrationsOK     uint64
 	RegistrationsFailed uint64
-	LookupsOK           uint64
-	LookupsDenied       uint64
+	BroadcastsUpdated   uint64
 	SignalsForwarded    uint64
 	SignalsRejected     uint64
 	RateLimited         uint64
@@ -103,11 +116,12 @@ type peerSession struct {
 	remoteIP   string
 	peerID     string
 	publicKey  identity.PublicKey
-	membership *identity.MembershipRecord
 	expiresAt  atomic.Int64 // Unix nanos of presence lease expiry
 	writeMu    sync.Mutex
 	closed     atomic.Bool
 	cancel     context.CancelFunc
+	subscribed map[string]struct{} // guarded by hub.mu
+	broadcasts map[string]struct{} // guarded by hub.mu
 }
 
 func (ps *peerSession) sendRaw(ctx context.Context, payload []byte) error {
@@ -144,34 +158,35 @@ type negotiationRecord struct {
 	activeGeneration uint32
 	closed           bool
 	updatedAt        time.Time
-	senderGens       map[string]*senderGenState // key: senderPeerID + ":" + gen
+	senderGens       map[string]*senderGenState
 }
 
-// Server is the single-container Lighthouse control-plane service (HTTPS/WSS + STUNS/TURNS).
-// It never instantiates a WebRTC PeerConnection; application payloads remain E2E DTLS 1.3 encrypted.
+// Server is the zero-config Lighthouse control-plane and universal relay service.
+// It stores no ACLs or policies and never terminates peer-to-peer WebRTC DTLS 1.3 sessions.
 type Server struct {
 	cfg           Config
 	hubOrigin     string
-	trust         *identity.TrustVerifier
-	sqlStore      *store.Store
+	hasPassphrase bool
+	hubKey        [32]byte
+	turnSecret    string
 	stunSrv       *stunserver.Server
 	turnSrv       *turnserver.Server
 	httpSrv       *http.Server
 	httpsListener net.Listener
 	log           *slog.Logger
 
-	ipConnRate   *ratelimit.KeyedLimiter
-	ipConnConc   *ratelimit.ConcurrencyLimiter
-	peerMsgRate  *ratelimit.KeyedLimiter
-	peerLookRate *ratelimit.KeyedLimiter
+	ipConnRate  *ratelimit.KeyedLimiter
+	ipConnConc  *ratelimit.ConcurrencyLimiter
+	peerMsgRate *ratelimit.KeyedLimiter
 
 	mu           sync.RWMutex
 	nextSessSeq  uint64
-	sessions     map[string][]*peerSession // peerID -> active sessions (bounded by MaxSessionsPerPeer)
+	sessions     map[string][]*peerSession
+	channels     map[string]map[string]protocol.BroadcastPeer // channelID -> peerID -> signed broadcast
+	channelSubs  map[string]map[*peerSession]struct{}         // channelID -> subscribed sessions
 	negotiations map[string]*negotiationRecord
 
-	// Optional test/interceptor hook strictly for negative security test T06
-	// (simulating a compromised hub tampering with forwarded frames). Nil in production.
+	// Optional test hook strictly for negative security tests simulating a compromised hub.
 	forwardHook func(raw []byte) []byte
 
 	closed  atomic.Bool
@@ -181,48 +196,38 @@ type Server struct {
 
 	regOK       atomic.Uint64
 	regFailed   atomic.Uint64
-	lookOK      atomic.Uint64
-	lookDenied  atomic.Uint64
+	bcastCount  atomic.Uint64
 	sigFwd      atomic.Uint64
 	sigRejected atomic.Uint64
 	rateDropped atomic.Uint64
 }
 
-// New creates and starts a Lighthouse Hub server.
-func New(cfg Config) (*Server, error) {
+// New creates and starts a zero-config Lighthouse Hub and optional universal STUNS/TURNS relay.
+func New(cfgIn *Config) (*Server, error) {
+	var cfg Config
+	if cfgIn != nil {
+		cfg = *cfgIn
+	}
 	applyDefaults(&cfg)
 	origin, err := identity.CanonicalizeOrigin(cfg.HubOrigin)
 	if err != nil {
 		return nil, fmt.Errorf("hub origin: %w", err)
 	}
 
-	var sqlStore *store.Store
-	policy := cfg.Policy
-	if cfg.SQLitePath != "" {
-		sqlStore, err = store.Open(cfg.SQLitePath)
+	var (
+		hasPassphrase bool
+		hubKey        [32]byte
+	)
+	if strings.TrimSpace(cfg.Passphrase) != "" {
+		hubKey, err = identity.DeriveHubKey(cfg.Passphrase)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("derive hub passphrase key: %w", err)
 		}
-		policy, err = sqlStore.LoadPolicy(context.Background(), policy)
-		if err != nil {
-			_ = sqlStore.Close()
-			return nil, err
-		}
+		hasPassphrase = true
 	}
 
-	trust, err := identity.NewTrustVerifier(policy, cfg.MaxClockSkew)
+	tlsCfg, err := buildTLS13Config(&cfg, origin)
 	if err != nil {
-		if sqlStore != nil {
-			_ = sqlStore.Close()
-		}
-		return nil, err
-	}
-
-	tlsCfg, err := buildTLS13Config(&cfg)
-	if err != nil {
-		if sqlStore != nil {
-			_ = sqlStore.Close()
-		}
 		return nil, err
 	}
 
@@ -231,9 +236,6 @@ func New(cfg Config) (*Server, error) {
 		var listenErr error
 		rawLn, listenErr = net.Listen("tcp", cfg.HTTPSListenAddr)
 		if listenErr != nil {
-			if sqlStore != nil {
-				_ = sqlStore.Close()
-			}
 			return nil, fmt.Errorf("listen https %s: %w", cfg.HTTPSListenAddr, listenErr)
 		}
 	}
@@ -241,18 +243,12 @@ func New(cfg Config) (*Server, error) {
 
 	if cfg.TCPOnly && (cfg.STUNSPacketConn != nil || cfg.STUNPacketConn != nil) {
 		_ = ln.Close()
-		if sqlStore != nil {
-			_ = sqlStore.Close()
-		}
 		return nil, errors.New("hub: UDP PacketConn is prohibited when TCPOnly=true")
 	}
 
 	wantsPlain := cfg.STUNListenAddr != "" || cfg.STUNPacketConn != nil || cfg.STUNTCPListener != nil
 	if wantsPlain && !cfg.AllowInsecure {
 		_ = ln.Close()
-		if sqlStore != nil {
-			_ = sqlStore.Close()
-		}
 		return nil, stunserver.ErrInsecureSTUNProhibited
 	}
 
@@ -261,6 +257,17 @@ func New(cfg Config) (*Server, error) {
 	if (cfg.EnableSTUN || wantsTURN) && !wantsSTUNS && !wantsPlain && cfg.TURNSTLSListenAddr == "" {
 		cfg.STUNSListenAddr = stunserver.DefaultSTUNSAddr
 		wantsSTUNS = true
+	}
+
+	turnSecret := strings.TrimSpace(cfg.TURNSecret)
+	if wantsTURN && turnSecret == "" && len(cfg.TURNUsers) == 0 && cfg.TURNAuthHandler == nil {
+		// Universal public relay: mint a fresh ephemeral HMAC secret automatically.
+		var rawSecret [32]byte
+		if _, rErr := rand.Read(rawSecret[:]); rErr != nil {
+			_ = ln.Close()
+			return nil, fmt.Errorf("generate ephemeral turn secret: %w", rErr)
+		}
+		turnSecret = base64.RawURLEncoding.EncodeToString(rawSecret[:])
 	}
 
 	var (
@@ -273,7 +280,7 @@ func New(cfg Config) (*Server, error) {
 			AllowInsecure:    cfg.AllowInsecure,
 			TLSListenAddr:    cfg.TURNSTLSListenAddr,
 			Realm:            cfg.TURNRealm,
-			SharedSecret:     cfg.TURNSecret,
+			SharedSecret:     turnSecret,
 			Users:            cfg.TURNUsers,
 			AuthHandler:      cfg.TURNAuthHandler,
 			PublicIP:         cfg.TURNPublicIP,
@@ -304,12 +311,9 @@ func New(cfg Config) (*Server, error) {
 				turnCfg.UDPPacketConn = cfg.STUNPacketConn
 			}
 		}
-		turnSrv, err = turnserver.New(turnCfg)
+		turnSrv, err = turnserver.New(&turnCfg)
 		if err != nil {
 			_ = ln.Close()
-			if sqlStore != nil {
-				_ = sqlStore.Close()
-			}
 			return nil, err
 		}
 	} else if wantsSTUNS || wantsPlain {
@@ -341,12 +345,9 @@ func New(cfg Config) (*Server, error) {
 				stunCfg.PacketConn = cfg.STUNPacketConn
 			}
 		}
-		stunSrv, err = stunserver.New(stunCfg)
+		stunSrv, err = stunserver.New(&stunCfg)
 		if err != nil {
 			_ = ln.Close()
-			if sqlStore != nil {
-				_ = sqlStore.Close()
-			}
 			return nil, err
 		}
 	}
@@ -354,8 +355,9 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		cfg:           cfg,
 		hubOrigin:     origin,
-		trust:         trust,
-		sqlStore:      sqlStore,
+		hasPassphrase: hasPassphrase,
+		hubKey:        hubKey,
+		turnSecret:    turnSecret,
 		stunSrv:       stunSrv,
 		turnSrv:       turnSrv,
 		httpsListener: ln,
@@ -363,8 +365,9 @@ func New(cfg Config) (*Server, error) {
 		ipConnRate:    ratelimit.NewKeyedLimiter(cfg.PerIPConnRPS, cfg.PerIPConnBurst, 8192, 5*time.Minute),
 		ipConnConc:    ratelimit.NewConcurrencyLimiter(cfg.MaxConnsPerIP, cfg.MaxTotalConns),
 		peerMsgRate:   ratelimit.NewKeyedLimiter(cfg.PerPeerMsgRPS, cfg.PerPeerMsgBurst, 8192, 5*time.Minute),
-		peerLookRate:  ratelimit.NewKeyedLimiter(cfg.PerPeerLookupRPS, cfg.PerPeerLookupBurst, 8192, 5*time.Minute),
 		sessions:      make(map[string][]*peerSession),
+		channels:      make(map[string]map[string]protocol.BroadcastPeer),
+		channelSubs:   make(map[string]map[*peerSession]struct{}),
 		negotiations:  make(map[string]*negotiationRecord),
 		stopCh:        make(chan struct{}),
 		nowFunc:       time.Now,
@@ -425,6 +428,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.MaxSessionsPerPeer <= 0 {
 		cfg.MaxSessionsPerPeer = 2
 	}
+	if cfg.MaxChannelsPerPeer <= 0 {
+		cfg.MaxChannelsPerPeer = 8
+	}
 	if cfg.MaxConnsPerIP <= 0 {
 		cfg.MaxConnsPerIP = 32
 	}
@@ -443,12 +449,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.PerPeerMsgBurst <= 0 {
 		cfg.PerPeerMsgBurst = 200
 	}
-	if cfg.PerPeerLookupRPS <= 0 {
-		cfg.PerPeerLookupRPS = 20
-	}
-	if cfg.PerPeerLookupBurst <= 0 {
-		cfg.PerPeerLookupBurst = 40
-	}
 	if cfg.MaxTrackedSessions <= 0 {
 		cfg.MaxTrackedSessions = 8192
 	}
@@ -457,26 +457,82 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
-func buildTLS13Config(cfg *Config) (*tls.Config, error) {
+func buildTLS13Config(cfg *Config, canonicalOrigin string) (*tls.Config, error) {
 	var base *tls.Config
-	if cfg.TLSConfig != nil {
+	switch {
+	case cfg.TLSConfig != nil:
 		base = cfg.TLSConfig.Clone()
-	} else {
+	case cfg.TLSCertFile != "" || cfg.TLSKeyFile != "":
 		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
-			return nil, errors.New("hub: TLS certificate and key are required")
+			return nil, errors.New("hub: both TLS certificate and key paths are required")
 		}
 		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("load hub TLS keypair: %w", err)
 		}
 		base = &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			MaxVersion:   tls.VersionTLS13,
 			Certificates: []tls.Certificate{cert},
 		}
+	case cfg.AutoTLS:
+		cert, err := generateEphemeralServerCert(canonicalOrigin)
+		if err != nil {
+			return nil, err
+		}
+		base = &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			MaxVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{cert},
+		}
+	default:
+		return nil, errors.New("hub: TLS certificate/key or AutoTLS is required")
 	}
-	// Section 4.1: WSS MUST use TLS 1.3 exclusively.
 	base.MinVersion = tls.VersionTLS13
 	base.MaxVersion = tls.VersionTLS13
 	return base, nil
+}
+
+func generateEphemeralServerCert(canonicalOrigin string) (tls.Certificate, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("generate ephemeral TLS key: %w", err)
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	dnsNames := []string{"localhost"}
+	ips := []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback}
+	if u, parseErr := url.Parse(canonicalOrigin); parseErr == nil {
+		host := u.Hostname()
+		if ip := net.ParseIP(host); ip != nil {
+			ips = append(ips, ip)
+		} else if host != "" && host != "localhost" {
+			dnsNames = append(dnsNames, host)
+		}
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "lighthouse-hub"},
+		DNSNames:              dnsNames,
+		IPAddresses:           ips,
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("create ephemeral TLS cert: %w", err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  priv,
+	}, nil
 }
 
 // HTTPSAddr returns the bound TCP address of the HTTPS/WSS server.
@@ -487,6 +543,11 @@ func (s *Server) HTTPSAddr() net.Addr {
 // TCPOnly reports whether the hub is operating in TCP-only mode with UDP disabled.
 func (s *Server) TCPOnly() bool {
 	return s.cfg.TCPOnly
+}
+
+// PassphraseRequired reports whether the hub requires an offline passphrase proof to register.
+func (s *Server) PassphraseRequired() bool {
+	return s.hasPassphrase
 }
 
 // STUNSDTLSAddr returns the bound DTLS 1.3 / UDP STUNS/TURNS address, or nil if disabled.
@@ -560,7 +621,7 @@ func (s *Server) STUNAddr() net.Addr {
 	return s.STUNTCPAddr()
 }
 
-// TURNActive reports whether the integrated TURNS/TURN relay service is running.
+// TURNActive reports whether the integrated universal TURNS/TURN relay service is running.
 func (s *Server) TURNActive() bool {
 	return s.turnSrv != nil
 }
@@ -570,23 +631,7 @@ func (s *Server) HubOrigin() string {
 	return s.hubOrigin
 }
 
-// ReloadPolicy updates the active trust and ACL policy and disconnects any newly revoked peers.
-func (s *Server) ReloadPolicy(policy identity.PolicyConfig) error {
-	if s.sqlStore != nil {
-		var err error
-		policy, err = s.sqlStore.LoadPolicy(context.Background(), policy)
-		if err != nil {
-			return err
-		}
-	}
-	if err := s.trust.Reload(policy); err != nil {
-		return err
-	}
-	s.evictRevokedSessions()
-	return nil
-}
-
-// SetForwardTamperHookForTesting installs a raw frame mutator strictly for T06 negative testing.
+// SetForwardTamperHookForTesting installs a raw frame mutator strictly for negative security tests.
 func (s *Server) SetForwardTamperHookForTesting(hook func(raw []byte) []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -600,6 +645,7 @@ func (s *Server) Stats() Stats {
 	for _, list := range s.sessions {
 		active += len(list)
 	}
+	activeChannels := len(s.channels)
 	s.mu.RUnlock()
 
 	var stunStats stunserver.Stats
@@ -608,10 +654,10 @@ func (s *Server) Stats() Stats {
 	}
 	return Stats{
 		ActiveSessions:      active,
+		ActiveChannels:      activeChannels,
 		RegistrationsOK:     s.regOK.Load(),
 		RegistrationsFailed: s.regFailed.Load(),
-		LookupsOK:           s.lookOK.Load(),
-		LookupsDenied:       s.lookDenied.Load(),
+		BroadcastsUpdated:   s.bcastCount.Load(),
 		SignalsForwarded:    s.sigFwd.Load(),
 		SignalsRejected:     s.sigRejected.Load(),
 		RateLimited:         s.rateDropped.Load(),
@@ -619,7 +665,7 @@ func (s *Server) Stats() Stats {
 	}
 }
 
-// Close shuts down the HTTPS/WSS signaling server, active WebSockets, STUN server, and SQLite store.
+// Close shuts down the HTTPS/WSS signaling server, active WebSockets, and STUNS/TURNS servers.
 func (s *Server) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
@@ -640,6 +686,8 @@ func (s *Server) Close() error {
 		}
 		delete(s.sessions, pid)
 	}
+	s.channels = make(map[string]map[string]protocol.BroadcastPeer)
+	s.channelSubs = make(map[string]map[*peerSession]struct{})
 	s.mu.Unlock()
 
 	var stunErr error
@@ -650,12 +698,55 @@ func (s *Server) Close() error {
 	if s.turnSrv != nil {
 		turnErr = s.turnSrv.Close()
 	}
-	var sqlErr error
-	if s.sqlStore != nil {
-		sqlErr = s.sqlStore.Close()
-	}
 	s.wg.Wait()
-	return errors.Join(stunErr, turnErr, sqlErr)
+	return errors.Join(stunErr, turnErr)
+}
+
+func (s *Server) buildRelayInfoForPeer(peerID string) *protocol.RelayInfo {
+	if s.turnSrv == nil || s.turnSecret == "" {
+		return nil
+	}
+	var uris []string
+	if dtlsAddr := s.turnSrv.DTLSAddr(); dtlsAddr != nil {
+		uris = append(uris, "turns:"+s.formatAdvertisedAddr(dtlsAddr))
+	}
+	if tlsAddr := s.turnSrv.TLSAddr(); tlsAddr != nil {
+		uris = append(uris, "turns:"+s.formatAdvertisedAddr(tlsAddr)+"?transport=tcp")
+	}
+	if len(uris) == 0 {
+		return nil
+	}
+	const ttl = 12 * time.Hour
+	user, pass, err := turnserver.GenerateCredentials(s.turnSecret, peerID, ttl)
+	if err != nil {
+		return nil
+	}
+	return &protocol.RelayInfo{
+		URIs:       uris,
+		Username:   user,
+		Credential: pass,
+		ExpiresAt:  s.nowFunc().Add(ttl).Unix(),
+	}
+}
+
+func (s *Server) formatAdvertisedAddr(addr net.Addr) string {
+	host, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	if s.cfg.TURNAdvertiseHost != "" {
+		return net.JoinHostPort(s.cfg.TURNAdvertiseHost, port)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsUnspecified() {
+		if s.cfg.TURNPublicIP != nil {
+			return net.JoinHostPort(s.cfg.TURNPublicIP.String(), port)
+		}
+		if u, uErr := url.Parse(s.hubOrigin); uErr == nil && u.Hostname() != "" {
+			return net.JoinHostPort(u.Hostname(), port)
+		}
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -691,7 +782,6 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// Issue single-use 32-byte registration challenge expiring in 60s (Section 3).
 	challenge, err := protocol.NewChallenge()
 	if err != nil {
 		_ = conn.Close(websocket.StatusInternalError, "internal_error")
@@ -701,11 +791,12 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 	challengeExp := now.Add(s.cfg.ChallengeTTL)
 
 	chalRaw, err := json.Marshal(protocol.ChallengeMessage{
-		V:         protocol.Version,
-		Type:      protocol.TypeChallenge,
-		Challenge: challenge,
-		HubOrigin: s.hubOrigin,
-		ExpiresAt: challengeExp.Unix(),
+		V:                  protocol.Version,
+		Type:               protocol.TypeChallenge,
+		Challenge:          challenge,
+		HubOrigin:          s.hubOrigin,
+		ExpiresAt:          challengeExp.Unix(),
+		PassphraseRequired: s.hasPassphrase,
 	})
 	if err != nil {
 		_ = conn.Close(websocket.StatusInternalError, "internal_error")
@@ -719,7 +810,6 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Phase 1: Require registration within ChallengeTTL; challenge is strictly single-use.
 	regCtx, regCancel := context.WithTimeout(ctx, s.cfg.ChallengeTTL)
 	msgType, rawReg, err := conn.Read(regCtx)
 	regCancel()
@@ -739,7 +829,7 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ps, errCode, errDetail := s.authenticateRegistration(ctx, conn, cancel, remoteIP, challenge, challengeExp, rawReg)
+	ps, errCode, errDetail := s.authenticateRegistration(conn, cancel, remoteIP, challenge, challengeExp, rawReg)
 	if ps == nil {
 		s.regFailed.Add(1)
 		s.log.Warn("peer registration rejected", "remote_ip", remoteIP, "code", errCode)
@@ -759,11 +849,11 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 		PeerID:               ps.peerID,
 		ExpiresAt:            time.Unix(0, ps.expiresAt.Load()).Unix(),
 		HeartbeatIntervalSec: hbSec,
+		Relay:                s.buildRelayInfoForPeer(ps.peerID),
 	}); err != nil {
 		return
 	}
 
-	// Phase 2: Authenticated control-plane loop.
 	for !ps.closed.Load() && !s.closed.Load() {
 		mType, raw, readErr := conn.Read(ctx)
 		if readErr != nil {
@@ -803,14 +893,12 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authenticateRegistration(
-	_ context.Context,
 	conn *websocket.Conn,
 	cancel context.CancelFunc,
-	remoteIP string,
-	expectedChallenge string,
+	remoteIP, expectedChallenge string,
 	challengeExp time.Time,
 	raw []byte,
-) (*peerSession, string, string) {
+) (sess *peerSession, errCode, errDetail string) {
 	hdr, err := protocol.PeekHeader(raw, s.cfg.MaxMessageBytes)
 	if err != nil {
 		return nil, classifyHeaderErr(err), "invalid message header"
@@ -838,25 +926,25 @@ func (s *Server) authenticateRegistration(
 	if err := identity.VerifyRegistrationChallenge(pub, reg.PeerID, expectedChallenge, s.hubOrigin, reg.Proof); err != nil {
 		return nil, protocol.ErrCodeAuthFailed, "invalid challenge proof"
 	}
-	vp, err := s.trust.VerifyPeer(reg.PeerID, pub, reg.Membership)
-	if err != nil {
-		return nil, protocol.ErrCodeAuthFailed, "peer not trusted or revoked"
+	if s.hasPassphrase {
+		if err := identity.VerifyHubPassphraseProofWithKey(s.hubKey, expectedChallenge, s.hubOrigin, reg.PeerID, reg.HubAuth); err != nil {
+			return nil, protocol.ErrCodeAuthFailed, "invalid hub passphrase proof"
+		}
 	}
-	s.trust.CacheVerifiedPeer(vp)
 
 	ps := &peerSession{
 		conn:       conn,
 		remoteIP:   remoteIP,
-		peerID:     vp.PeerID,
-		publicKey:  vp.PublicKey,
-		membership: vp.Membership,
+		peerID:     reg.PeerID,
+		publicKey:  pub,
 		cancel:     cancel,
+		subscribed: make(map[string]struct{}),
+		broadcasts: make(map[string]struct{}),
 	}
 	ps.expiresAt.Store(now.Add(s.cfg.PresenceTTL).UnixNano())
 
 	s.mu.Lock()
 	existing := s.sessions[ps.peerID]
-	// Prune any closed/expired sessions for this peer first.
 	active := existing[:0]
 	for _, old := range existing {
 		if !old.closed.Load() && now.UnixNano() <= old.expiresAt.Load() {
@@ -879,6 +967,7 @@ func (s *Server) unregisterSession(ps *peerSession) {
 	ps.closed.Store(true)
 	ps.cancel()
 
+	var affectedChannels []string
 	s.mu.Lock()
 	list := s.sessions[ps.peerID]
 	kept := list[:0]
@@ -892,8 +981,29 @@ func (s *Server) unregisterSession(ps *peerSession) {
 	} else {
 		s.sessions[ps.peerID] = kept
 	}
+
+	for chID := range ps.subscribed {
+		if subs, ok := s.channelSubs[chID]; ok {
+			delete(subs, ps)
+			if len(subs) == 0 {
+				delete(s.channelSubs, chID)
+			}
+		}
+	}
+	for chID := range ps.broadcasts {
+		if members, ok := s.channels[chID]; ok {
+			delete(members, ps.peerID)
+			if len(members) == 0 {
+				delete(s.channels, chID)
+			}
+			affectedChannels = append(affectedChannels, chID)
+		}
+	}
 	s.mu.Unlock()
 
+	for _, chID := range affectedChannels {
+		s.notifyChannelSubscribers(chID)
+	}
 	_ = ps.conn.Close(websocket.StatusNormalClosure, "closed")
 }
 
@@ -906,18 +1016,6 @@ func (s *Server) handleAuthenticatedMessage(ctx context.Context, ps *peerSession
 			Type: protocol.TypeError,
 			Code: classifyHeaderErr(err),
 		})
-		return
-	}
-
-	if s.trust.IsRevoked(ps.peerID) {
-		s.sigRejected.Add(1)
-		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
-			V:    protocol.Version,
-			Type: protocol.TypeError,
-			Code: protocol.ErrCodeAuthFailed,
-		})
-		ps.closed.Store(true)
-		ps.cancel()
 		return
 	}
 
@@ -935,14 +1033,19 @@ func (s *Server) handleAuthenticatedMessage(ctx context.Context, ps *peerSession
 		}
 		ps.expiresAt.Store(s.nowFunc().Add(s.cfg.PresenceTTL).UnixNano())
 
-	case protocol.TypeLookup:
-		s.handleLookup(ctx, ps, raw)
+	case protocol.TypeChannelJoin:
+		s.handleChannelJoin(ctx, ps, raw)
+
+	case protocol.TypeChannelLeave:
+		s.handleChannelLeave(ctx, ps, raw)
+
+	case protocol.TypeBroadcast:
+		s.handleBroadcast(ctx, ps, raw)
 
 	case protocol.TypeOffer, protocol.TypeAnswer, protocol.TypeCandidate, protocol.TypeEndOfCandidates, protocol.TypeClose:
 		s.handlePeerSignal(ctx, ps, raw)
 
 	default:
-		// Client MUST NOT send challenge, registered, lookup_result, error, or duplicate register.
 		s.sigRejected.Add(1)
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
 			V:    protocol.Version,
@@ -952,19 +1055,10 @@ func (s *Server) handleAuthenticatedMessage(ctx context.Context, ps *peerSession
 	}
 }
 
-func (s *Server) handleLookup(ctx context.Context, ps *peerSession, raw []byte) {
-	if !s.peerLookRate.Allow(ps.peerID) {
-		s.rateDropped.Add(1)
-		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
-			V:    protocol.Version,
-			Type: protocol.TypeError,
-			Code: protocol.ErrCodeRateLimited,
-		})
-		return
-	}
-	var req protocol.LookupMessage
-	if err := jcs.UnmarshalStrict(raw, &req); err != nil {
-		s.lookDenied.Add(1)
+func (s *Server) handleChannelJoin(ctx context.Context, ps *peerSession, raw []byte) {
+	var msg protocol.ChannelJoinMessage
+	if err := jcs.UnmarshalStrict(raw, &msg); err != nil {
+		s.sigRejected.Add(1)
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
 			V:    protocol.Version,
 			Type: protocol.TypeError,
@@ -972,52 +1066,204 @@ func (s *Server) handleLookup(ctx context.Context, ps *peerSession, raw []byte) 
 		})
 		return
 	}
-	if err := identity.ValidatePeerID(req.Target); err != nil {
-		s.lookDenied.Add(1)
+	if err := identity.ValidateChannelID(msg.ChannelID); err != nil {
+		s.sigRejected.Add(1)
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
 			V:    protocol.Version,
 			Type: protocol.TypeError,
-			Code: protocol.ErrCodeUnknownPeer,
+			Code: protocol.ErrCodeMalformedMessage,
 		})
 		return
 	}
 
-	targetSess := s.latestOnlineSession(req.Target)
-	var targetPub identity.PublicKey
-	var targetMem *identity.MembershipRecord
-	if targetSess != nil {
-		targetPub = targetSess.publicKey
-		targetMem = targetSess.membership
-	}
-	targetVP, err := s.trust.VerifyPeer(req.Target, targetPub, targetMem)
-	if err != nil {
-		s.lookDenied.Add(1)
+	s.mu.Lock()
+	if _, exists := ps.subscribed[msg.ChannelID]; !exists && len(ps.subscribed) >= s.cfg.MaxChannelsPerPeer {
+		s.mu.Unlock()
+		s.sigRejected.Add(1)
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
 			V:    protocol.Version,
 			Type: protocol.TypeError,
-			Code: protocol.ErrCodeUnknownPeer,
+			Code: protocol.ErrCodeRateLimited,
 		})
 		return
 	}
-	if err := s.trust.AuthorizePair(ps.peerID, req.Target, ps.membership, targetVP.Membership); err != nil {
-		s.lookDenied.Add(1)
-		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
-			V:    protocol.Version,
-			Type: protocol.TypeError,
-			Code: protocol.ErrCodeUnauthorizedPair,
-		})
-		return
+	ps.subscribed[msg.ChannelID] = struct{}{}
+	subs, ok := s.channelSubs[msg.ChannelID]
+	if !ok {
+		subs = make(map[*peerSession]struct{})
+		s.channelSubs[msg.ChannelID] = subs
 	}
+	subs[ps] = struct{}{}
+	peers := s.snapshotChannelPeersLocked(msg.ChannelID)
+	s.mu.Unlock()
 
-	s.lookOK.Add(1)
-	_ = ps.sendJSON(ctx, protocol.LookupResultMessage{
-		V:          protocol.Version,
-		Type:       protocol.TypeLookupResult,
-		Target:     req.Target,
-		Online:     targetSess != nil,
-		PublicKey:  identity.EncodePublicKey(targetVP.PublicKey),
-		Membership: targetVP.Membership,
+	_ = ps.sendJSON(ctx, protocol.ChannelPeersMessage{
+		V:         protocol.Version,
+		Type:      protocol.TypeChannelPeers,
+		ChannelID: msg.ChannelID,
+		Peers:     peers,
 	})
+}
+
+func (s *Server) handleChannelLeave(ctx context.Context, ps *peerSession, raw []byte) {
+	var msg protocol.ChannelLeaveMessage
+	if err := jcs.UnmarshalStrict(raw, &msg); err != nil {
+		s.sigRejected.Add(1)
+		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
+			V:    protocol.Version,
+			Type: protocol.TypeError,
+			Code: protocol.ErrCodeMalformedMessage,
+		})
+		return
+	}
+	if err := identity.ValidateChannelID(msg.ChannelID); err != nil {
+		s.sigRejected.Add(1)
+		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
+			V:    protocol.Version,
+			Type: protocol.TypeError,
+			Code: protocol.ErrCodeMalformedMessage,
+		})
+		return
+	}
+
+	removedBroadcast := false
+	s.mu.Lock()
+	delete(ps.subscribed, msg.ChannelID)
+	if subs, ok := s.channelSubs[msg.ChannelID]; ok {
+		delete(subs, ps)
+		if len(subs) == 0 {
+			delete(s.channelSubs, msg.ChannelID)
+		}
+	}
+	if _, wasBroadcasting := ps.broadcasts[msg.ChannelID]; wasBroadcasting {
+		delete(ps.broadcasts, msg.ChannelID)
+		if members, ok := s.channels[msg.ChannelID]; ok {
+			delete(members, ps.peerID)
+			if len(members) == 0 {
+				delete(s.channels, msg.ChannelID)
+			}
+			removedBroadcast = true
+		}
+	}
+	s.mu.Unlock()
+
+	if removedBroadcast {
+		s.notifyChannelSubscribers(msg.ChannelID)
+	}
+}
+
+func (s *Server) handleBroadcast(ctx context.Context, ps *peerSession, raw []byte) {
+	var msg protocol.BroadcastMessage
+	if err := jcs.UnmarshalStrict(raw, &msg); err != nil {
+		s.sigRejected.Add(1)
+		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
+			V:    protocol.Version,
+			Type: protocol.TypeError,
+			Code: protocol.ErrCodeMalformedMessage,
+		})
+		return
+	}
+	if msg.PeerID != ps.peerID {
+		s.sigRejected.Add(1)
+		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
+			V:    protocol.Version,
+			Type: protocol.TypeError,
+			Code: protocol.ErrCodeSenderMismatch,
+		})
+		return
+	}
+	pub, err := protocol.VerifyBroadcast(&msg)
+	if err != nil || !pub.Equal(ps.publicKey) {
+		s.sigRejected.Add(1)
+		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
+			V:    protocol.Version,
+			Type: protocol.TypeError,
+			Code: protocol.ErrCodeInvalidSignature,
+		})
+		return
+	}
+
+	s.mu.Lock()
+	if msg.Active {
+		if _, exists := ps.broadcasts[msg.ChannelID]; !exists && len(ps.broadcasts) >= s.cfg.MaxChannelsPerPeer {
+			s.mu.Unlock()
+			s.sigRejected.Add(1)
+			_ = ps.sendJSON(ctx, protocol.ErrorMessage{
+				V:    protocol.Version,
+				Type: protocol.TypeError,
+				Code: protocol.ErrCodeRateLimited,
+			})
+			return
+		}
+		ps.broadcasts[msg.ChannelID] = struct{}{}
+		members, ok := s.channels[msg.ChannelID]
+		if !ok {
+			members = make(map[string]protocol.BroadcastPeer)
+			s.channels[msg.ChannelID] = members
+		}
+		members[ps.peerID] = protocol.BroadcastPeer{
+			PeerID:     msg.PeerID,
+			PublicKey:  msg.PublicKey,
+			SealedMeta: msg.SealedMeta,
+			Timestamp:  msg.Timestamp,
+			Sig:        msg.Sig,
+		}
+	} else {
+		delete(ps.broadcasts, msg.ChannelID)
+		if members, ok := s.channels[msg.ChannelID]; ok {
+			delete(members, ps.peerID)
+			if len(members) == 0 {
+				delete(s.channels, msg.ChannelID)
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	s.bcastCount.Add(1)
+	s.notifyChannelSubscribers(msg.ChannelID)
+}
+
+func (s *Server) snapshotChannelPeersLocked(channelID string) []protocol.BroadcastPeer {
+	members := s.channels[channelID]
+	out := make([]protocol.BroadcastPeer, 0, len(members))
+	for _, bp := range members {
+		out = append(out, bp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].PeerID < out[j].PeerID
+	})
+	return out
+}
+
+func (s *Server) notifyChannelSubscribers(channelID string) {
+	s.mu.RLock()
+	subsMap := s.channelSubs[channelID]
+	if len(subsMap) == 0 {
+		s.mu.RUnlock()
+		return
+	}
+	subs := make([]*peerSession, 0, len(subsMap))
+	for sub := range subsMap {
+		if !sub.closed.Load() {
+			subs = append(subs, sub)
+		}
+	}
+	peers := s.snapshotChannelPeersLocked(channelID)
+	s.mu.RUnlock()
+
+	payload, err := json.Marshal(protocol.ChannelPeersMessage{
+		V:         protocol.Version,
+		Type:      protocol.TypeChannelPeers,
+		ChannelID: channelID,
+		Peers:     peers,
+	})
+	if err != nil {
+		return
+	}
+	ctx := context.Background()
+	for _, sub := range subs {
+		_ = sub.sendRaw(ctx, payload)
+	}
 }
 
 func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []byte) {
@@ -1032,44 +1278,12 @@ func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []by
 		return
 	}
 
-	// Section 4.1: Authenticated WSS session determines sender identity.
 	if env.From != ps.peerID {
 		s.sigRejected.Add(1)
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
 			V:         protocol.Version,
 			Type:      protocol.TypeError,
 			Code:      protocol.ErrCodeSenderMismatch,
-			SessionID: env.SessionID,
-		})
-		return
-	}
-
-	targetSess := s.latestOnlineSession(env.To)
-	var targetPub identity.PublicKey
-	var targetMem *identity.MembershipRecord
-	if targetSess != nil {
-		targetPub = targetSess.publicKey
-		targetMem = targetSess.membership
-	}
-
-	// Verify recipient identity and ACL authorization before signature/presence disclosure.
-	targetVP, err := s.trust.VerifyPeer(env.To, targetPub, targetMem)
-	if err != nil {
-		s.sigRejected.Add(1)
-		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
-			V:         protocol.Version,
-			Type:      protocol.TypeError,
-			Code:      protocol.ErrCodeUnknownPeer,
-			SessionID: env.SessionID,
-		})
-		return
-	}
-	if err := s.trust.AuthorizePair(ps.peerID, env.To, ps.membership, targetVP.Membership); err != nil {
-		s.sigRejected.Add(1)
-		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
-			V:         protocol.Version,
-			Type:      protocol.TypeError,
-			Code:      protocol.ErrCodeUnauthorizedPair,
 			SessionID: env.SessionID,
 		})
 		return
@@ -1091,7 +1305,6 @@ func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []by
 		return
 	}
 
-	// Enforce session, generation, monotonic sequence, replay rejection, and candidate bounds.
 	if errCode := s.validateAndRecordSequence(env, now); errCode != "" {
 		s.sigRejected.Add(1)
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
@@ -1103,7 +1316,6 @@ func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []by
 		return
 	}
 
-	// Section 4.2: No offline payload mailbox — recipient must be online.
 	recipients := s.onlineSessions(env.To)
 	if len(recipients) == 0 {
 		s.sigRejected.Add(1)
@@ -1130,6 +1342,9 @@ func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []by
 			delivered = true
 		}
 	}
+	if env.Type == protocol.TypeClose {
+		s.markNegotiationClosed(env.SessionID)
+	}
 	if !delivered {
 		s.sigRejected.Add(1)
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
@@ -1149,12 +1364,6 @@ func (s *Server) validateAndRecordSequence(env *protocol.SignalEnvelope, now tim
 
 	rec, exists := s.negotiations[env.SessionID]
 	if !exists {
-		if env.Type != protocol.TypeOffer && env.Type != protocol.TypeClose {
-			// New session must begin with offer (or cancellation close) at seq 0.
-			if env.Seq != 0 {
-				return protocol.ErrCodeReplayedSignaling
-			}
-		}
 		if env.Seq != 0 {
 			return protocol.ErrCodeReplayedSignaling
 		}
@@ -1171,7 +1380,6 @@ func (s *Server) validateAndRecordSequence(env *protocol.SignalEnvelope, now tim
 		}
 		s.negotiations[env.SessionID] = rec
 	} else {
-		// Verify session belongs to this exact peer pair.
 		validPair := (rec.peerA == env.From && rec.peerB == env.To) || (rec.peerA == env.To && rec.peerB == env.From)
 		if !validPair || rec.closed {
 			return protocol.ErrCodeReplayedSignaling
@@ -1204,10 +1412,15 @@ func (s *Server) validateAndRecordSequence(env *protocol.SignalEnvelope, now tim
 	}
 	sg.nextSeq = env.Seq + 1
 	rec.updatedAt = now
-	if env.Type == protocol.TypeClose {
+	return ""
+}
+
+func (s *Server) markNegotiationClosed(sessionID string) {
+	s.mu.Lock()
+	if rec, ok := s.negotiations[sessionID]; ok {
 		rec.closed = true
 	}
-	return ""
+	s.mu.Unlock()
 }
 
 func (s *Server) evictOldestNegotiationLocked(now time.Time) {
@@ -1229,14 +1442,6 @@ func (s *Server) evictOldestNegotiationLocked(now time.Time) {
 	}
 }
 
-func (s *Server) latestOnlineSession(peerID string) *peerSession {
-	all := s.onlineSessions(peerID)
-	if len(all) == 0 {
-		return nil
-	}
-	return all[len(all)-1]
-}
-
 func (s *Server) onlineSessions(peerID string) []*peerSession {
 	nowNano := s.nowFunc().UnixNano()
 	s.mu.RLock()
@@ -1252,24 +1457,6 @@ func (s *Server) onlineSessions(peerID string) []*peerSession {
 	return out
 }
 
-func (s *Server) evictRevokedSessions() {
-	s.mu.Lock()
-	var toClose []*peerSession
-	for pid, list := range s.sessions {
-		if s.trust.IsRevoked(pid) {
-			toClose = append(toClose, list...)
-			delete(s.sessions, pid)
-		}
-	}
-	s.mu.Unlock()
-
-	for _, ps := range toClose {
-		ps.closed.Store(true)
-		ps.cancel()
-		_ = ps.conn.Close(websocket.StatusPolicyViolation, "peer_revoked")
-	}
-}
-
 func (s *Server) reapLoop() {
 	defer s.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
@@ -1280,46 +1467,46 @@ func (s *Server) reapLoop() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			now := s.nowFunc()
-			nowNano := now.UnixNano()
-			negTTL := s.cfg.SignalingTTL + 2*s.cfg.MaxClockSkew + 2*time.Minute
-
-			var expired []*peerSession
-			s.mu.Lock()
-			for pid, list := range s.sessions {
-				kept := list[:0]
-				for _, ps := range list {
-					if ps.closed.Load() || nowNano > ps.expiresAt.Load() {
-						expired = append(expired, ps)
-					} else {
-						kept = append(kept, ps)
-					}
-				}
-				if len(kept) == 0 {
-					delete(s.sessions, pid)
-				} else {
-					s.sessions[pid] = kept
-				}
-			}
-			for id, rec := range s.negotiations {
-				if now.Sub(rec.updatedAt) > negTTL {
-					delete(s.negotiations, id)
-				}
-			}
-			s.mu.Unlock()
-
-			for _, ps := range expired {
-				ps.closed.Store(true)
-				ps.cancel()
-				_ = ps.conn.Close(websocket.StatusPolicyViolation, "presence_expired")
-			}
+			s.reapExpired()
 		}
 	}
 }
 
+func (s *Server) reapExpired() {
+	now := s.nowFunc()
+	nowNano := now.UnixNano()
+	negTTL := s.cfg.SignalingTTL + 2*s.cfg.MaxClockSkew + time.Minute
+
+	var expired []*peerSession
+	s.mu.Lock()
+	for pid, list := range s.sessions {
+		kept := list[:0]
+		for _, ps := range list {
+			if ps.closed.Load() || nowNano > ps.expiresAt.Load() {
+				expired = append(expired, ps)
+				continue
+			}
+			kept = append(kept, ps)
+		}
+		if len(kept) == 0 {
+			delete(s.sessions, pid)
+		} else {
+			s.sessions[pid] = kept
+		}
+	}
+	for sid, rec := range s.negotiations {
+		if now.Sub(rec.updatedAt) > negTTL {
+			delete(s.negotiations, sid)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, ps := range expired {
+		s.unregisterSession(ps)
+	}
+}
+
 func (s *Server) writeErrorDirect(ctx context.Context, conn *websocket.Conn, code, detail, sessionID string) {
-	wctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	raw, err := json.Marshal(protocol.ErrorMessage{
 		V:         protocol.Version,
 		Type:      protocol.TypeError,
@@ -1330,6 +1517,8 @@ func (s *Server) writeErrorDirect(ctx context.Context, conn *websocket.Conn, cod
 	if err != nil {
 		return
 	}
+	wctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	_ = conn.Write(wctx, websocket.MessageText, raw)
 }
 

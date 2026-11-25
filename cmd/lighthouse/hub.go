@@ -14,7 +14,6 @@ import (
 	"lighthouse-in-snoo/internal/hub"
 	"lighthouse-in-snoo/internal/stunserver"
 	"lighthouse-in-snoo/internal/turnserver"
-	"lighthouse-in-snoo/pkg/identity"
 )
 
 func newHubCommand() *cli.Command {
@@ -22,33 +21,34 @@ func newHubCommand() *cli.Command {
 		httpsAddr        string
 		stunsAddr        string
 		stunAddr         string
+		passphrase       string
 		tcpOnly          bool
 		insecure         bool
+		noRelay          bool
 		turnTLSAddr      string
 		turnSecret       string
-		turnUsersRaw     string
 		turnRealm        string
 		turnPublicIPStr  string
+		turnAdvHost      string
 		turnRelayMinPort int
 		turnRelayMaxPort int
 		hubOrigin        string
 		tlsCert          string
 		tlsKey           string
-		policyPath       string
-		sqlitePath       string
 		hbInterval       time.Duration
 		presenceTTL      time.Duration
 	)
 
 	cmd := &cli.Command{
 		Name:       "hub",
-		ShortAbout: "Run the HTTPS/WSS signaling and STUNS/TURNS server",
-		LongAbout:  "Run the Lighthouse server exposing TLS 1.3 HTTPS/WSS signaling (/healthz, /v1/signal) and DTLS 1.3 over UDP STUNS/TURNS (:5349/udp). Pass --tcp-only to disable UDP and serve STUNS/TURNS over TLS 1.3/TCP only. Plaintext STUN/TURN requires --insecure. Send SIGHUP to reload policy and revocations.",
+		ShortAbout: "Run the zero-config universal signaling hub and relay",
+		LongAbout:  "Run a stateless Lighthouse signaling hub and universal DTLS 1.3/UDP STUNS+TURNS relay with zero ACLs or policy files. Pass --passphrase to gate hub registration with an offline shared passphrase, or --tcp-only to disable UDP.",
 		Examples: []string{
-			"lighthouse hub --https-addr :8443 --stuns-addr :5349 --hub-origin wss://hub.example.com",
-			"lighthouse hub --stuns-addr :5349 --turn-secret <SECRET> --turn-public-ip 203.0.113.10",
-			"lighthouse hub --tcp-only --stuns-addr :5349 --policy /etc/lighthouse/policy.json",
-			"lighthouse hub --insecure --stun-addr :3478 --policy /etc/lighthouse/policy.json",
+			"lighthouse hub",
+			"lighthouse hub --https-addr :8443 --stuns-addr :5349 --hub-origin wss://hub.example.com --tls-cert tls.crt --tls-key tls.key",
+			"lighthouse hub --passphrase <SECRET> --turn-public-ip 203.0.113.10",
+			"lighthouse hub --tcp-only --stuns-addr :5349",
+			"lighthouse hub --insecure --stun-addr :3478",
 		},
 		Run: func(ctx *cli.Context) error {
 			logger := slog.New(slog.NewJSONHandler(ctx.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -59,12 +59,6 @@ func newHubCommand() *cli.Command {
 			}
 			if insecure && stunAddr == "" {
 				stunAddr = stunserver.DefaultInsecureSTUNAddr
-			}
-
-			turnUsers, err := turnserver.ParseStaticUsers(turnUsersRaw)
-			if err != nil {
-				logger.Error("invalid --turn-users", "err", err)
-				return &cli.ExitError{Code: 2, Err: err}
 			}
 
 			var turnPublicIP net.IP
@@ -83,32 +77,29 @@ func newHubCommand() *cli.Command {
 				return &cli.ExitError{Code: 2, Err: portErr}
 			}
 
-			policy, err := identity.LoadPolicyFile(policyPath)
-			if err != nil {
-				logger.Error("load policy failed", "path", policyPath, "err", err)
-				return err
-			}
+			enableRelay := !noRelay && !tcpOnly
+			autoTLS := tlsCert == "" && tlsKey == ""
 
-			srv, err := hub.New(hub.Config{
+			srv, err := hub.New(&hub.Config{
 				HTTPSListenAddr:    httpsAddr,
+				Passphrase:         passphrase,
 				TCPOnly:            tcpOnly,
 				AllowInsecure:      insecure,
 				EnableSTUN:         true,
 				STUNSListenAddr:    stunsAddr,
 				STUNListenAddr:     stunAddr,
-				EnableTURN:         turnSecret != "" || len(turnUsers) > 0,
+				EnableTURN:         enableRelay,
 				TURNSTLSListenAddr: turnTLSAddr,
 				TURNRealm:          turnRealm,
 				TURNSecret:         turnSecret,
-				TURNUsers:          turnUsers,
 				TURNPublicIP:       turnPublicIP,
+				TURNAdvertiseHost:  turnAdvHost,
 				TURNRelayMinPort:   uint16(turnRelayMinPort),
 				TURNRelayMaxPort:   uint16(turnRelayMaxPort),
 				HubOrigin:          hubOrigin,
 				TLSCertFile:        tlsCert,
 				TLSKeyFile:         tlsKey,
-				Policy:             policy,
-				SQLitePath:         sqlitePath,
+				AutoTLS:            autoTLS,
 				PresenceHeartbeat:  hbInterval,
 				PresenceTTL:        presenceTTL,
 				Logger:             logger,
@@ -124,30 +115,16 @@ func newHubCommand() *cli.Command {
 				"stun_udp_addr", fmt.Sprint(srv.STUNUDPAddr()),
 				"stun_tcp_addr", fmt.Sprint(srv.STUNTCPAddr()),
 				"tcp_only", tcpOnly,
-				"turn_active", srv.TURNActive(),
+				"relay_active", srv.TURNActive(),
+				"passphrase_gated", srv.PassphraseRequired(),
+				"auto_tls", autoTLS,
 				"insecure", insecure,
 				"hub_origin", srv.HubOrigin(),
 			)
 
 			sigCh := make(chan os.Signal, 2)
-			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-
-			for sig := range sigCh {
-				if sig == syscall.SIGHUP {
-					newPol, loadErr := identity.LoadPolicyFile(policyPath)
-					if loadErr != nil {
-						logger.Error("policy reload failed", "err", loadErr)
-						continue
-					}
-					if reloadErr := srv.ReloadPolicy(newPol); reloadErr != nil {
-						logger.Error("policy apply failed", "err", reloadErr)
-						continue
-					}
-					logger.Info("policy reloaded")
-					continue
-				}
-				break
-			}
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			<-sigCh
 
 			logger.Info("shutting down lighthouse hub")
 			if err := srv.Close(); err != nil {
@@ -169,22 +146,30 @@ func newHubCommand() *cli.Command {
 	cmd.StringOpt(&stunsAddr, cli.Option{
 		Long:      "stuns-addr",
 		ValueName: "ADDR",
-		ShortHelp: "DTLS 1.3 / UDP STUNS/TURNS listen address",
-		LongHelp:  "UDP listen address for DTLS 1.3 STUNS Binding (and TURNS when credentials are configured)",
+		ShortHelp: "Encrypted STUNS/TURNS listen address",
+		LongHelp:  "Listen address for DTLS 1.3/UDP STUNS+TURNS (or TLS 1.3/TCP STUNS with --tcp-only)",
 		EnvVar:    "LIGHTHOUSE_STUNS_ADDR",
 		Default:   ":5349",
 	})
 	cmd.StringOpt(&stunAddr, cli.Option{
 		Long:      "stun-addr",
 		ValueName: "ADDR",
-		ShortHelp: "Plaintext UDP STUN/TURN address (requires --insecure)",
-		LongHelp:  "Plaintext UDP listen address for unencrypted stun:/turn: traffic; rejected unless --insecure is set (defaults to :3478 with --insecure)",
+		ShortHelp: "Plaintext STUN/TURN address (requires --insecure)",
+		LongHelp:  "Plaintext listen address for unencrypted stun:/turn:; rejected unless --insecure is set (default :3478)",
 		EnvVar:    "LIGHTHOUSE_STUN_ADDR",
+	})
+	cmd.StringOpt(&passphrase, cli.Option{
+		Long:      "passphrase",
+		Short:     'P',
+		ValueName: "SECRET",
+		ShortHelp: "Optional offline hub passphrase",
+		LongHelp:  "Optional offline shared passphrase required to register on this hub (verified via challenge HMAC, never sent in plaintext)",
+		EnvVar:    "LIGHTHOUSE_PASSPHRASE",
 	})
 	cmd.BoolOpt(&tcpOnly, cli.Option{
 		Long:      "tcp-only",
-		ShortHelp: "Disable UDP; serve STUNS/TURNS over TLS 1.3/TCP only",
-		LongHelp:  "Opt in to sole-TCP mode: bind zero UDP sockets and serve STUNS/TURNS over TLS 1.3/TCP on --stuns-addr",
+		ShortHelp: "Disable UDP; serve STUNS over TLS 1.3/TCP only",
+		LongHelp:  "Opt in to sole-TCP mode: bind zero UDP sockets and serve STUNS over TLS 1.3/TCP",
 		EnvVar:    "LIGHTHOUSE_TCP_ONLY",
 	})
 	cmd.BoolOpt(&insecure, cli.Option{
@@ -193,25 +178,23 @@ func newHubCommand() *cli.Command {
 		LongHelp:  "Opt in to unencrypted STUN/TURN on --stun-addr alongside encrypted STUNS/TURNS",
 		EnvVar:    "LIGHTHOUSE_INSECURE",
 	})
+	cmd.BoolOpt(&noRelay, cli.Option{
+		Long:      "no-relay",
+		ShortHelp: "Disable integrated universal TURNS relay",
+		LongHelp:  "Serve STUNS Binding only without integrated TURNS relay allocations",
+		EnvVar:    "LIGHTHOUSE_NO_RELAY",
+	})
 	cmd.StringOpt(&turnSecret, cli.Option{
 		Long:      "turn-secret",
 		ValueName: "SECRET",
-		ShortHelp: "Shared secret for HMAC TURN REST credentials",
-		LongHelp:  "Enable authenticated DTLS 1.3 TURNS on --stuns-addr using time-limited TURN REST credentials",
+		ShortHelp: "Optional HMAC secret for universal TURNS credentials",
+		LongHelp:  "Optional shared secret for HMAC TURN REST credentials (auto-generated ephemerally when unset)",
 		EnvVar:    "LIGHTHOUSE_TURN_SECRET",
-	})
-	cmd.StringOpt(&turnUsersRaw, cli.Option{
-		Long:      "turn-users",
-		ValueName: "LIST",
-		ShortHelp: "Static TURN credentials (user=pass,...)",
-		LongHelp:  "Comma-separated static user=pass entries enabling authenticated DTLS 1.3 TURNS on --stuns-addr",
-		EnvVar:    "LIGHTHOUSE_TURN_USERS",
 	})
 	cmd.StringOpt(&turnRealm, cli.Option{
 		Long:      "turn-realm",
 		ValueName: "REALM",
 		ShortHelp: "TURN authentication realm",
-		LongHelp:  "RFC 8656 realm advertised by the integrated TURNS/TURN service",
 		EnvVar:    "LIGHTHOUSE_TURN_REALM",
 		Default:   turnserver.DefaultRealm,
 	})
@@ -219,80 +202,59 @@ func newHubCommand() *cli.Command {
 		Long:      "turn-public-ip",
 		ValueName: "IP",
 		ShortHelp: "Public IP advertised in TURN relay allocations",
-		LongHelp:  "Optional static public IPv4/IPv6 address returned in XOR-RELAYED-ADDRESS responses",
 		EnvVar:    "LIGHTHOUSE_TURN_PUBLIC_IP",
+	})
+	cmd.StringOpt(&turnAdvHost, cli.Option{
+		Long:      "turn-advertise-host",
+		ValueName: "HOST",
+		ShortHelp: "Host advertised to peers in universal relay URIs",
+		EnvVar:    "LIGHTHOUSE_TURN_ADVERTISE_HOST",
 	})
 	cmd.StringOpt(&turnTLSAddr, cli.Option{
 		Long:      "turn-tls-addr",
 		ValueName: "ADDR",
-		ShortHelp: "Optional TLS 1.3 / TCP TURNS fallback address",
-		LongHelp:  "Optional TCP listen address for TLS 1.3 TURNS (?transport=tcp fallback; DTLS/UDP on --stuns-addr is primary)",
+		ShortHelp: "Optional TLS 1.3/TCP TURNS fallback address",
 		EnvVar:    "LIGHTHOUSE_TURN_TLS_ADDR",
 	})
 	cmd.IntOpt(&turnRelayMinPort, cli.Option{
 		Long:      "turn-relay-min-port",
 		ValueName: "PORT",
 		ShortHelp: "Minimum UDP port for TURN relay allocations",
-		LongHelp:  "Optional lower bound of the UDP relay port range when --turn-public-ip is set",
 	})
 	cmd.IntOpt(&turnRelayMaxPort, cli.Option{
 		Long:      "turn-relay-max-port",
 		ValueName: "PORT",
 		ShortHelp: "Maximum UDP port for TURN relay allocations",
-		LongHelp:  "Optional upper bound of the UDP relay port range when --turn-public-ip is set",
 	})
 	cmd.StringOpt(&hubOrigin, cli.Option{
 		Long:      "hub-origin",
 		ValueName: "URL",
 		ShortHelp: "Canonical WSS hub origin",
-		LongHelp:  "Canonical wss://host[:port] origin verified in peer registration proofs",
 		EnvVar:    "LIGHTHOUSE_HUB_ORIGIN",
 		Default:   resolvedDefaultHubOrigin(),
 	})
 	cmd.StringOpt(&tlsCert, cli.Option{
 		Long:      "tls-cert",
 		ValueName: "PATH",
-		ShortHelp: "TLS/DTLS certificate PEM path",
-		LongHelp:  "Path to the PEM-encoded server certificate chain for TLS 1.3 WSS and DTLS 1.3 STUNS/TURNS",
+		ShortHelp: "TLS/DTLS certificate PEM path (ephemeral self-signed if omitted)",
 		EnvVar:    "LIGHTHOUSE_TLS_CERT",
-		Default:   "/etc/lighthouse/tls.crt",
 	})
 	cmd.StringOpt(&tlsKey, cli.Option{
 		Long:      "tls-key",
 		ValueName: "PATH",
-		ShortHelp: "TLS/DTLS private key PEM path",
-		LongHelp:  "Path to the PEM-encoded server private key for TLS 1.3 WSS and DTLS 1.3 STUNS/TURNS",
+		ShortHelp: "TLS/DTLS private key PEM path (ephemeral self-signed if omitted)",
 		EnvVar:    "LIGHTHOUSE_TLS_KEY",
-		Default:   "/etc/lighthouse/tls.key",
-	})
-	cmd.StringOpt(&policyPath, cli.Option{
-		Long:      "policy",
-		Short:     'p',
-		ValueName: "PATH",
-		ShortHelp: "Authorization policy JSON path",
-		LongHelp:  "Path to JSON policy containing trusted authorities, peers, ACLs, and revocations",
-		EnvVar:    "LIGHTHOUSE_POLICY",
-		Default:   "/etc/lighthouse/policy.json",
-	})
-	cmd.StringOpt(&sqlitePath, cli.Option{
-		Long:      "sqlite",
-		ValueName: "PATH",
-		ShortHelp: "Optional SQLite state DB path",
-		LongHelp:  "Optional persistent SQLite database merged with static policy configuration",
-		EnvVar:    "LIGHTHOUSE_SQLITE",
 	})
 	cmd.DurationOpt(&hbInterval, cli.Option{
 		Long:      "presence-heartbeat",
 		ValueName: "DURATION",
 		ShortHelp: "Presence heartbeat interval",
-		LongHelp:  "Heartbeat cadence advertised to registered peers",
 		Default:   "20s",
 	})
 	cmd.DurationOpt(&presenceTTL, cli.Option{
 		Long:      "presence-ttl",
 		ValueName: "DURATION",
 		ShortHelp: "Presence lease expiry",
-		LongHelp:  "Ephemeral presence lease lifetime before idle peers expire",
 		Default:   "60s",
 	})
 

@@ -5,24 +5,24 @@ import (
 	"os"
 
 	"lighthouse-in-snoo/internal/cli"
+	"lighthouse-in-snoo/pkg/version"
 )
 
 func newRootCommand() *cli.Command {
 	root := &cli.Command{
 		Name:       "lighthouse",
-		Version:    Version,
-		ShortAbout: "WebRTC Lighthouse hub, peer client, and admin CLI",
-		LongAbout:  "WebRTC Lighthouse hub, peer client, and policy administration tool.",
+		Version:    version.Version,
+		ShortAbout: "Zero-config Lighthouse universal signaling hub and relay",
+		LongAbout:  "Zero-config Lighthouse universal signaling hub and STUNS/TURNS relay. Peers authenticate independently and control connections via the Fyne TUN interface app (lighthouse-ui).",
 		Examples: []string{
-			"lighthouse hub --policy /etc/lighthouse/policy.json --tls-cert tls.crt --tls-key tls.key",
-			"lighthouse peer --key peer.key --policy policy.json --hub wss://hub.example.com/v1/signal --stun stuns:hub.example.com:5349",
-			"lighthouse admin keygen --out peer.key",
+			"lighthouse hub",
+			"lighthouse hub --tls-cert tls.crt --tls-key tls.key --hub-origin wss://hub.example.com",
+			"lighthouse hub --passphrase <SECRET> --turn-public-ip 203.0.113.10",
+			"lighthouse hub --tcp-only --stuns-addr :5349",
 		},
 	}
 
 	root.AddSubcommand(newHubCommand())
-	root.AddSubcommand(newPeerCommand())
-	root.AddSubcommand(newAdminCommand())
 	return root
 }
 

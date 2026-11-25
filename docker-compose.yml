@@ -14,7 +14,6 @@ services:
       - "5349:5349/udp"
     volumes:
       - ./config:/etc/lighthouse:ro
-      - lighthouse-state:/var/lib/lighthouse
     read_only: true
     tmpfs:
       - /tmp
@@ -23,6 +22,3 @@ services:
     security_opt:
       - no-new-privileges:true
     user: "10001:10001"
-
-volumes:
-  lighthouse-state:

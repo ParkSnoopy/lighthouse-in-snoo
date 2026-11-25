@@ -29,18 +29,25 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Static Analysis and Race Tests
+      - name: Install Fyne Linux Headers
         run: |
-          go vet ./...
-          CGO_ENABLED=0 GOARCH=amd64 go build -o bin/lighthouse ./cmd/lighthouse
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1-mesa-dev xorg-dev libxkbcommon-dev
+
+      - name: Static Analysis, Go-Critic, Builds, and Race Tests
+        run: |
+          make lint
+          make build
+          make build-ui
           go test -race -count=1 ./...
 
       - name: Resolve and Verify Version Alignment
         id: version
         run: |
           BIN_VER="$(./bin/lighthouse --version | awk '{print $2}')"
-          if [ -z "$BIN_VER" ]; then
-            echo "failed to resolve version from lighthouse --version" >&2
+          UI_VER="$(./bin/lighthouse-ui --version | awk '{print $2}')"
+          if [ -z "$BIN_VER" ] || [ "$BIN_VER" != "$UI_VER" ]; then
+            echo "version mismatch: lighthouse=${BIN_VER} lighthouse-ui=${UI_VER}" >&2
             exit 1
           fi
           RELEASE_VER="$BIN_VER"

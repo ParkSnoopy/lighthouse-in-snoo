@@ -37,22 +37,18 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		}
 		defer rawLn.Close()
 
-		// Hub MUST reject plaintext UDP STUNListenAddr without AllowInsecure=true.
-		if _, err := hub.New(hub.Config{
+		if _, err := hub.New(&hub.Config{
 			HTTPSListener:  rawLn,
 			TLSConfig:      pki.serverTLS,
 			HubOrigin:      "wss://" + rawLn.Addr().String(),
 			STUNListenAddr: "127.0.0.1:0",
-			Policy:         ids.policy,
 		}); !errors.Is(err, stunserver.ErrInsecureSTUNProhibited) {
 			t.Fatalf("expected ErrInsecureSTUNProhibited from hub.New, got %v", err)
 		}
 
-		// Peer MUST reject plaintext stun: and turn: without AllowInsecureICE=true.
 		for _, uri := range []string{"stun:127.0.0.1:3478", "turn:127.0.0.1:3478"} {
-			if _, err := peer.NewClient(peer.Config{
+			if _, err := peer.NewClient(&peer.Config{
 				KeyPair:        ids.peerA,
-				Policy:         ids.policy,
 				SignalingURL:   "wss://127.0.0.1:8443/v1/signal",
 				STUNServerURI:  uri,
 				TURNUsername:   "u",
@@ -66,13 +62,11 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 	t.Run("STUNSDTLS13RejectsUntrustedCA", func(t *testing.T) {
 		t.Parallel()
 		ids := newTestMeshIdentities(t)
-		_, _, _, wsURL, stunsURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+		_, _, _, wsURL, stunsURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
 		wrongCA := x509.NewCertPool()
-		client, err := peer.NewClient(peer.Config{
+		client, err := peer.NewClient(&peer.Config{
 			KeyPair:       ids.peerA,
-			Membership:    ids.memA,
-			Policy:        ids.policy,
 			SignalingURL:  wsURL,
 			TLSConfig:     &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, RootCAs: wrongCA},
 			STUNServerURI: stunsURI,
@@ -102,7 +96,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		wsURL := "wss://" + boundAddr + "/v1/signal"
 
 		const turnSecret = "lighthouse-turns-hmac-secret"
-		srv, err := hub.New(hub.Config{
+		srv, err := hub.New(&hub.Config{
 			HTTPSListener:     rawLn,
 			TLSConfig:         pki.serverTLS,
 			HubOrigin:         "wss://" + boundAddr,
@@ -111,7 +105,6 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			TURNSecret:        turnSecret,
 			TURNRealm:         "lighthouse",
 			TURNRelayBindAddr: "127.0.0.1",
-			Policy:            ids.policy,
 		})
 		if err != nil {
 			_ = rawLn.Close()
@@ -123,7 +116,6 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			t.Fatalf("expected TURNS DTLS 1.3 / UDP listener active, got turn=%v addr=%v", srv.TURNActive(), srv.STUNSAddr())
 		}
 
-		// Bare "turns:<ip>:<port>" automatically prioritizes DTLS 1.3 over UDP!
 		turnsURI := "turns:" + srv.STUNSAddr().String()
 		userA, passA, err := turnserver.GenerateCredentials(turnSecret, ids.peerA.PeerID, time.Hour)
 		if err != nil {
@@ -135,10 +127,8 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		}
 
 		sessBCh := make(chan *peer.Session, 1)
-		clientA, err := peer.NewClient(peer.Config{
+		clientA, err := peer.NewClient(&peer.Config{
 			KeyPair:            ids.peerA,
-			Membership:         ids.memA,
-			Policy:             ids.policy,
 			SignalingURL:       wsURL,
 			TLSConfig:          pki.clientTLS,
 			TURNServerURI:      turnsURI,
@@ -147,16 +137,15 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			ICETransportPolicy: webrtc.ICETransportPolicyRelay,
 			NetworkTypes:       []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:    true,
+			Consent:            allowAllConsent(),
 		})
 		if err != nil {
 			t.Fatalf("NewClient A (turns): %v", err)
 		}
 		defer clientA.Close()
 
-		clientB, err := peer.NewClient(peer.Config{
+		clientB, err := peer.NewClient(&peer.Config{
 			KeyPair:            ids.peerB,
-			Membership:         ids.memB,
-			Policy:             ids.policy,
 			SignalingURL:       wsURL,
 			TLSConfig:          pki.clientTLS,
 			TURNServerURI:      turnsURI,
@@ -165,6 +154,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			ICETransportPolicy: webrtc.ICETransportPolicyRelay,
 			NetworkTypes:       []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:    true,
+			Consent:            allowAllConsent(),
 			OnSession:          func(s *peer.Session) { sessBCh <- s },
 		})
 		if err != nil {
@@ -228,7 +218,6 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		turnNet := newVNetNIC(t, "203.0.113.10")
 		_ = wan.AddNet(turnNet)
 
-		// Completely block direct UDP between NAT A (203.0.113.51) and NAT B (203.0.113.52).
 		wan.AddChunkFilter(func(c vnet.Chunk) bool {
 			src := c.SourceAddr().(*net.UDPAddr).IP.String()
 			dst := c.DestinationAddr().(*net.UDPAddr).IP.String()
@@ -282,7 +271,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		boundAddr := rawLn.Addr().String()
 		wsURL := "wss://" + boundAddr + "/v1/signal"
 
-		srv, err := hub.New(hub.Config{
+		srv, err := hub.New(&hub.Config{
 			HTTPSListener:     rawLn,
 			TLSConfig:         pki.serverTLS,
 			HubOrigin:         "wss://" + boundAddr,
@@ -293,7 +282,6 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			TURNRelayBindAddr: "203.0.113.10",
 			TURNNet:           turnNet,
 			PionLoggerFactory: lf,
-			Policy:            ids.policy,
 		})
 		if err != nil {
 			_ = rawLn.Close()
@@ -302,10 +290,8 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		defer srv.Close()
 
 		sessBCh := make(chan *peer.Session, 1)
-		clientA, err := peer.NewClient(peer.Config{
+		clientA, err := peer.NewClient(&peer.Config{
 			KeyPair:           ids.peerA,
-			Membership:        ids.memA,
-			Policy:            ids.policy,
 			SignalingURL:      wsURL,
 			TLSConfig:         pki.clientTLS,
 			TURNServerURI:     "turns:203.0.113.10:5349",
@@ -315,16 +301,15 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			IncludeLoopback:   false,
 			VNet:              netA,
 			PionLoggerFactory: lf,
+			Consent:           allowAllConsent(),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer clientA.Close()
 
-		clientB, err := peer.NewClient(peer.Config{
+		clientB, err := peer.NewClient(&peer.Config{
 			KeyPair:           ids.peerB,
-			Membership:        ids.memB,
-			Policy:            ids.policy,
 			SignalingURL:      wsURL,
 			TLSConfig:         pki.clientTLS,
 			TURNServerURI:     "turns:203.0.113.10:5349",
@@ -334,6 +319,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			IncludeLoopback:   false,
 			VNet:              netB,
 			PionLoggerFactory: lf,
+			Consent:           allowAllConsent(),
 			OnSession:         func(s *peer.Session) { sessBCh <- s },
 		})
 		if err != nil {
@@ -379,7 +365,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		boundAddr := rawLn.Addr().String()
 		wsURL := "wss://" + boundAddr + "/v1/signal"
 
-		srv, err := hub.New(hub.Config{
+		srv, err := hub.New(&hub.Config{
 			HTTPSListener:     rawLn,
 			TLSConfig:         pki.serverTLS,
 			HubOrigin:         "wss://" + boundAddr,
@@ -388,7 +374,6 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			STUNListenAddr:    "127.0.0.1:0",
 			TURNUsers:         map[string]string{"u1": "p1"},
 			TURNRelayBindAddr: "127.0.0.1",
-			Policy:            ids.policy,
 		})
 		if err != nil {
 			_ = rawLn.Close()
@@ -398,10 +383,8 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 
 		turnURI := "turn:" + srv.STUNUDPAddr().String()
 		sessBCh := make(chan *peer.Session, 1)
-		clientA, err := peer.NewClient(peer.Config{
+		clientA, err := peer.NewClient(&peer.Config{
 			KeyPair:            ids.peerA,
-			Membership:         ids.memA,
-			Policy:             ids.policy,
 			SignalingURL:       wsURL,
 			TLSConfig:          pki.clientTLS,
 			TURNServerURI:      turnURI,
@@ -411,16 +394,15 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			ICETransportPolicy: webrtc.ICETransportPolicyRelay,
 			NetworkTypes:       []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:    true,
+			Consent:            allowAllConsent(),
 		})
 		if err != nil {
 			t.Fatalf("NewClient A insecure turn: %v", err)
 		}
 		defer clientA.Close()
 
-		clientB, err := peer.NewClient(peer.Config{
+		clientB, err := peer.NewClient(&peer.Config{
 			KeyPair:            ids.peerB,
-			Membership:         ids.memB,
-			Policy:             ids.policy,
 			SignalingURL:       wsURL,
 			TLSConfig:          pki.clientTLS,
 			TURNServerURI:      turnURI,
@@ -430,6 +412,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 			ICETransportPolicy: webrtc.ICETransportPolicyRelay,
 			NetworkTypes:       []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:    true,
+			Consent:            allowAllConsent(),
 			OnSession:          func(s *peer.Session) { sessBCh <- s },
 		})
 		if err != nil {

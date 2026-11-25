@@ -1,139 +1,120 @@
 # Protocol, Wire Formats, and Architecture
 
-## 1. Protocol Stack
+## 1. System Architecture
+
+Lighthouse separates the network into two components:
+
+1. **Zero-Config Universal Hub (`cmd/lighthouse` / `internal/hub`)**: A stateless `CGO_ENABLED=0` static `linux/amd64` server with no policy files, ACLs, or database. It provides:
+   - TLS 1.3 WSS signaling (`/v1/signal`) and privacy-preserving health endpoint (`/healthz`).
+   - Passphrase-bucketed broadcast forwarding (opaque 32-byte `channel_id` tokens; the hub never sees raw passphrases or decrypted peer labels).
+   - Optional offline shared hub passphrase gating (`--passphrase` / `LIGHTHOUSE_PASSPHRASE`) verified via challenge-bound HMAC.
+   - Integrated universal DTLS 1.3 / UDP STUNS + TURNS relay (`:5349/udp`) that automatically mints 12-hour HMAC TURN REST credentials in `registered.relay` for every registered peer (or TLS 1.3 / TCP STUNS with zero UDP sockets under `--tcp-only`).
+2. **Bound OS Virtual Interface App (`cmd/lighthouse-ui` / `internal/ui` / `pkg/tun` / `pkg/peer`)**: A Fyne desktop application that binds a local OS TUN virtual interface (`lh0`, RFC 6598 `100.64.0.0/10`) directly to user-authorized DTLS 1.3 WebRTC tunnels.
+
+## 2. Protocol Stack
 
 ```text
-Application binary messages (<= 16 KiB per message)
-WebRTC DataChannel / DCEP ("data/v1", optional "packet/v1")
+OS IPv4 / IPv6 packets via TUN virtual interface (lh0, 100.64.0.0/10, MTU 1280)
+TUN Router (pkg/tun): strict cryptographic source-IP anti-spoofing
+WebRTC DataChannel / DCEP ("packet/v1" unordered datagrams, "data/v1" ordered fallback, <= 16 KiB)
 SCTP (congestion control active, max-message-size = 16384)
 DTLS 1.3 (RFC 9147, 0xFEFC, ECDHE + AEAD, replay window = 64, 0-RTT disabled)
-ICE-selected UDP transport (host / srflx / prflx; relay permitted only with configured turns:/turn:)
+ICE-selected UDP transport (host / srflx / prflx / universal DTLS 1.3 TURNS relay; or ICE-TCP with --tcp-only)
 IPv4 / IPv6
 ```
 
-Control-plane signaling runs out of band over `wss://<host>/v1/signal` using TLS 1.3 exclusively. Address discovery and optional TURN relaying prioritize **DTLS 1.3 over UDP** (`:5349/udp`, RFC 7350 + RFC 8489 + RFC 8656):
+Transport prioritization:
 
-- `stuns:<host>[:<port>]` (default port `5349`): runs STUN Binding over DTLS 1.3 / UDP on the shared ICE UDP socket so NAT mappings discovered over STUNS match direct UDP peer traffic.
-- `turns:<host>[:<port>]` (default port `5349`): prioritizes DTLS 1.3 / UDP (`?transport=udp`) automatically; `?transport=tcp` uses TLS 1.3 / TCP when explicitly requested.
-- Opt-in `--tcp-only` (`TCPOnly: true` / `LIGHTHOUSE_TCP_ONLY=true`): binds zero UDP sockets on hub and peers, serves STUNS/TURNS exclusively over TLS 1.3 / TCP (RFC 8489 stream framing on `:5349/tcp`), rejects `?transport=udp` and UDP candidates, and negotiates end-to-end DTLS 1.3 DataChannels over RFC 6544 / RFC 4571 ICE-TCP (`tcp4`/`tcp6`).
-- Plaintext `stun:` and `turn:` (default port `3478`) are rejected by default on both hub and peer and require explicit opt-in via `--insecure` (`AllowInsecure` / `AllowInsecureICE`).
+- `stuns:<host>[:<port>]` (default `5349`): STUN Binding over DTLS 1.3 / UDP on the shared ICE UDP socket.
+- `turns:<host>[:<port>]` (default `5349`): Universal relay over DTLS 1.3 / UDP (`?transport=udp`) by default; `?transport=tcp` uses TLS 1.3 / TCP when explicitly requested.
+- `--tcp-only` (`TCPOnly: true` / `LIGHTHOUSE_TCP_ONLY=true`): Binds zero UDP sockets on hub and peers, serves STUNS over TLS 1.3 / TCP (RFC 8489 framing on `:5349/tcp`), rejects `?transport=udp` and UDP candidates, and runs DTLS 1.3 DataChannels over RFC 6544 / RFC 4571 ICE-TCP.
+- Plaintext `stun:` and `turn:` (default `3478`) are rejected by default and require explicit `--insecure` (`AllowInsecure` / `AllowInsecureICE`).
 
-## 2. Cryptographic Identity and Trust
+## 3. Cryptographic Identity, Passphrase Scoping, and Consent Core
 
-### 2.1 Peer Identifiers and Key Algorithms
+### 3.1 Peer Identities and Deterministic Virtual IP
 
-- Supported identity and authority signing algorithms (`--algo`):
-  - `ed25519` (default, RFC 8032): raw 32-byte unpadded `base64url` wire `public_key`; `peer_id = base64url(SHA-256(raw_32_bytes))`.
+- Supported signing algorithms (`--algo`):
+  - `ed25519` (default, RFC 8032): unpadded `base64url` raw 32-byte key; `peer_id = base64url(SHA-256(raw_32_bytes))`.
   - `ed448` (RFC 8032): `ed448:<base64url(raw_57_bytes)>`; `peer_id = base64url(SHA-256("ed448\x00" || raw_57_bytes))`.
-  - `nistp-256` (ECDSA P-256 + SHA-256), `nistp-384` (ECDSA P-384 + SHA-384), `nistp-521` (ECDSA P-521 + SHA-512): `<algo>:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("<algo>\x00" || spki_der))`.
+  - `nistp-256`, `nistp-384`, `nistp-521`: `<algo>:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("<algo>\x00" || spki_der))`.
   - `rsa` (RSA-PSS + SHA-256, `2048`–`8192` bits, default `3072`): `rsa:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("rsa\x00" || spki_der))`.
-- Private keys are stored with `0600` file permissions; `pkg/identity.LoadKeyPair` rejects group/world-accessible key files.
-- Every `peer_id` is a 43-character unpadded `base64url` SHA-256 digest.
+- Private keys and local blacklist files (`blacklist.json`) are saved atomically with `0600` permissions and rejected if group/world-accessible.
+- Every `peer_id` deterministically maps to a unique RFC 6598 TUN IPv4 address via `SHA-256("LIGHTHOUSE-TUN-IPV4-V2\x00" || peer_id)` mapped into `100.64.0.0/10`.
 
-### 2.2 Domain-Separated Signatures
+### 3.2 Offline Passphrase Derivation
 
-All cryptographic signatures use RFC 8785 JSON Canonicalization Scheme (`internal/jcs`), rejecting invalid UTF-8, duplicate object keys at any nesting depth, trailing tokens, and out-of-schema fields prior to canonicalization.
+Raw passphrases never leave the peer or hub process:
+
+1. **Broadcast Channels (`identity.DeriveChannelKeys`)**: Argon2id (`time=1, memory=16 MiB, threads=2`, salt `"LIGHTHOUSE-CHANNEL-V2"`) derives 64 bytes:
+   - Bytes `[0:32]` → 43-char base64url `channel_id` sent to the hub to isolate broadcast routing.
+   - Bytes `[32:64]` → 32-byte XChaCha20-Poly1305 AEAD key (`AuthKey`) used to seal/open `BroadcastMeta` (`display_name`) with AAD `peer_id || "\x00" || channel_id`.
+2. **Optional Hub Passphrase (`identity.DeriveHubKey`)**: Argon2id (salt `"LIGHTHOUSE-HUB-KEY-V2"`) derives a 32-byte HMAC key. Registration submits `HMAC-SHA256(hubKey, "LIGHTHOUSE-HUB-AUTH-V2\x00" || challenge || "\x00" || hub_origin || "\x00" || peer_id)` verified in constant time.
+
+### 3.3 Explicit User Consent & Local Blacklist
+
+Security authorization lives exclusively at the user's client (`peer.ConsentHandler`):
+
+- Incoming offers are cryptographically verified (embedded `public_key` bound to `from` `peer_id`, JCS signature, TTL, replay history, SDP candidate policy) **before** prompting the user.
+- If `Consent == nil`, the client fails closed to `ConsentDeny`.
+- Incoming ICE candidates arriving while awaiting the user's modal prompt are buffered in `preConsentQueue` without blocking the signaling loop.
+- Decisions:
+  - `ConsentAllow`: applies remote SDP, sends signed Answer, completes DTLS 1.3 handshake, and binds the verified session into `tun.Router`.
+  - `ConsentDeny`: transmits signed `close` (`reason: "user_denied"`) and discards the offer.
+  - `ConsentBlacklist`: persists the peer to `blacklist.json` (`0600`), closes any active tunnel (`reason: "blacklisted"`), hides its broadcasts, and auto-rejects all future offers without prompting.
+
+### 3.4 Domain-Separated Signatures (v2)
+
+All signed frames use RFC 8785 JCS (`internal/jcs`), rejecting invalid UTF-8, duplicate object keys, trailing tokens, and unknown fields.
 
 | Purpose | Domain Prefix | Signed Payload |
 | --- | --- | --- |
-| Hub Registration | `"LIGHTHOUSE-REGISTER-V1\x00"` | `JCS({"challenge": "...", "hub_origin": "...", "peer_id": "..."})` |
-| Authority Membership | `"LIGHTHOUSE-MEMBERSHIP-V1\x00"` | `JCS(MembershipRecord excluding "sig")` |
-| P2P Signaling Envelope | `"LIGHTHOUSE-SIGNAL-V1\x00"` | `JCS(SignalEnvelope excluding "sig")` |
+| Hub Registration | `"LIGHTHOUSE-REGISTER-V1\x00"` | `JCS({"challenge", "hub_origin", "peer_id"})` |
+| Passphrase Broadcast | `"LIGHTHOUSE-BROADCAST-V2\x00"` | `JCS(BroadcastMessage excluding "sig")` |
+| P2P Signaling Envelope | `"LIGHTHOUSE-SIGNAL-V2\x00"` | `JCS(SignalEnvelope excluding "sig")` |
 
-### 2.3 Independent Authorization and Revocation
+## 4. Control-Plane Wire Protocol (v2)
 
-`pkg/identity.TrustVerifier` enforces default-deny authorization on both the hub and every peer:
-
-1. A peer identity must not appear in `revoked_peers`.
-2. Identity authenticity requires either a locally pinned `{peer_id, public_key}` entry or a valid, non-expired `MembershipRecord` signed by an offline authority in `trusted_authorities`.
-3. Pairwise communication requires explicit authorization in `acl_rules` (and must satisfy `allowed_peers` scopes if present in either peer's `MembershipRecord`).
-
-## 3. Control-Plane Wire Protocol
-
-### 3.1 Endpoints and Limits
-
-- `GET /healthz`: returns HTTP `200` `{"status":"ok"}` with `Cache-Control: no-store` and no peer state.
-- `WSS /v1/signal`: TLS 1.3 only (`MinVersion = MaxVersion = TLS 1.3`), UTF-8 JSON text frames only, max frame size `64 KiB` (`65536` bytes).
-- Registration challenges are 32 random bytes (`base64url`), single-use per WSS connection, expiring after `60 s`.
-- Presence leases default to `60 s` with `20 s` heartbeats.
-
-### 3.2 Message Types
+- `GET /healthz`: HTTP `200` `{"status":"ok"}`, `Cache-Control: no-store`.
+- `WSS /v1/signal`: TLS 1.3 exclusively, UTF-8 JSON text frames, `64 KiB` frame cap, single-use 32-byte challenges (`60 s` expiry), `20 s` heartbeats / `60 s` leases.
 
 | Type | Direction | Description |
 | --- | --- | --- |
-| `challenge` | Hub → Peer | Single-use 32-byte registration challenge and canonical `hub_origin` |
-| `register` | Peer → Hub | `peer_id`, `public_key`, optional `membership`, and `LIGHTHOUSE-REGISTER-V1` proof |
-| `registered` | Hub → Peer | Registration confirmation, lease expiry, and heartbeat interval |
+| `challenge` | Hub → Peer | Single-use challenge, canonical `hub_origin`, and `passphrase_required` flag |
+| `register` | Peer → Hub | `v:2`, `peer_id`, `public_key`, `hub_origin`, `challenge`, `proof`, optional `hub_auth` |
+| `registered` | Hub → Peer | Confirmation, lease TTL, heartbeat interval, and auto-minted universal `relay` credentials |
 | `heartbeat` | Peer → Hub | Presence lease renewal |
-| `lookup` | Peer → Hub | Authorized presence and identity query for `target` |
-| `lookup_result` | Hub → Peer | `online` boolean plus `public_key` and `membership` for independent verification |
-| `offer` | Peer → Peer | Signed envelope carrying `{"sdp": "<unmodified SDP offer>"}` |
-| `answer` | Peer → Peer | Signed envelope carrying `{"sdp": "<unmodified SDP answer>"}` |
-| `candidate` | Peer → Peer | Signed trickled ICE candidate (`candidate`, `sdpMid`, `sdpMLineIndex`, `usernameFragment`) |
-| `end_of_candidates` | Peer → Peer | Signed generation gathering completion (`usernameFragment`) |
-| `close` | Peer → Peer | Signed negotiation cancellation or closure (`reason`) |
+| `channel_join` | Peer → Hub | Subscribe to broadcasts for opaque `channel_id` |
+| `channel_leave` | Peer → Hub | Unsubscribe and withdraw any active broadcast on `channel_id` |
+| `broadcast` | Peer → Hub | Signed self-announcement (`active: true/false`, `sealed_meta`) scoped to `channel_id` |
+| `channel_peers` | Hub → Peer | Current snapshot of active signed broadcasts on `channel_id` |
+| `offer` / `answer` | Peer → Peer | Signed v2 envelope embedding sender `public_key` and unmodified SDP |
+| `candidate` / `end_of_candidates` | Peer → Peer | Signed v2 trickled ICE candidate / gathering terminator |
+| `close` | Peer → Peer | Signed v2 cancellation or closure (`user_denied`, `blacklisted`, `normal_close`) |
 | `error` | Hub → Peer | Machine-readable failure code (`code`, optional `detail`, optional `session_id`) |
 
-### 3.3 Ordering, Buffering, and Replay Protection
+FIFO ordering invariant: the hub delivers `close` frames to recipients before marking a negotiation record closed, and the peer client processes `error` and signaling envelopes in strict single-queue FIFO order so user-initiated close reasons (`user_denied`, `blacklisted`) are never preempted by post-close in-flight candidate rejections.
 
-- `session_id` is a random 128-bit identifier (`22`-character unpadded `base64url`).
-- `seq` starts at `0` and increments monotonically per `(from, session_id, generation)`.
-- Signaling TTL defaults to `60 s` with `30 s` maximum clock skew tolerance.
-- The hub verifies sender session binding (`env.from == session.peer_id`), ACL authorization, signature validity, monotonic `seq`, and the `128`-candidate limit per `(sender, generation)` before forwarding the unmodified JSON frame to online recipients.
-- Receiving peers independently verify identity, ACL, signature, expiry, session replay history, and generation freshness. Trickled candidates arriving prior to `SetRemoteDescription` are buffered in `seq` order (up to `128`) and installed only after the verified SDP is applied.
-- If WSS disconnects before a negotiation reaches `Connected`, the peer abandons that negotiation so subsequent attempts use a fresh `session_id`. Already-`Connected` direct sessions continue across hub outages.
+## 5. TUN Forwarding & Anti-Spoofing (`pkg/tun`)
 
-## 4. Transport, State Machine, and DataChannels
+`tun.Router` binds a `tun.Device` (Linux `/dev/net/tun` `IFF_TUN | IFF_NO_PI` or in-memory `MemoryDevice` for tests) to active peer sessions:
 
-### 4.1 ICE Server and Candidate Policy
+- **Outbound**: reads raw IP packets from TUN, verifies `src == localVirtualIP`, looks up the authorized `*peer.Session` by destination virtual IP, and transmits over `packet/v1` (falling back to `data/v1`). Unrouted or spoofed-source packets are dropped and counted.
+- **Inbound**: verifies `src == session.RemoteVirtualIP() && dst == localVirtualIP` on every packet arriving from a remote peer before writing to TUN. Any spoofed packet is dropped and counted (`DroppedSpoofed`).
 
-- Default secure schemes: `stuns:` and `turns:` (prioritizing DTLS 1.3 / UDP `:5349/udp` over TLS 1.3 / TCP).
-- Plaintext `stun:` and `turn:` fail closed (`ErrInsecureICEProhibited`) unless `--insecure` / `AllowInsecureICE: true` is set.
-- Peer ICE candidate admission:
-  - Direct-only UDP mode (default, no `turns:`/`turn:` configured): only UDP `host`, `srflx`, and `prflx` candidates are accepted; `relay` candidates, TCP candidates, `ice-lite`, audio/video media sections, and hub endpoints are rejected.
-  - TURN-enabled UDP mode (`turns:` or `--insecure` `turn:` configured): UDP `relay` candidates are admitted alongside `host`/`srflx`/`prflx` while retaining strict end-to-end DTLS 1.3 (`0xFEFC`) + SHA-256 fingerprint authentication between peers.
-  - Opt-in TCP-only mode (`--tcp-only` / `TCPOnly: true`): only TCP (`tcp4`/`tcp6`) ICE-TCP candidates are admitted via `ICETCPMux` (passive) and active TCP dialers; all UDP candidates, `?transport=udp` URIs, and hub endpoints are rejected while retaining strict end-to-end DTLS 1.3 (`0xFEFC`) + SHA-256 fingerprint authentication.
-- Concurrent offers for the same peer pair resolve deterministically: the offer from the lexicographically smaller `peer_id` wins.
+## 6. Reference Dependencies
 
-### 4.2 Connection State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> Disconnected
-    Disconnected --> Discovering
-    Discovering --> Negotiating: authorized peer online
-    Discovering --> Failed: offline or denied
-    Negotiating --> Authenticating: valid UDP candidate pair nominated
-    Negotiating --> Failed: timeout or prohibited candidate
-    Authenticating --> Connected: DTLS 1.3 (0xFEFC) + SHA-256 fingerprint + data/v1 open
-    Authenticating --> Failed: downgrade, fingerprint mismatch, or transport failure
-    Connected --> Reconnecting: path lost or network change
-    Reconnecting --> Negotiating: bounded signed ICE restart (generation + 1)
-    Reconnecting --> Failed: retry budget exhausted or hub offline
-    Connected --> Disconnected: close
-    Failed --> Disconnected
-```
-
-### 4.3 DataChannels and Backpressure
-
-| Label | Ordered | Reliability | Limit |
-| --- | --- | --- | --- |
-| `data/v1` | `true` | Reliable | `16 KiB` per message |
-| `packet/v1` (optional) | `false` | `maxRetransmits = 0` | `16 KiB` per message |
-
-The answerer closes any incoming DataChannel with an unrecognized label or mismatched reliability attributes. Outbound senders enforce a `1 MiB` per-peer queue cap combined with SCTP `BufferedAmount` low/high watermarks (`256 KiB` / `512 KiB`), suspending new payload transmission immediately whenever the path is unverified.
-
-## 5. Pinned Reference Dependencies
-
-| Module | Version | Role |
-| --- | --- | --- |
-| `github.com/pion/webrtc/v5` | `v5.0.0-rc.4` | Native Go WebRTC PeerConnection, ICE, SCTP, DCEP |
-| `github.com/pion/dtls/v4` | `v4.0.1` | DTLS 1.3 (RFC 9147) for peer transport and RFC 7350 DTLS/UDP STUNS/TURNS |
-| `github.com/pion/ice/v5` | `v5.0.0-rc.9` | Full ICE agent and candidate parser |
-| `github.com/pion/stun/v5` | `v5.0.0-rc.3` | RFC 8489 STUN wire codec |
-| `github.com/pion/turn/v6` | `v6.0.0-rc.1` | RFC 8656 authenticated DTLS/UDP TURNS server and client |
-| `github.com/pion/sdp/v3` | `v3.0.20` | SDP parsing and pre-installation policy inspection |
-| `github.com/pion/transport/v5` | `v5.1.5` | Network abstraction and `vnet` virtual NAT/router testing |
-| `github.com/coder/websocket` | `v1.8.15` | Bounded TLS 1.3 WebSocket client and server |
-| `github.com/cloudflare/circl` | `v1.6.5` | RFC 8032 Ed448 identity and authority signatures |
-| `modernc.org/sqlite` | `v1.63.0` | Optional pure-Go SQLite administrative policy persistence |
+| Module | Role |
+| --- | --- |
+| `github.com/pion/webrtc/v5` | Native Go WebRTC PeerConnection, ICE, SCTP, DCEP |
+| `github.com/pion/dtls/v4` | DTLS 1.3 (RFC 9147) for peer transport and RFC 7350 DTLS/UDP STUNS/TURNS |
+| `github.com/pion/ice/v5` | Full ICE agent and candidate parser |
+| `github.com/pion/stun/v5` | RFC 8489 STUN wire codec |
+| `github.com/pion/turn/v6` | RFC 8656 universal DTLS/UDP TURNS relay |
+| `github.com/pion/sdp/v3` | SDP parsing and pre-installation policy inspection |
+| `github.com/pion/transport/v5` | Network abstraction and `vnet` virtual NAT/router testing |
+| `github.com/coder/websocket` | Bounded TLS 1.3 WebSocket client and server |
+| `github.com/cloudflare/circl` | RFC 8032 Ed448 identity signatures |
+| `golang.org/x/crypto` | Argon2id passphrase KDF and XChaCha20-Poly1305 AEAD |
+| `fyne.io/fyne/v2` | Cross-platform desktop UI (`cmd/lighthouse-ui`, `internal/ui`) |
+| `github.com/go-critic/go-critic` | Go `tool` linter (standard profile overall; `-enableAll` on security packages) |

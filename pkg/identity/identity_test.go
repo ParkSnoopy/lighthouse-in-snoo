@@ -2,11 +2,11 @@ package identity_test
 
 import (
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"lighthouse-in-snoo/pkg/identity"
 )
@@ -69,71 +69,6 @@ func TestRegistrationChallengeProof(t *testing.T) {
 	}
 }
 
-func TestOfflineAuthorityMembershipAndACL(t *testing.T) {
-	t.Parallel()
-
-	authKP, _ := identity.GenerateKeyPair()
-	peerA, _ := identity.GenerateKeyPair()
-	peerB, _ := identity.GenerateKeyPair()
-	peerC, _ := identity.GenerateKeyPair()
-
-	now := time.Unix(1_795_560_000, 0)
-	recA, err := identity.IssueMembership(authKP, peerA.PublicKey, now.Unix()-60, now.Unix()+3600, []string{peerB.PeerID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	recB, err := identity.IssueMembership(authKP, peerB.PublicKey, now.Unix()-60, now.Unix()+3600, []string{peerA.PeerID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	recC, err := identity.IssueMembership(authKP, peerC.PublicKey, now.Unix()-60, now.Unix()+3600, []string{peerA.PeerID})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tv, err := identity.NewTrustVerifier(identity.PolicyConfig{
-		Version:            1,
-		TrustedAuthorities: []string{identity.EncodePublicKey(authKP.PublicKey)},
-		ACLRules: []identity.ACLRule{
-			{PeerA: peerA.PeerID, PeerB: peerB.PeerID},
-		},
-	}, 30*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tv.SetClock(func() time.Time { return now })
-
-	if _, err := tv.VerifyPeer(peerA.PeerID, peerA.PublicKey, recA); err != nil {
-		t.Fatalf("VerifyPeer A: %v", err)
-	}
-	if err := tv.AuthorizePair(peerA.PeerID, peerB.PeerID, recA, recB); err != nil {
-		t.Fatalf("AuthorizePair A<->B: %v", err)
-	}
-	if err := tv.AuthorizePair(peerA.PeerID, peerC.PeerID, recA, recC); !errors.Is(err, identity.ErrUnauthorizedPair) {
-		t.Fatalf("expected unauthorized pair for A<->C, got %v", err)
-	}
-
-	// Advance clock beyond expiry + skew.
-	tv.SetClock(func() time.Time { return now.Add(2 * time.Hour) })
-	if _, err := tv.VerifyPeer(peerA.PeerID, peerA.PublicKey, recA); !errors.Is(err, identity.ErrMembershipExpired) {
-		t.Fatalf("expected ErrMembershipExpired, got %v", err)
-	}
-
-	// Revocation check.
-	tv.SetClock(func() time.Time { return now })
-	if err := tv.Reload(identity.PolicyConfig{
-		Version:            1,
-		TrustedAuthorities: []string{identity.EncodePublicKey(authKP.PublicKey)},
-		ACLRules:           []identity.ACLRule{{PeerA: peerA.PeerID, PeerB: peerB.PeerID}},
-		RevokedPeers:       []string{peerB.PeerID},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tv.VerifyPeer(peerB.PeerID, peerB.PublicKey, recB); !errors.Is(err, identity.ErrRevokedPeer) {
-		t.Fatalf("expected ErrRevokedPeer, got %v", err)
-	}
-}
-
 func TestMultiAlgorithmKeyGenSaveSignAndVerify(t *testing.T) {
 	t.Parallel()
 
@@ -152,15 +87,7 @@ func TestMultiAlgorithmKeyGenSaveSignAndVerify(t *testing.T) {
 		{"rsa 2048", "rsa", identity.AlgorithmRSA, 2048, "rsa:"},
 	}
 
-	// Generate an Ed448 authority to cross-sign memberships for every peer algorithm.
-	authKP, err := identity.GenerateKeyPairWithOptions(identity.KeyGenOptions{Algorithm: identity.AlgorithmEd448})
-	if err != nil {
-		t.Fatalf("generate ed448 authority: %v", err)
-	}
-
 	dir := t.TempDir()
-	now := time.Now()
-	authorities := map[string]identity.PublicKey{authKP.PeerID: authKP.PublicKey}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -215,7 +142,6 @@ func TestMultiAlgorithmKeyGenSaveSignAndVerify(t *testing.T) {
 				t.Fatalf("reloaded keypair mismatch for %s", algo)
 			}
 
-			// Registration proof round-trip + tamper check.
 			challenge := "0123456789abcdef0123456789abcdef0123456789a"
 			proof, err := loaded.SignRegistrationChallenge(challenge, "wss://hub.example.com")
 			if err != nil {
@@ -226,19 +152,6 @@ func TestMultiAlgorithmKeyGenSaveSignAndVerify(t *testing.T) {
 			}
 			if err := identity.VerifyRegistrationChallenge(decodedPub, kp.PeerID, challenge, "wss://other.example.com", proof); !errors.Is(err, identity.ErrInvalidProof) {
 				t.Fatalf("expected ErrInvalidProof on wrong origin for %s, got %v", algo, err)
-			}
-
-			// Cross-algorithm offline authority membership issuance & verification.
-			rec, err := identity.IssueMembership(authKP, decodedPub, now.Unix()-60, now.Unix()+3600, []string{"*"})
-			if err != nil {
-				t.Fatalf("IssueMembership(%s): %v", algo, err)
-			}
-			verifiedPub, err := identity.VerifyMembershipRecord(rec, authorities, now, 30*time.Second)
-			if err != nil {
-				t.Fatalf("VerifyMembershipRecord(%s): %v", algo, err)
-			}
-			if !verifiedPub.Equal(kp.PublicKey) {
-				t.Fatalf("verified membership public key mismatch for %s", algo)
 			}
 		})
 	}
@@ -255,4 +168,157 @@ func TestMultiAlgorithmKeyGenSaveSignAndVerify(t *testing.T) {
 			t.Fatalf("expected ErrInvalidKeyBits when --bits passed for ed448, got %v", err)
 		}
 	})
+}
+
+func TestChannelPassphraseDerivationAndSealedMeta(t *testing.T) {
+	t.Parallel()
+
+	if _, err := identity.DeriveChannelKeys("   "); !errors.Is(err, identity.ErrEmptyPassphrase) {
+		t.Fatalf("expected ErrEmptyPassphrase, got %v", err)
+	}
+
+	k1, err := identity.DeriveChannelKeys("offline-shared-secret")
+	if err != nil {
+		t.Fatalf("DeriveChannelKeys: %v", err)
+	}
+	k2, err := identity.DeriveChannelKeys("offline-shared-secret")
+	if err != nil {
+		t.Fatalf("DeriveChannelKeys repeat: %v", err)
+	}
+	if k1.ChannelID != k2.ChannelID || k1.AuthKey != k2.AuthKey {
+		t.Fatal("DeriveChannelKeys is not deterministic")
+	}
+	if err := identity.ValidateChannelID(k1.ChannelID); err != nil {
+		t.Fatalf("ValidateChannelID: %v", err)
+	}
+
+	other, err := identity.DeriveChannelKeys("different-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.ChannelID == k1.ChannelID {
+		t.Fatal("distinct passphrases produced identical channel IDs")
+	}
+
+	kp, err := identity.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherKP, err := identity.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sealed, err := identity.SealBroadcastMeta(k1.AuthKey, kp.PeerID, k1.ChannelID, identity.BroadcastMeta{DisplayName: "alice-workstation"})
+	if err != nil {
+		t.Fatalf("SealBroadcastMeta: %v", err)
+	}
+	if strings.Contains(sealed, "alice-workstation") {
+		t.Fatal("sealed broadcast metadata leaked plaintext display name")
+	}
+
+	got, err := identity.OpenBroadcastMeta(k1.AuthKey, kp.PeerID, k1.ChannelID, sealed)
+	if err != nil || got.DisplayName != "alice-workstation" {
+		t.Fatalf("OpenBroadcastMeta = %+v, %v; want alice-workstation", got, err)
+	}
+
+	// Wrong passphrase key MUST fail AEAD decryption.
+	if _, err := identity.OpenBroadcastMeta(other.AuthKey, kp.PeerID, k1.ChannelID, sealed); err == nil {
+		t.Fatal("expected OpenBroadcastMeta to fail with wrong passphrase")
+	}
+	// Swapped peer_id (AAD mismatch) MUST fail AEAD decryption.
+	if _, err := identity.OpenBroadcastMeta(k1.AuthKey, otherKP.PeerID, k1.ChannelID, sealed); err == nil {
+		t.Fatal("expected OpenBroadcastMeta to fail on peer_id AAD mismatch")
+	}
+}
+
+func TestHubPassphraseChallengeProof(t *testing.T) {
+	t.Parallel()
+
+	kp, err := identity.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hubKey, err := identity.DeriveHubKey("private-hub-passphrase")
+	if err != nil {
+		t.Fatalf("DeriveHubKey: %v", err)
+	}
+	challenge := "0123456789abcdef0123456789abcdef0123456789a"
+	proof, err := identity.SignHubPassphraseProof("private-hub-passphrase", challenge, "wss://hub.example.com", kp.PeerID)
+	if err != nil {
+		t.Fatalf("SignHubPassphraseProof: %v", err)
+	}
+
+	if err := identity.VerifyHubPassphraseProofWithKey(hubKey, challenge, "wss://hub.example.com", kp.PeerID, proof); err != nil {
+		t.Fatalf("VerifyHubPassphraseProofWithKey: %v", err)
+	}
+
+	wrongKey, _ := identity.DeriveHubKey("wrong-passphrase")
+	if err := identity.VerifyHubPassphraseProofWithKey(wrongKey, challenge, "wss://hub.example.com", kp.PeerID, proof); !errors.Is(err, identity.ErrInvalidProof) {
+		t.Fatalf("expected ErrInvalidProof for wrong passphrase, got %v", err)
+	}
+	if err := identity.VerifyHubPassphraseProofWithKey(hubKey, challenge, "wss://evil.example.com", kp.PeerID, proof); !errors.Is(err, identity.ErrInvalidProof) {
+		t.Fatalf("expected ErrInvalidProof for wrong origin, got %v", err)
+	}
+	if err := identity.VerifyHubPassphraseProofWithKey(hubKey, "other-challenge-value-0123456789abcdef0123456", "wss://hub.example.com", kp.PeerID, proof); !errors.Is(err, identity.ErrInvalidProof) {
+		t.Fatalf("expected ErrInvalidProof for wrong challenge, got %v", err)
+	}
+}
+
+func TestVirtualIPv4FromPeerIDAndBlacklistPersistence(t *testing.T) {
+	t.Parallel()
+
+	kpA, _ := identity.GenerateKeyPair()
+	kpB, _ := identity.GenerateKeyPair()
+
+	cgnat := netip.MustParsePrefix("100.64.0.0/10")
+	ipA, err := identity.VirtualIPv4FromPeerID(kpA.PeerID)
+	if err != nil {
+		t.Fatalf("VirtualIPv4FromPeerID: %v", err)
+	}
+	if !cgnat.Contains(ipA) {
+		t.Fatalf("virtual IP %s outside 100.64.0.0/10", ipA)
+	}
+	ipARepeat, err := identity.VirtualIPv4FromPeerID(kpA.PeerID)
+	if err != nil || ipARepeat != ipA {
+		t.Fatalf("VirtualIPv4FromPeerID not deterministic: %v vs %v (%v)", ipA, ipARepeat, err)
+	}
+	if _, err := identity.VirtualIPv4FromPeerID("bad-peer-id"); err == nil {
+		t.Fatal("expected error for invalid peer ID")
+	}
+
+	blPath := filepath.Join(t.TempDir(), "blacklist.json")
+	bl, err := identity.LoadBlacklist(blPath)
+	if err != nil {
+		t.Fatalf("LoadBlacklist missing file: %v", err)
+	}
+	if err := bl.Add(kpB.PeerID); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if !bl.Contains(kpB.PeerID) || bl.Contains(kpA.PeerID) {
+		t.Fatal("unexpected blacklist membership")
+	}
+	if err := bl.Save(blPath); err != nil {
+		t.Fatalf("Save blacklist: %v", err)
+	}
+
+	reloaded, err := identity.LoadBlacklist(blPath)
+	if err != nil {
+		t.Fatalf("reload blacklist: %v", err)
+	}
+	if !reloaded.Contains(kpB.PeerID) || len(reloaded.List()) != 1 {
+		t.Fatalf("reloaded blacklist mismatch: %v", reloaded.List())
+	}
+
+	if err := os.Chmod(blPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := identity.LoadBlacklist(blPath); !errors.Is(err, identity.ErrInsecureFilePerms) {
+		t.Fatalf("expected ErrInsecureFilePerms for 0644 blacklist, got %v", err)
+	}
+
+	reloaded.Remove(kpB.PeerID)
+	if reloaded.Contains(kpB.PeerID) {
+		t.Fatal("Remove did not delete peer from blacklist")
+	}
 }

@@ -42,24 +42,6 @@ func loadDotEnvIfPresent(path string) {
 	}
 }
 
-func resolvedDefaultSTUNURI() string {
-	if uri := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_URI")); uri != "" {
-		return uri
-	}
-	port := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_PORT"))
-	if port == "" {
-		port = "5349"
-	}
-	if domain := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_DOMAIN")); domain != "" {
-		return formatSTUNURI(domain, port)
-	}
-	return "stuns:127.0.0.1:" + port
-}
-
-func resolvedDefaultTURNURI() string {
-	return strings.TrimSpace(os.Getenv("LIGHTHOUSE_TURN_URI"))
-}
-
 func resolvedDefaultHubOrigin() string {
 	if origin := strings.TrimSpace(os.Getenv("LIGHTHOUSE_HUB_ORIGIN")); origin != "" {
 		return origin
@@ -68,34 +50,6 @@ func resolvedDefaultHubOrigin() string {
 		return "wss://" + stripSTUNHost(domain)
 	}
 	return "wss://localhost:8443"
-}
-
-func resolvedDefaultHubURL() string {
-	if u := strings.TrimSpace(os.Getenv("LIGHTHOUSE_HUB_URL")); u != "" {
-		return u
-	}
-	return strings.TrimRight(resolvedDefaultHubOrigin(), "/") + "/v1/signal"
-}
-
-func formatSTUNURI(domain, defaultPort string) string {
-	d := strings.TrimSpace(domain)
-	lower := strings.ToLower(d)
-	if strings.Contains(d, "://") ||
-		strings.HasPrefix(lower, "stuns:") ||
-		strings.HasPrefix(lower, "turns:") ||
-		strings.HasPrefix(lower, "stun:") ||
-		strings.HasPrefix(lower, "turn:") {
-		return d
-	}
-	// If already host:port or [ipv6]:port, preserve explicit port.
-	if _, _, err := net.SplitHostPort(d); err == nil {
-		return "stuns:" + d
-	}
-	// Bare IPv6 address without brackets.
-	if ip := net.ParseIP(d); ip != nil && ip.To4() == nil {
-		return "stuns:[" + d + "]:" + defaultPort
-	}
-	return "stuns:" + net.JoinHostPort(strings.Trim(d, "[]"), defaultPort)
 }
 
 func stripSTUNHost(domain string) string {

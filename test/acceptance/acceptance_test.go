@@ -25,13 +25,11 @@ import (
 	"lighthouse-in-snoo/pkg/protocol"
 )
 
-// TestArchitectureAndControlPlaneInvariants verifies ARCH-01..ARCH-05, TLS 1.3 WSS enforcement,
-// /healthz privacy, and log redaction requirements.
+// TestArchitectureAndControlPlaneInvariants verifies dependency isolation, TLS 1.3 WSS
+// enforcement, /healthz privacy, and zero-config stateless hub invariants.
 func TestArchitectureAndControlPlaneInvariants(t *testing.T) {
 	t.Parallel()
 
-	// Verify internal/hub has ZERO dependency on pion/webrtc (never terminates PeerConnection),
-	// and internal/stunserver has ZERO dependency on pion/webrtc or pion/turn.
 	outHub, err := exec.Command("go", "list", "-deps", "lighthouse-in-snoo/internal/hub").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list -deps internal/hub failed: %v\n%s", err, string(outHub))
@@ -46,11 +44,16 @@ func TestArchitectureAndControlPlaneInvariants(t *testing.T) {
 	if strings.Contains(string(outSTUN), "github.com/pion/webrtc") || strings.Contains(string(outSTUN), "github.com/pion/turn") {
 		t.Fatalf("ARCH violation: stunserver depends on pion/webrtc or pion/turn:\n%s", string(outSTUN))
 	}
+	outHubCmd, err := exec.Command("go", "list", "-deps", "lighthouse-in-snoo/cmd/lighthouse").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list -deps cmd/lighthouse failed: %v\n%s", err, string(outHubCmd))
+	}
+	if strings.Contains(string(outHubCmd), "fyne.io/fyne") || strings.Contains(string(outHubCmd), "modernc.org/sqlite") {
+		t.Fatalf("ARCH violation: static hub binary depends on fyne or sqlite:\n%s", string(outHubCmd))
+	}
 
-	ids := newTestMeshIdentities(t)
-	srv, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+	srv, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
-	// Verify /healthz returns status ok and no private peer details (Section 4.1).
 	healthURL := "https://" + srv.HTTPSAddr().String() + "/healthz"
 	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.clientTLS}}
 	resp, err := hc.Get(healthURL)
@@ -63,7 +66,6 @@ func TestArchitectureAndControlPlaneInvariants(t *testing.T) {
 		t.Fatalf("unexpected /healthz: status=%d body=%q", resp.StatusCode, string(body))
 	}
 
-	// Verify TLS 1.2 client is rejected by Hub WSS (Section 4.1).
 	tls12Cfg := pki.clientTLS.Clone()
 	tls12Cfg.MinVersion = tls.VersionTLS12
 	tls12Cfg.MaxVersion = tls.VersionTLS12
@@ -83,22 +85,21 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 	t.Parallel()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, hubLogs, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+	_, pki, hubLogs, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
 	peerLogs := &safeLogBuffer{}
 	peerLogger := slog.New(slog.NewJSONHandler(peerLogs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	sessBCh := make(chan *peer.Session, 1)
-	clientA, err := peer.NewClient(peer.Config{
+	clientA, err := peer.NewClient(&peer.Config{
 		KeyPair:             ids.peerA,
-		Membership:          ids.memA,
-		Policy:              ids.policy,
 		SignalingURL:        wsURL,
 		TLSConfig:           pki.clientTLS,
 		STUNServerURI:       stunURI,
 		NetworkTypes:        []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:     true,
 		EnablePacketChannel: true,
+		Consent:             allowAllConsent(),
 		Logger:              peerLogger,
 	})
 	if err != nil {
@@ -106,16 +107,15 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 	}
 	defer clientA.Close()
 
-	clientB, err := peer.NewClient(peer.Config{
+	clientB, err := peer.NewClient(&peer.Config{
 		KeyPair:             ids.peerB,
-		Membership:          ids.memB,
-		Policy:              ids.policy,
 		SignalingURL:        wsURL,
 		TLSConfig:           pki.clientTLS,
 		STUNServerURI:       stunURI,
 		NetworkTypes:        []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:     true,
 		EnablePacketChannel: true,
+		Consent:             allowAllConsent(),
 		Logger:              peerLogger,
 		OnSession: func(s *peer.Session) {
 			sessBCh <- s
@@ -158,7 +158,6 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 		t.Fatalf("expected direct host-host pair on LAN, got (%s, %s)", diagA.LocalCandidateType, diagA.RemoteCandidateType)
 	}
 
-	// Reliable data/v1 transfer.
 	secretPayload := []byte("SUPER-SECRET-APP-PAYLOAD-T01")
 	if err := sessA.Send(ctx, secretPayload); err != nil {
 		t.Fatalf("Send data/v1: %v", err)
@@ -172,7 +171,6 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 		t.Fatal("timeout receiving data/v1")
 	}
 
-	// Unordered packet/v1 transfer.
 	dgram := []byte("packet-v1-datagram")
 	if err := sessA.SendPacket(ctx, dgram); err != nil {
 		t.Fatalf("SendPacket: %v", err)
@@ -186,13 +184,11 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 		t.Fatal("timeout receiving packet/v1")
 	}
 
-	// Enforce 16 KiB per-message application limit (Section 7).
 	oversized := make([]byte, peer.MaxApplicationMessageBytes+1)
 	if err := sessA.Send(ctx, oversized); !errors.Is(err, peer.ErrMessageTooLarge) {
 		t.Fatalf("expected ErrMessageTooLarge for 16KiB+1 payload, got %v", err)
 	}
 
-	// Observability privacy check (Section 9): logs must NOT contain SDP, ICE pwd, keys, or payload.
 	combinedLogs := hubLogs.String() + "\n" + peerLogs.String()
 	for _, forbidden := range []string{"v=0\r\n", "a=ice-pwd:", string(secretPayload), "typ host"} {
 		if strings.Contains(combinedLogs, forbidden) {
@@ -200,7 +196,6 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 		}
 	}
 
-	// Record acceptance telemetry (Section 10).
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range bi.Deps {
 			if strings.HasPrefix(dep.Path, "github.com/pion/") {
@@ -230,33 +225,31 @@ func TestT02_PublicIPv4AndIPv6Connectivity(t *testing.T) {
 		t.Run(fam.name, func(t *testing.T) {
 			t.Parallel()
 			ids := newTestMeshIdentities(t)
-			_, pki, _, wsURL, stunURI := startTestHub(t, fam.tcpNet, fam.bindHost, fam.stunAddr, ids.policy, nil)
+			_, pki, _, wsURL, stunURI := startTestHub(t, fam.tcpNet, fam.bindHost, fam.stunAddr, nil)
 
 			sessBCh := make(chan *peer.Session, 1)
-			clientA, err := peer.NewClient(peer.Config{
+			clientA, err := peer.NewClient(&peer.Config{
 				KeyPair:         ids.peerA,
-				Membership:      ids.memA,
-				Policy:          ids.policy,
 				SignalingURL:    wsURL,
 				TLSConfig:       pki.clientTLS,
 				STUNServerURI:   stunURI,
 				NetworkTypes:    []webrtc.NetworkType{fam.netType},
 				IncludeLoopback: true,
+				Consent:         allowAllConsent(),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer clientA.Close()
 
-			clientB, err := peer.NewClient(peer.Config{
+			clientB, err := peer.NewClient(&peer.Config{
 				KeyPair:         ids.peerB,
-				Membership:      ids.memB,
-				Policy:          ids.policy,
 				SignalingURL:    wsURL,
 				TLSConfig:       pki.clientTLS,
 				STUNServerURI:   stunURI,
 				NetworkTypes:    []webrtc.NetworkType{fam.netType},
 				IncludeLoopback: true,
+				Consent:         allowAllConsent(),
 				OnSession:       func(s *peer.Session) { sessBCh <- s },
 			})
 			if err != nil {
@@ -309,18 +302,17 @@ func TestT05_PeerSupportsOnlyDTLS12Fails(t *testing.T) {
 	t.Parallel()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+	_, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
 	payloadDelivered := make(chan []byte, 1)
 
-	clientA, err := peer.NewClient(peer.Config{
+	clientA, err := peer.NewClient(&peer.Config{
 		KeyPair:                 ids.peerA,
-		Membership:              ids.memA,
-		Policy:                  ids.policy,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
 		STUNServerURI:           stunURI,
 		IncludeLoopback:         true,
+		Consent:                 allowAllConsent(),
 		OfferToConnectedTimeout: 3 * time.Second,
 	})
 	if err != nil {
@@ -328,15 +320,13 @@ func TestT05_PeerSupportsOnlyDTLS12Fails(t *testing.T) {
 	}
 	defer clientA.Close()
 
-	// Peer B simulates a legacy DTLS 1.2-only endpoint.
-	clientB, err := peer.NewClient(peer.Config{
+	clientB, err := peer.NewClient(&peer.Config{
 		KeyPair:                 ids.peerB,
-		Membership:              ids.memB,
-		Policy:                  ids.policy,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
 		STUNServerURI:           stunURI,
 		IncludeLoopback:         true,
+		Consent:                 allowAllConsent(),
 		OfferToConnectedTimeout: 3 * time.Second,
 		OverrideDTLSMinVersion:  dtlsProtocol.Version1_2,
 		OverrideDTLSMaxVersion:  dtlsProtocol.Version1_2,
@@ -419,29 +409,27 @@ func TestT06_CompromisedHubTamperingFails(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ids := newTestMeshIdentities(t)
-			srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+			srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 			srv.SetForwardTamperHookForTesting(tc.mutate)
 
-			clientA, _ := peer.NewClient(peer.Config{
+			clientA, _ := peer.NewClient(&peer.Config{
 				KeyPair:                 ids.peerA,
-				Membership:              ids.memA,
-				Policy:                  ids.policy,
 				SignalingURL:            wsURL,
 				TLSConfig:               pki.clientTLS,
 				STUNServerURI:           stunURI,
 				IncludeLoopback:         true,
+				Consent:                 allowAllConsent(),
 				OfferToConnectedTimeout: 1200 * time.Millisecond,
 			})
 			defer clientA.Close()
 
-			clientB, _ := peer.NewClient(peer.Config{
+			clientB, _ := peer.NewClient(&peer.Config{
 				KeyPair:                 ids.peerB,
-				Membership:              ids.memB,
-				Policy:                  ids.policy,
 				SignalingURL:            wsURL,
 				TLSConfig:               pki.clientTLS,
 				STUNServerURI:           stunURI,
 				IncludeLoopback:         true,
+				Consent:                 allowAllConsent(),
 				OfferToConnectedTimeout: 1200 * time.Millisecond,
 			})
 			defer clientB.Close()
@@ -461,64 +449,59 @@ func TestT06_CompromisedHubTamperingFails(t *testing.T) {
 	}
 }
 
-// TestT07_UnknownForbiddenAndReplayedSignalingRejected verifies T07.
-func TestT07_UnknownForbiddenAndReplayedSignalingRejected(t *testing.T) {
+// TestT07_DeniedBlacklistedAndReplayedSignalingRejected verifies T07:
+// Default fail-closed consent, explicit user Deny/Blacklist, and signaling replay rejection.
+func TestT07_DeniedBlacklistedAndReplayedSignalingRejected(t *testing.T) {
 	t.Parallel()
 
 	ids := newTestMeshIdentities(t)
-	srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+	srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 1. Unknown/untrusted peer registration MUST be rejected.
-	unknownKP, _ := identity.GenerateKeyPair()
-	unknownClient, err := peer.NewClient(peer.Config{
-		KeyPair:      unknownKP,
-		Policy:       ids.policy,
-		SignalingURL: wsURL,
-		TLSConfig:    pki.clientTLS,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unknownClient.Close()
-	if err := unknownClient.Register(ctx); err == nil {
-		t.Fatal("T07: expected unknown peer registration to be rejected")
-	}
-
-	// 2. Forbidden peer pair: Peer C has valid authority membership, so it can register,
-	//    but ACL only allows A <-> B. Lookup and connection C -> B MUST be denied!
-	clientB, _ := peer.NewClient(peer.Config{
+	// 1. Default fail-closed: nil ConsentHandler MUST deny incoming offers.
+	clientDefaultDeny, err := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerB,
-		Membership:      ids.memB,
-		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		IncludeLoopback: true,
 	})
-	defer clientB.Close()
-	if err := clientB.Register(ctx); err != nil {
-		t.Fatalf("Register B: %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientDefaultDeny.Close()
+	if err := clientDefaultDeny.Register(ctx); err != nil {
+		t.Fatal(err)
 	}
 
-	clientC, _ := peer.NewClient(peer.Config{
+	clientC, err := peer.NewClient(&peer.Config{
 		KeyPair:                 ids.peerC,
-		Membership:              ids.memC,
-		Policy:                  ids.policy,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
 		STUNServerURI:           stunURI,
 		IncludeLoopback:         true,
-		OfferToConnectedTimeout: 2 * time.Second,
+		OfferToConnectedTimeout: 3 * time.Second,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer clientC.Close()
 	if err := clientC.Register(ctx); err != nil {
-		t.Fatalf("Register C: %v", err)
+		t.Fatal(err)
 	}
-	if _, _, err := clientC.Lookup(ctx, ids.peerB.PeerID); err == nil {
-		t.Fatal("T07: expected forbidden pair C->B lookup to be denied")
+
+	if _, err := clientC.Connect(ctx, ids.peerB.PeerID); !errors.Is(err, peer.ErrUserDenied) {
+		t.Fatalf("T07: expected ErrUserDenied on nil Consent handler, got %v", err)
+	}
+
+	// 2. Explicit blacklist on Peer B rejects future offers from Peer C with ErrPeerBlacklisted.
+	if err := clientDefaultDeny.Blacklist(ids.peerC.PeerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientC.Connect(ctx, ids.peerB.PeerID); !errors.Is(err, peer.ErrPeerBlacklisted) {
+		t.Fatalf("T07: expected ErrPeerBlacklisted for blacklisted peer, got %v", err)
 	}
 
 	// 3. Replayed signaling MUST be rejected at both Hub and Peer B.
@@ -533,14 +516,13 @@ func TestT07_UnknownForbiddenAndReplayedSignalingRejected(t *testing.T) {
 	_ = json.Unmarshal(rawChal, &chal)
 	proof, _ := ids.peerA.SignRegistrationChallenge(chal.Challenge, srv.HubOrigin())
 	regRaw, _ := json.Marshal(protocol.RegisterMessage{
-		V:          1,
-		Type:       protocol.TypeRegister,
-		PeerID:     ids.peerA.PeerID,
-		PublicKey:  identity.EncodePublicKey(ids.peerA.PublicKey),
-		HubOrigin:  srv.HubOrigin(),
-		Challenge:  chal.Challenge,
-		Membership: ids.memA,
-		Proof:      proof,
+		V:         protocol.Version,
+		Type:      protocol.TypeRegister,
+		PeerID:    ids.peerA.PeerID,
+		PublicKey: identity.EncodePublicKey(ids.peerA.PublicKey),
+		HubOrigin: srv.HubOrigin(),
+		Challenge: chal.Challenge,
+		Proof:     proof,
 	})
 	_ = wsA.Write(ctx, websocket.MessageText, regRaw)
 	_, _, _ = wsA.Read(ctx) // registered
@@ -559,7 +541,6 @@ func TestT07_UnknownForbiddenAndReplayedSignalingRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// First send succeeds; second replay of identical signed envelope MUST return replayed_signaling error!
 	if err := wsA.Write(ctx, websocket.MessageText, closeEnvRaw); err != nil {
 		t.Fatal(err)
 	}
@@ -577,64 +558,57 @@ func TestT07_UnknownForbiddenAndReplayedSignalingRejected(t *testing.T) {
 		t.Fatalf("T07: expected hub error %q on replay, got %+v", protocol.ErrCodeReplayedSignaling, errMsg)
 	}
 
-	// Replaying directly into Peer B's envelope verifier MUST also be rejected.
-	if err := clientB.InjectRawEnvelopeForTesting(closeEnvRaw); !errors.Is(err, peer.ErrReplayedSignaling) {
+	if err := clientDefaultDeny.InjectRawEnvelopeForTesting(closeEnvRaw); !errors.Is(err, peer.ErrReplayedSignaling) {
 		t.Fatalf("T07: expected Peer B ErrReplayedSignaling, got %v", err)
 	}
 }
 
 // TestT08_RelayAndHubEndpointCandidatesRejected verifies T08:
-// TURN configuration, relay candidates in SDP, relay candidates in Trickle ICE,
-// and candidates pointing at Hub endpoints are all rejected before installation.
+// Plaintext ICE URIs, relay candidates when relay is disabled, and Hub endpoint candidates
+// are all rejected before WebRTC installation.
 func TestT08_RelayAndHubEndpointCandidatesRejected(t *testing.T) {
 	t.Parallel()
 
 	ids := newTestMeshIdentities(t)
-	srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+	srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
-	// 1. Plaintext stun:/turn: URIs MUST be rejected unless AllowInsecureICE=true.
 	for _, badURI := range []string{"stun:127.0.0.1:3478", "turn:127.0.0.1:3478"} {
-		if _, err := peer.NewClient(peer.Config{
+		if _, err := peer.NewClient(&peer.Config{
 			KeyPair:       ids.peerA,
-			Policy:        ids.policy,
 			SignalingURL:  wsURL,
 			STUNServerURI: badURI,
 		}); !errors.Is(err, peer.ErrInsecureICEProhibited) || !errors.Is(err, peer.ErrInvalidICEConfig) {
 			t.Fatalf("T08: expected ErrInsecureICEProhibited for %q, got %v", badURI, err)
 		}
 	}
-	// turns: without credentials MUST fail validation.
-	if _, err := peer.NewClient(peer.Config{
+	if _, err := peer.NewClient(&peer.Config{
 		KeyPair:       ids.peerA,
-		Policy:        ids.policy,
 		SignalingURL:  wsURL,
 		TURNServerURI: "turns:127.0.0.1:5349",
 	}); !errors.Is(err, peer.ErrInvalidICEConfig) {
 		t.Fatalf("T08: expected ErrInvalidICEConfig for turns: without credentials, got %v", err)
 	}
 
-	clientA, err := peer.NewClient(peer.Config{
+	clientA, err := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerA,
-		Membership:      ids.memA,
-		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clientA.Close()
 
-	clientB, err := peer.NewClient(peer.Config{
+	clientB, err := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerB,
-		Membership:      ids.memB,
-		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -650,7 +624,6 @@ func TestT08_RelayAndHubEndpointCandidatesRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Build a syntactically valid WebRTC data-channel SDP offer and inject a relay candidate into it.
 	pcTmp, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatal(err)
@@ -678,17 +651,11 @@ func TestT08_RelayAndHubEndpointCandidatesRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Ensure Peer B knows Peer A's verified identity locally.
-	policyWithBoth := ids.policy
-	policyWithBoth.Memberships = []identity.MembershipRecord{*ids.memA, *ids.memB}
-	_ = clientB.ReloadPolicy(policyWithBoth)
-
-	// 2. Injecting signed offer SDP with relay candidate MUST be rejected before installation.
 	if err := clientB.InjectRawEnvelopeForTesting(relayOfferRaw); !errors.Is(err, peer.ErrProhibitedCandidate) {
 		t.Fatalf("T08: expected ErrProhibitedCandidate for SDP relay candidate, got %v", err)
 	}
 
-	// 3. Install a clean signed offer, then inject trickled relay candidate & hub-endpoint candidate.
+	// Install clean signed offer, wait for async consent handler to promote it, then test trickled candidates.
 	sid2, _ := protocol.NewSessionID()
 	_, cleanOfferRaw, _ := protocol.SignEnvelope(
 		ids.peerA,
@@ -703,6 +670,8 @@ func TestT08_RelayAndHubEndpointCandidatesRejected(t *testing.T) {
 	if err := clientB.InjectRawEnvelopeForTesting(cleanOfferRaw); err != nil {
 		t.Fatalf("clean offer install: %v", err)
 	}
+	// Allow async consent goroutine to complete Offer installation.
+	time.Sleep(150 * time.Millisecond)
 
 	mid := "0"
 	mline := uint16(0)
@@ -725,7 +694,6 @@ func TestT08_RelayAndHubEndpointCandidatesRejected(t *testing.T) {
 		t.Fatalf("T08: expected ErrProhibitedCandidate for trickled relay candidate, got %v", err)
 	}
 
-	// Candidate targeting Hub's STUN UDP endpoint MUST also be rejected as a prohibited destination!
 	stunUDP := srv.STUNAddr().String()
 	parts := strings.Split(stunUDP, ":")
 	_, trickleHubEPRaw, _ := protocol.SignEnvelope(
@@ -759,44 +727,37 @@ func TestT10_StopHubDuringHealthyDirectSession(t *testing.T) {
 	t.Parallel()
 
 	ids := newTestMeshIdentities(t)
-	// Allow C<->A in policy too so we can verify fresh negotiations fail once Hub stops.
-	pol := ids.policy
-	pol.ACLRules = append(pol.ACLRules, identity.ACLRule{PeerA: ids.peerC.PeerID, PeerB: ids.peerA.PeerID})
-
-	srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", pol, nil)
+	srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
 	sessBCh := make(chan *peer.Session, 1)
-	clientA, _ := peer.NewClient(peer.Config{
+	clientA, _ := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerA,
-		Membership:      ids.memA,
-		Policy:          pol,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
 	defer clientA.Close()
 
-	clientB, _ := peer.NewClient(peer.Config{
+	clientB, _ := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerB,
-		Membership:      ids.memB,
-		Policy:          pol,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 		OnSession:       func(s *peer.Session) { sessBCh <- s },
 	})
 	defer clientB.Close()
 
-	clientC, _ := peer.NewClient(peer.Config{
+	clientC, _ := peer.NewClient(&peer.Config{
 		KeyPair:                 ids.peerC,
-		Membership:              ids.memC,
-		Policy:                  pol,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
 		STUNServerURI:           stunURI,
 		IncludeLoopback:         true,
+		Consent:                 allowAllConsent(),
 		OfferToConnectedTimeout: 2 * time.Second,
 	})
 	defer clientC.Close()
@@ -813,13 +774,11 @@ func TestT10_StopHubDuringHealthyDirectSession(t *testing.T) {
 	}
 	sessB := <-sessBCh
 
-	// Stop the entire Hub (both WSS control plane and STUN server)!
 	if err := srv.Close(); err != nil {
 		t.Fatalf("srv.Close: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	// Existing direct session A<->B MUST remain Connected and transfer payloads!
 	if sessA.State() != peer.StateConnected || sessB.State() != peer.StateConnected {
 		t.Fatalf("T10: expected direct session to stay Connected during hub outage, got A=%s B=%s", sessA.State(), sessB.State())
 	}
@@ -834,40 +793,36 @@ func TestT10_StopHubDuringHealthyDirectSession(t *testing.T) {
 		}
 	}
 
-	// Meanwhile, fresh negotiation C->A MUST fail closed while Hub is stopped!
 	if _, err := clientC.Connect(ctx, ids.peerA.PeerID); err == nil {
 		t.Fatal("T10: expected new negotiation to fail when Hub is offline")
 	}
 }
 
-// TestGlareConcurrentOffers verifies Section 5 deterministic glare resolution:
-// when both peers send concurrent offers simultaneously, the lexicographically smaller
-// peer_id's offer wins and both peers converge to a single Connected session.
+// TestGlareConcurrentOffers verifies deterministic glare resolution:
+// when both peers initiate concurrent offers, both converge to a single Connected session.
 func TestGlareConcurrentOffers(t *testing.T) {
 	t.Parallel()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
+	_, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
-	clientA, _ := peer.NewClient(peer.Config{
+	clientA, _ := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerA,
-		Membership:      ids.memA,
-		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
 	defer clientA.Close()
 
-	clientB, _ := peer.NewClient(peer.Config{
+	clientB, _ := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerB,
-		Membership:      ids.memB,
-		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
 	defer clientB.Close()
 
@@ -908,15 +863,10 @@ func TestGlareConcurrentOffers(t *testing.T) {
 }
 
 // TestMixedAlgorithmDirectP2PConnectivity verifies that non-Ed25519 keys
-// (Ed448 authority, NIST P-384 Peer A, RSA-2048 Peer B) interoperate end to end
-// across registration, independent membership verification, signed signaling, and DTLS 1.3.
+// (NIST P-384 Peer A, RSA-2048 Peer B) interoperate end to end over DTLS 1.3.
 func TestMixedAlgorithmDirectP2PConnectivity(t *testing.T) {
 	t.Parallel()
 
-	authKP, err := identity.GenerateKeyPairWithOptions(identity.KeyGenOptions{Algorithm: identity.AlgorithmEd448})
-	if err != nil {
-		t.Fatal(err)
-	}
 	peerA, err := identity.GenerateKeyPairWithOptions(identity.KeyGenOptions{Algorithm: identity.AlgorithmNISTP384})
 	if err != nil {
 		t.Fatal(err)
@@ -926,51 +876,31 @@ func TestMixedAlgorithmDirectP2PConnectivity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Now().Unix()
-	memA, err := identity.IssueMembership(authKP, peerA.PublicKey, now-60, now+3600, []string{peerB.PeerID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	memB, err := identity.IssueMembership(authKP, peerB.PublicKey, now-60, now+3600, []string{peerA.PeerID})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	policy := identity.PolicyConfig{
-		Version:            1,
-		TrustedAuthorities: []string{identity.EncodePublicKey(authKP.PublicKey)},
-		ACLRules: []identity.ACLRule{
-			{PeerA: peerA.PeerID, PeerB: peerB.PeerID},
-		},
-	}
-
-	_, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", policy, nil)
+	_, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", nil)
 
 	sessBCh := make(chan *peer.Session, 1)
-	clientA, err := peer.NewClient(peer.Config{
+	clientA, err := peer.NewClient(&peer.Config{
 		KeyPair:         peerA,
-		Membership:      memA,
-		Policy:          policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		NetworkTypes:    []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clientA.Close()
 
-	clientB, err := peer.NewClient(peer.Config{
+	clientB, err := peer.NewClient(&peer.Config{
 		KeyPair:         peerB,
-		Membership:      memB,
-		Policy:          policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   stunURI,
 		NetworkTypes:    []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 		OnSession:       func(s *peer.Session) { sessBCh <- s },
 	})
 	if err != nil {

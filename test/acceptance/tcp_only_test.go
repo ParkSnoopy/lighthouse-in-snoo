@@ -14,7 +14,6 @@ import (
 	"github.com/pion/webrtc/v5"
 
 	"lighthouse-in-snoo/internal/hub"
-	"lighthouse-in-snoo/pkg/identity"
 	"lighthouse-in-snoo/pkg/peer"
 	"lighthouse-in-snoo/pkg/protocol"
 )
@@ -46,12 +45,7 @@ func findNonLinkLocalIPv6() net.IP {
 	return nil
 }
 
-// TestTCPOnlyModeZeroUDPEndToEnd verifies opt-in --tcp-only mode across hub and peers:
-//   - Hub binds zero UDP sockets and serves STUNS over TLS 1.3 / TCP.
-//   - Peer rejects UDP network types, ?transport=udp, and relay-only policy when TCPOnly=true.
-//   - ProbeSTUNS verifies the hub's TLS 1.3 / TCP STUNS endpoint (and rejects untrusted CAs).
-//   - Two TCP-only peers establish ICE-TCP with end-to-end DTLS 1.3 (0xFEFC),
-//     exchange bidirectional data/v1 + packet/v1 payloads, and reject injected UDP candidates.
+// TestTCPOnlyModeZeroUDPEndToEnd verifies opt-in --tcp-only mode across hub and peers.
 func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 	t.Parallel()
 
@@ -71,50 +65,43 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 		}
 		defer udpConn.Close()
 
-		// Hub MUST reject UDP PacketConn when TCPOnly=true.
-		if _, err := hub.New(hub.Config{
+		if _, err := hub.New(&hub.Config{
 			HTTPSListener:   rawLn,
 			TLSConfig:       pki.serverTLS,
 			HubOrigin:       "wss://" + rawLn.Addr().String(),
 			TCPOnly:         true,
 			STUNSPacketConn: udpConn,
-			Policy:          ids.policy,
 		}); err == nil {
 			t.Fatal("expected hub.New to reject UDP PacketConn when TCPOnly=true")
 		}
 
-		// Peer MUST reject UDP NetworkTypes, ?transport=udp, relay-only policy, and plaintext stun: without AllowInsecureICE.
 		for _, badCfg := range []peer.Config{
 			{
 				KeyPair:      ids.peerA,
-				Policy:       ids.policy,
 				SignalingURL: "wss://127.0.0.1:8443/v1/signal",
 				TCPOnly:      true,
 				NetworkTypes: []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			},
 			{
 				KeyPair:       ids.peerA,
-				Policy:        ids.policy,
 				SignalingURL:  "wss://127.0.0.1:8443/v1/signal",
 				TCPOnly:       true,
 				STUNServerURI: "stuns:127.0.0.1:5349?transport=udp",
 			},
 			{
 				KeyPair:            ids.peerA,
-				Policy:             ids.policy,
 				SignalingURL:       "wss://127.0.0.1:8443/v1/signal",
 				TCPOnly:            true,
 				ICETransportPolicy: webrtc.ICETransportPolicyRelay,
 			},
 			{
 				KeyPair:       ids.peerA,
-				Policy:        ids.policy,
 				SignalingURL:  "wss://127.0.0.1:8443/v1/signal",
 				TCPOnly:       true,
 				STUNServerURI: "stun:127.0.0.1:3478",
 			},
 		} {
-			if _, err := peer.NewClient(badCfg); !errors.Is(err, peer.ErrInvalidICEConfig) {
+			if _, err := peer.NewClient(&badCfg); !errors.Is(err, peer.ErrInvalidICEConfig) {
 				t.Fatalf("expected ErrInvalidICEConfig for TCP-only invalid config %+v, got %v", badCfg, err)
 			}
 		}
@@ -138,14 +125,13 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 		boundHTTPS := httpsLn.Addr().String()
 		wsURL := "wss://" + boundHTTPS + "/v1/signal"
 
-		srv, err := hub.New(hub.Config{
+		srv, err := hub.New(&hub.Config{
 			HTTPSListener:    httpsLn,
 			TLSConfig:        pki.serverTLS,
 			HubOrigin:        "wss://" + boundHTTPS,
 			TCPOnly:          true,
 			EnableSTUN:       true,
 			STUNSTLSListener: stunsLn,
-			Policy:           ids.policy,
 		})
 		if err != nil {
 			_ = httpsLn.Close()
@@ -161,11 +147,8 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 
 		stunsURI := "stuns:" + srv.STUNSTLSAddr().String()
 
-		// Untrusted CA MUST fail ProbeSTUNS over TLS 1.3 / TCP.
-		untrustedClient, err := peer.NewClient(peer.Config{
+		untrustedClient, err := peer.NewClient(&peer.Config{
 			KeyPair:       ids.peerA,
-			Membership:    ids.memA,
-			Policy:        ids.policy,
 			SignalingURL:  wsURL,
 			TLSConfig:     &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, RootCAs: x509.NewCertPool()},
 			STUNServerURI: stunsURI,
@@ -182,34 +165,31 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 		}
 		probeFailCancel()
 
-		// Test with default TCPOnly NetworkTypes ([TCP4, TCP6]) and default ICETCPListenAddr (":0").
 		sessBCh := make(chan *peer.Session, 1)
-		clientA, err := peer.NewClient(peer.Config{
+		clientA, err := peer.NewClient(&peer.Config{
 			KeyPair:             ids.peerA,
-			Membership:          ids.memA,
-			Policy:              ids.policy,
 			SignalingURL:        wsURL,
 			TLSConfig:           pki.clientTLS,
 			STUNServerURI:       stunsURI,
 			TCPOnly:             true,
 			IncludeLoopback:     true,
 			EnablePacketChannel: true,
+			Consent:             allowAllConsent(),
 		})
 		if err != nil {
 			t.Fatalf("NewClient A TCPOnly: %v", err)
 		}
 		defer clientA.Close()
 
-		clientB, err := peer.NewClient(peer.Config{
+		clientB, err := peer.NewClient(&peer.Config{
 			KeyPair:             ids.peerB,
-			Membership:          ids.memB,
-			Policy:              ids.policy,
 			SignalingURL:        wsURL,
 			TLSConfig:           pki.clientTLS,
 			STUNServerURI:       stunsURI,
 			TCPOnly:             true,
 			IncludeLoopback:     true,
 			EnablePacketChannel: true,
+			Consent:             allowAllConsent(),
 			OnSession:           func(s *peer.Session) { sessBCh <- s },
 		})
 		if err != nil {
@@ -257,7 +237,6 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 			t.Fatalf("expected TCP selected candidate pair, got %q", diagA.SelectedPair)
 		}
 
-		// Bidirectional ordered data/v1 transfer over DTLS 1.3 / ICE-TCP.
 		msgAB := []byte("tcp-only-data-A-to-B")
 		msgBA := []byte("tcp-only-data-B-to-A")
 		if err := sessA.Send(ctx, msgAB); err != nil {
@@ -273,7 +252,6 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 			t.Fatalf("B->A mismatch: got %q want %q", string(got), string(msgBA))
 		}
 
-		// Unordered packet/v1 transfer over DTLS 1.3 / ICE-TCP.
 		pkt := []byte("tcp-only-packet-v1")
 		if err := sessA.SendPacket(ctx, pkt); err != nil {
 			t.Fatal(err)
@@ -287,7 +265,6 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 			t.Fatal("timeout waiting for packet/v1 payload in TCP-only mode")
 		}
 
-		// Signed Offer containing a UDP candidate MUST be rejected by a TCP-only client before WebRTC installation.
 		fakePC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 		if err != nil {
 			t.Fatal(err)
@@ -300,19 +277,13 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 		}
 		udpSDP := baseOffer.SDP + "a=candidate:99 1 UDP 2130706431 127.0.0.1 45000 typ host\r\n"
 
-		pinnedPolicy := ids.policy
-		pinnedPolicy.TrustedPeers = []identity.TrustedPeerEntry{{
-			PeerID:    ids.peerB.PeerID,
-			PublicKey: identity.EncodePublicKey(ids.peerB.PublicKey),
-		}}
-		rejectClient, err := peer.NewClient(peer.Config{
+		rejectClient, err := peer.NewClient(&peer.Config{
 			KeyPair:       ids.peerA,
-			Membership:    ids.memA,
-			Policy:        pinnedPolicy,
 			SignalingURL:  wsURL,
 			TLSConfig:     pki.clientTLS,
 			STUNServerURI: stunsURI,
 			TCPOnly:       true,
+			Consent:       allowAllConsent(),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -369,14 +340,13 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 		boundHTTPS := httpsLn.Addr().String()
 		wsURL := "wss://" + boundHTTPS + "/v1/signal"
 
-		srv, err := hub.New(hub.Config{
+		srv, err := hub.New(&hub.Config{
 			HTTPSListener:    httpsLn,
 			TLSConfig:        pki.serverTLS,
 			HubOrigin:        "wss://" + boundHTTPS,
 			TCPOnly:          true,
 			EnableSTUN:       true,
 			STUNSTLSListener: stunsLn,
-			Policy:           ids.policy,
 		})
 		if err != nil {
 			_ = httpsLn.Close()
@@ -392,15 +362,14 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 
 		stunsURI := "stuns:" + srv.STUNSTLSAddr().String()
 		sessBCh := make(chan *peer.Session, 1)
-		clientA, err := peer.NewClient(peer.Config{
+		clientA, err := peer.NewClient(&peer.Config{
 			KeyPair:       ids.peerA,
-			Membership:    ids.memA,
-			Policy:        ids.policy,
 			SignalingURL:  wsURL,
 			TLSConfig:     pki.clientTLS,
 			STUNServerURI: stunsURI,
 			TCPOnly:       true,
 			NetworkTypes:  []webrtc.NetworkType{webrtc.NetworkTypeTCP6},
+			Consent:       allowAllConsent(),
 		})
 		if err != nil {
 			t.Fatalf("NewClient A IPv6 TCPOnly: %v", err)
@@ -418,22 +387,19 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 			t.Fatalf("IPv6 Register A: %v", err)
 		}
 
-		// RFC 8445 §5.1.1.1 filters IPv6 link-local candidates and pion/ice excludes ::1 host
-		// candidates, so full TCP6 ICE-TCP pairing requires a non-link-local IPv6 host address.
 		if nonLLIPv6 == nil {
 			t.Log("IPv6 TLS 1.3 WSS + TLS 1.3/TCP STUNS verified on [::1]; skipping TCP6 ICE-TCP connect (no non-link-local IPv6 address on host)")
 			return
 		}
 
-		clientB, err := peer.NewClient(peer.Config{
+		clientB, err := peer.NewClient(&peer.Config{
 			KeyPair:       ids.peerB,
-			Membership:    ids.memB,
-			Policy:        ids.policy,
 			SignalingURL:  wsURL,
 			TLSConfig:     pki.clientTLS,
 			STUNServerURI: stunsURI,
 			TCPOnly:       true,
 			NetworkTypes:  []webrtc.NetworkType{webrtc.NetworkTypeTCP6},
+			Consent:       allowAllConsent(),
 			OnSession:     func(s *peer.Session) { sessBCh <- s },
 		})
 		if err != nil {

@@ -108,6 +108,12 @@ func (mc *managedChannel) bindDataChannel(dc *webrtc.DataChannel, maxMsgBytes in
 	})
 }
 
+func (mc *managedChannel) isBound() bool {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return mc.dc != nil && !mc.closed
+}
+
 func (mc *managedChannel) setPathAllowed(allowed bool) {
 	mc.mu.Lock()
 	mc.pathAllowed = allowed

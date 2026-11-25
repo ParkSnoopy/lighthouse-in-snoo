@@ -70,7 +70,10 @@ type Server struct {
 }
 
 // New creates and starts a TURNS (DTLS 1.3/UDP or TLS 1.3/TCP) and/or opt-in insecure TURN server.
-func New(cfg Config) (*Server, error) {
+func New(cfg *Config) (*Server, error) {
+	if cfg == nil {
+		return nil, errors.New("turnserver: config is required")
+	}
 	wantsPlainUDP := cfg.UDPListenAddr != "" || cfg.UDPPacketConn != nil
 	wantsPlainTCP := cfg.TCPListenAddr != "" || cfg.TCPListener != nil
 	if (wantsPlainUDP || wantsPlainTCP) && !cfg.AllowInsecure {
@@ -286,7 +289,7 @@ func GenerateCredentials(sharedSecret, user string, ttl time.Duration) (username
 	return turn.GenerateLongTermTURNRESTCredentials(sharedSecret, user, ttl)
 }
 
-func buildAuthHandler(cfg Config, realm string, lf logging.LoggerFactory) (turn.AuthHandler, error) {
+func buildAuthHandler(cfg *Config, realm string, lf logging.LoggerFactory) (turn.AuthHandler, error) {
 	if cfg.AuthHandler != nil {
 		return cfg.AuthHandler, nil
 	}
@@ -319,7 +322,7 @@ func buildAuthHandler(cfg Config, realm string, lf logging.LoggerFactory) (turn.
 	}, nil
 }
 
-func buildRelayGenerator(cfg Config, boundAddr net.Addr) turn.RelayAddressGenerator {
+func buildRelayGenerator(cfg *Config, boundAddr net.Addr) turn.RelayAddressGenerator {
 	bindAddr := strings.TrimSpace(cfg.RelayBindAddress)
 	if bindAddr == "" {
 		bindAddr = defaultBindIPFromAddr(boundAddr)

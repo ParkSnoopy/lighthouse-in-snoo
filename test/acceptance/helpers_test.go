@@ -2,6 +2,7 @@ package acceptance_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -19,6 +20,7 @@ import (
 
 	"lighthouse-in-snoo/internal/hub"
 	"lighthouse-in-snoo/pkg/identity"
+	"lighthouse-in-snoo/pkg/peer"
 )
 
 // vnetConstructMu guards Pion vnet.NewRouter/NewNet against an upstream unguarded
@@ -45,6 +47,24 @@ func newVNetNIC(t *testing.T, staticIP string) *vnet.Net {
 		t.Fatalf("vnet.NewNet(%s): %v", staticIP, err)
 	}
 	return n
+}
+
+func allowAllConsent() peer.ConsentHandler {
+	return peer.ConsentFunc(func(_ context.Context, _ *peer.IncomingRequest) peer.ConsentDecision {
+		return peer.ConsentAllow
+	})
+}
+
+func denyAllConsent() peer.ConsentHandler {
+	return peer.ConsentFunc(func(_ context.Context, _ *peer.IncomingRequest) peer.ConsentDecision {
+		return peer.ConsentDeny
+	})
+}
+
+func blacklistAllConsent() peer.ConsentHandler {
+	return peer.ConsentFunc(func(_ context.Context, _ *peer.IncomingRequest) peer.ConsentDecision {
+		return peer.ConsentBlacklist
+	})
 }
 
 type safeLogBuffer struct {
@@ -136,68 +156,40 @@ func generateTestPKI(t *testing.T, ips ...net.IP) testCA {
 }
 
 type testMeshIdentities struct {
-	authority *identity.KeyPair
-	peerA     *identity.KeyPair
-	peerB     *identity.KeyPair
-	peerC     *identity.KeyPair
-	memA      *identity.MembershipRecord
-	memB      *identity.MembershipRecord
-	memC      *identity.MembershipRecord
-	policy    identity.PolicyConfig
+	peerA *identity.KeyPair
+	peerB *identity.KeyPair
+	peerC *identity.KeyPair
 }
 
 func newTestMeshIdentities(t *testing.T) testMeshIdentities {
 	t.Helper()
 
-	authKP, err := identity.GenerateKeyPair()
+	kpA, err := identity.GenerateKeyPair()
 	if err != nil {
 		t.Fatal(err)
 	}
-	kpA, _ := identity.GenerateKeyPair()
-	kpB, _ := identity.GenerateKeyPair()
-	kpC, _ := identity.GenerateKeyPair()
+	kpB, err := identity.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kpC, err := identity.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Ensure deterministic PeerA < PeerB lexicographical ordering when helpful in glare tests.
+	// Ensure deterministic PeerA < PeerB lexicographical ordering for glare tests.
 	if kpA.PeerID > kpB.PeerID {
 		kpA, kpB = kpB, kpA
 	}
 
-	now := time.Now().Unix()
-	memA, err := identity.IssueMembership(authKP, kpA.PublicKey, now-60, now+3600, []string{kpB.PeerID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	memB, err := identity.IssueMembership(authKP, kpB.PublicKey, now-60, now+3600, []string{kpA.PeerID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Peer C is a valid member of the authority, but NOT authorized in the ACL with B!
-	memC, err := identity.IssueMembership(authKP, kpC.PublicKey, now-60, now+3600, []string{"*"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	policy := identity.PolicyConfig{
-		Version:            1,
-		TrustedAuthorities: []string{identity.EncodePublicKey(authKP.PublicKey)},
-		ACLRules: []identity.ACLRule{
-			{PeerA: kpA.PeerID, PeerB: kpB.PeerID},
-		},
-	}
-
 	return testMeshIdentities{
-		authority: authKP,
-		peerA:     kpA,
-		peerB:     kpB,
-		peerC:     kpC,
-		memA:      memA,
-		memB:      memB,
-		memC:      memC,
-		policy:    policy,
+		peerA: kpA,
+		peerB: kpB,
+		peerC: kpC,
 	}
 }
 
-func startTestHub(t *testing.T, network, listenAddr, stunsListenAddr string, policy identity.PolicyConfig, stunsConn net.PacketConn, extraIPs ...net.IP) (*hub.Server, testCA, *safeLogBuffer, string, string) {
+func startTestHub(t *testing.T, network, listenAddr, stunsListenAddr string, stunsConn net.PacketConn, extraIPs ...net.IP) (*hub.Server, testCA, *safeLogBuffer, string, string) {
 	t.Helper()
 
 	pki := generateTestPKI(t, extraIPs...)
@@ -211,14 +203,13 @@ func startTestHub(t *testing.T, network, listenAddr, stunsListenAddr string, pol
 	boundAddr := rawLn.Addr().String()
 	wsURL := "wss://" + boundAddr + "/v1/signal"
 
-	srv, err := hub.New(hub.Config{
+	srv, err := hub.New(&hub.Config{
 		HTTPSListener:   rawLn,
 		TLSConfig:       pki.serverTLS,
 		HubOrigin:       "wss://" + boundAddr,
 		EnableSTUN:      stunsConn != nil || stunsListenAddr != "",
 		STUNSListenAddr: stunsListenAddr,
 		STUNSPacketConn: stunsConn,
-		Policy:          policy,
 		Logger:          logger,
 	})
 	if err != nil {

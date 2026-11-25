@@ -66,7 +66,7 @@ func TestSTUNSDTLS13UDPDefaultAndInsecureOptIn(t *testing.T) {
 
 	t.Run("Rejects plaintext UDP without AllowInsecure", func(t *testing.T) {
 		t.Parallel()
-		_, err := stunserver.New(stunserver.Config{
+		_, err := stunserver.New(&stunserver.Config{
 			ListenAddr: "127.0.0.1:0",
 		})
 		if !errors.Is(err, stunserver.ErrInsecureSTUNProhibited) {
@@ -77,7 +77,7 @@ func TestSTUNSDTLS13UDPDefaultAndInsecureOptIn(t *testing.T) {
 	t.Run("DTLS 1.3 UDP STUNS IPv4 binding, DTLS 1.2 rejected, TURN allocate rejected", func(t *testing.T) {
 		t.Parallel()
 		srvTLS, roots := makeTestSTUNSCert(t)
-		srv, err := stunserver.New(stunserver.Config{
+		srv, err := stunserver.New(&stunserver.Config{
 			DTLSListenAddr: "127.0.0.1:0",
 			TLSConfig:      srvTLS,
 			PerIPRPS:       200,
@@ -197,7 +197,7 @@ func TestSTUNSDTLS13UDPDefaultAndInsecureOptIn(t *testing.T) {
 			t.Skipf("IPv6 loopback unavailable: %v", err)
 		}
 		srvTLS, roots := makeTestSTUNSCert(t)
-		srv, err := stunserver.New(stunserver.Config{
+		srv, err := stunserver.New(&stunserver.Config{
 			DTLSPacketConn: lnConn,
 			TLSConfig:      srvTLS,
 		})
@@ -260,7 +260,7 @@ func TestSTUNSDTLS13UDPDefaultAndInsecureOptIn(t *testing.T) {
 
 	t.Run("Opt-in AllowInsecure plaintext UDP binding and validation", func(t *testing.T) {
 		t.Parallel()
-		srv, err := stunserver.New(stunserver.Config{
+		srv, err := stunserver.New(&stunserver.Config{
 			AllowInsecure: true,
 			ListenAddr:    "127.0.0.1:0",
 			PerIPRPS:      100,
@@ -333,7 +333,7 @@ func TestSTUNSTLS13TCPOnlyAndInsecureTCP(t *testing.T) {
 
 	t.Run("Rejects plaintext TCP without AllowInsecure", func(t *testing.T) {
 		t.Parallel()
-		_, err := stunserver.New(stunserver.Config{
+		_, err := stunserver.New(&stunserver.Config{
 			TCPListenAddr: "127.0.0.1:0",
 		})
 		if !errors.Is(err, stunserver.ErrInsecureSTUNProhibited) {
@@ -344,7 +344,7 @@ func TestSTUNSTLS13TCPOnlyAndInsecureTCP(t *testing.T) {
 	t.Run("TLS 1.3 TCP STUNS binds zero UDP sockets, rejects TLS 1.2 and TURN Allocate", func(t *testing.T) {
 		t.Parallel()
 		srvTLS, roots := makeTestSTUNSCert(t)
-		srv, err := stunserver.New(stunserver.Config{
+		srv, err := stunserver.New(&stunserver.Config{
 			TLSListenAddr: "127.0.0.1:0",
 			TLSConfig:     srvTLS,
 			PerIPRPS:      200,
@@ -428,7 +428,7 @@ func TestSTUNSTLS13TCPOnlyAndInsecureTCP(t *testing.T) {
 			t.Skipf("IPv6 loopback unavailable: %v", err)
 		}
 		srvTLS, roots := makeTestSTUNSCert(t)
-		srv, err := stunserver.New(stunserver.Config{
+		srv, err := stunserver.New(&stunserver.Config{
 			TLSListener: ln6,
 			TLSConfig:   srvTLS,
 		})
@@ -474,7 +474,7 @@ func TestSTUNSTLS13TCPOnlyAndInsecureTCP(t *testing.T) {
 
 	t.Run("Opt-in AllowInsecure plaintext TCP STUN with zero UDP", func(t *testing.T) {
 		t.Parallel()
-		srv, err := stunserver.New(stunserver.Config{
+		srv, err := stunserver.New(&stunserver.Config{
 			AllowInsecure: true,
 			TCPListenAddr: "127.0.0.1:0",
 		})

@@ -43,13 +43,11 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 		LoggerFactory: lf,
 	})
 
-	// Hub STUN UDP socket on public WAN IP 203.0.113.10:3478.
 	stunNet := newVNetNIC(t, "203.0.113.10")
 	if err := wan.AddNet(stunNet); err != nil {
 		t.Fatal(err)
 	}
 
-	// NAT A: 192.168.10.0/24 -> WAN 203.0.113.21 (Address-Restricted Cone NAT).
 	natA := newVNetRouter(t, &vnet.RouterConfig{
 		CIDR:      "192.168.10.0/24",
 		StaticIPs: []string{"203.0.113.21"},
@@ -67,7 +65,6 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// NAT B: 192.168.20.0/24 -> WAN 203.0.113.22 (Address-Restricted Cone NAT).
 	natB := newVNetRouter(t, &vnet.RouterConfig{
 		CIDR:      "192.168.20.0/24",
 		StaticIPs: []string{"203.0.113.22"},
@@ -97,13 +94,11 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 	defer stunConn.Close()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
+	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", stunConn, net.ParseIP("203.0.113.10"))
 
 	sessBCh := make(chan *peer.Session, 1)
-	clientA, err := peer.NewClient(peer.Config{
+	clientA, err := peer.NewClient(&peer.Config{
 		KeyPair:           ids.peerA,
-		Membership:        ids.memA,
-		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
 		STUNServerURI:     "stuns:203.0.113.10:5349",
@@ -111,16 +106,15 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 		IncludeLoopback:   false,
 		VNet:              netA,
 		PionLoggerFactory: lf,
+		Consent:           allowAllConsent(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clientA.Close()
 
-	clientB, err := peer.NewClient(peer.Config{
+	clientB, err := peer.NewClient(&peer.Config{
 		KeyPair:           ids.peerB,
-		Membership:        ids.memB,
-		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
 		STUNServerURI:     "stuns:203.0.113.10:5349",
@@ -128,6 +122,7 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 		IncludeLoopback:   false,
 		VNet:              netB,
 		PionLoggerFactory: lf,
+		Consent:           allowAllConsent(),
 		OnSession:         func(s *peer.Session) { sessBCh <- s },
 	})
 	if err != nil {
@@ -169,7 +164,7 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 
 // TestT04_RestrictiveNATsFailClosed verifies T04:
 // Restrictive symmetric NATs / firewalls with no viable direct UDP path fail closed
-// within the configured budget without any relay attempt.
+// within the configured budget when no relay is configured.
 func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 	t.Parallel()
 
@@ -179,8 +174,6 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 	stunNet := newVNetNIC(t, "203.0.113.10")
 	_ = wan.AddNet(stunNet)
 
-	// Block all direct peer-to-peer UDP packets between NAT A (203.0.113.31) and NAT B (203.0.113.32)
-	// while still permitting STUN Binding to 203.0.113.10.
 	wan.AddChunkFilter(func(c vnet.Chunk) bool {
 		src := c.SourceAddr().(*net.UDPAddr).IP.String()
 		dst := c.DestinationAddr().(*net.UDPAddr).IP.String()
@@ -223,12 +216,10 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 	defer stunConn.Close()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
+	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", stunConn, net.ParseIP("203.0.113.10"))
 
-	clientA, _ := peer.NewClient(peer.Config{
+	clientA, _ := peer.NewClient(&peer.Config{
 		KeyPair:                 ids.peerA,
-		Membership:              ids.memA,
-		Policy:                  ids.policy,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
 		STUNServerURI:           "stuns:203.0.113.10:5349",
@@ -236,14 +227,13 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 		IncludeLoopback:         false,
 		VNet:                    netA,
 		PionLoggerFactory:       lf,
+		Consent:                 allowAllConsent(),
 		OfferToConnectedTimeout: 2 * time.Second,
 	})
 	defer clientA.Close()
 
-	clientB, _ := peer.NewClient(peer.Config{
+	clientB, _ := peer.NewClient(&peer.Config{
 		KeyPair:                 ids.peerB,
-		Membership:              ids.memB,
-		Policy:                  ids.policy,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
 		STUNServerURI:           "stuns:203.0.113.10:5349",
@@ -251,6 +241,7 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 		IncludeLoopback:         false,
 		VNet:                    netB,
 		PionLoggerFactory:       lf,
+		Consent:                 allowAllConsent(),
 		OfferToConnectedTimeout: 2 * time.Second,
 	})
 	defer clientB.Close()
@@ -273,8 +264,7 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 
 // TestT09_LargeBinaryTransferPacketCapture verifies T09:
 // Sends a 512 KiB binary transfer (32 x 16 KiB chunks) between connected peers
-// and verifies via packet capture that all application data flows directly between peers
-// while Hub traffic is strictly control-plane.
+// and verifies via packet capture that all application data flows directly between peers.
 func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	t.Parallel()
 
@@ -295,7 +285,6 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 		otherBytes      atomic.Uint64
 	)
 
-	// Packet capture filter inspecting every datagram traversing the virtual network.
 	wan.AddChunkFilter(func(c vnet.Chunk) bool {
 		src := c.SourceAddr().(*net.UDPAddr).IP.String()
 		dst := c.DestinationAddr().(*net.UDPAddr).IP.String()
@@ -329,13 +318,11 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	defer stunConn.Close()
 
 	ids := newTestMeshIdentities(t)
-	srv, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
+	srv, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", stunConn, net.ParseIP("203.0.113.10"))
 
 	sessBCh := make(chan *peer.Session, 1)
-	clientA, _ := peer.NewClient(peer.Config{
+	clientA, _ := peer.NewClient(&peer.Config{
 		KeyPair:           ids.peerA,
-		Membership:        ids.memA,
-		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
 		STUNServerURI:     "stuns:203.0.113.10:5349",
@@ -343,13 +330,12 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 		IncludeLoopback:   false,
 		VNet:              netA,
 		PionLoggerFactory: lf,
+		Consent:           allowAllConsent(),
 	})
 	defer clientA.Close()
 
-	clientB, _ := peer.NewClient(peer.Config{
+	clientB, _ := peer.NewClient(&peer.Config{
 		KeyPair:           ids.peerB,
-		Membership:        ids.memB,
-		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
 		STUNServerURI:     "stuns:203.0.113.10:5349",
@@ -357,6 +343,7 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 		IncludeLoopback:   false,
 		VNet:              netB,
 		PionLoggerFactory: lf,
+		Consent:           allowAllConsent(),
 		OnSession:         func(s *peer.Session) { sessBCh <- s },
 	})
 	defer clientB.Close()
@@ -375,7 +362,6 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	hubStatsBefore := srv.Stats()
 	hubUDPBefore := hubUDPBytes.Load()
 
-	// Transfer 512 KiB (32 chunks x 16 KiB) with SHA-256 verification.
 	const numChunks = 32
 	const chunkSize = peer.MaxApplicationMessageBytes
 	totalPayload := make([]byte, numChunks*chunkSize)
@@ -470,13 +456,11 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 		defer stunConn.Close()
 
 		ids := newTestMeshIdentities(t)
-		_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
+		_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", stunConn, net.ParseIP("203.0.113.10"))
 
 		sessBCh := make(chan *peer.Session, 1)
-		clientA, _ := peer.NewClient(peer.Config{
+		clientA, _ := peer.NewClient(&peer.Config{
 			KeyPair:           ids.peerA,
-			Membership:        ids.memA,
-			Policy:            ids.policy,
 			SignalingURL:      wsURL,
 			TLSConfig:         pki.clientTLS,
 			STUNServerURI:     "stuns:203.0.113.10:5349",
@@ -484,14 +468,13 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 			IncludeLoopback:   false,
 			VNet:              netA1,
 			PionLoggerFactory: lf,
+			Consent:           allowAllConsent(),
 			ICERestartBackoff: 50 * time.Millisecond,
 		})
 		defer clientA.Close()
 
-		clientB, _ := peer.NewClient(peer.Config{
+		clientB, _ := peer.NewClient(&peer.Config{
 			KeyPair:           ids.peerB,
-			Membership:        ids.memB,
-			Policy:            ids.policy,
 			SignalingURL:      wsURL,
 			TLSConfig:         pki.clientTLS,
 			STUNServerURI:     "stuns:203.0.113.10:5349",
@@ -499,6 +482,7 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 			IncludeLoopback:   false,
 			VNet:              netB,
 			PionLoggerFactory: lf,
+			Consent:           allowAllConsent(),
 			ICERestartBackoff: 50 * time.Millisecond,
 			OnSession:         func(s *peer.Session) { sessBCh <- s },
 		})
@@ -515,11 +499,9 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 		}
 		sessB := <-sessBCh
 
-		// Kill old NIC 198.51.100.21 and switch Peer A to new NIC 198.51.100.22!
 		blockOldA1.Store(true)
 		clientA.UpdateNetwork(netA2)
 
-		// Wait for generation 1 Connected state on both peers.
 		deadline := time.Now().Add(8 * time.Second)
 		for time.Now().Before(deadline) {
 			dA := sessA.Diagnostics()
@@ -566,34 +548,32 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 		defer wan.Stop()
 
 		ids := newTestMeshIdentities(t)
-		_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, nil)
+		_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", nil)
 
-		clientA, _ := peer.NewClient(peer.Config{
+		clientA, _ := peer.NewClient(&peer.Config{
 			KeyPair:                 ids.peerA,
-			Membership:              ids.memA,
-			Policy:                  ids.policy,
 			SignalingURL:            wsURL,
 			TLSConfig:               pki.clientTLS,
 			NetworkTypes:            []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:         false,
 			VNet:                    netA,
 			PionLoggerFactory:       lf,
+			Consent:                 allowAllConsent(),
 			MaxICERestarts:          1,
 			ICERestartBackoff:       50 * time.Millisecond,
 			OfferToConnectedTimeout: 1500 * time.Millisecond,
 		})
 		defer clientA.Close()
 
-		clientB, _ := peer.NewClient(peer.Config{
+		clientB, _ := peer.NewClient(&peer.Config{
 			KeyPair:                 ids.peerB,
-			Membership:              ids.memB,
-			Policy:                  ids.policy,
 			SignalingURL:            wsURL,
 			TLSConfig:               pki.clientTLS,
 			NetworkTypes:            []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:         false,
 			VNet:                    netB,
 			PionLoggerFactory:       lf,
+			Consent:                 allowAllConsent(),
 			MaxICERestarts:          1,
 			ICERestartBackoff:       50 * time.Millisecond,
 			OfferToConnectedTimeout: 1500 * time.Millisecond,
@@ -610,7 +590,6 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Sever all UDP connectivity and trigger ICE restart -> MUST fail closed.
 		severDirect.Store(true)
 		if err := sessA.RestartICE(ctx); err == nil {
 			t.Fatal("T11: expected RestartICE to fail closed when direct path is severed")
@@ -623,7 +602,7 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 
 // TestT12_FloodOversizedSignalingAndMalformedSTUN verifies T12:
 // Flooding the Hub with oversized signaling frames, connection bursts, and malformed STUN
-// enforces rate/size limits with bounded resource usage while legitimate peers still succeed.
+// enforces rate/size limits while legitimate peers still connect.
 func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 	t.Parallel()
 
@@ -636,13 +615,12 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 	boundAddr := rawLn.Addr().String()
 	wsURL := "wss://" + boundAddr + "/v1/signal"
 
-	srv, err := hub.New(hub.Config{
+	srv, err := hub.New(&hub.Config{
 		HTTPSListener:   rawLn,
 		TLSConfig:       pki.serverTLS,
 		HubOrigin:       "wss://" + boundAddr,
 		EnableSTUN:      true,
 		STUNSListenAddr: "127.0.0.1:0",
-		Policy:          ids.policy,
 		PerIPConnRPS:    50,
 		PerIPConnBurst:  15,
 		STUNPerIPRPS:    50,
@@ -656,14 +634,13 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 1. Send an oversized (80 KiB > 64 KiB) WebSocket message during registration -> rejected!
 	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.clientTLS}}
 	wsBig, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: hc})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _, _ = wsBig.Read(ctx) // challenge
-	oversizedJSON := `{"v":1,"type":"register","pad":"` + strings.Repeat("A", 80*1024) + `"}`
+	oversizedJSON := `{"v":2,"type":"register","pad":"` + strings.Repeat("A", 80*1024) + `"}`
 	_ = wsBig.Write(ctx, websocket.MessageText, []byte(oversizedJSON))
 	_, _, readErr := wsBig.Read(ctx)
 	if websocket.CloseStatus(readErr) != websocket.StatusMessageTooBig && readErr == nil {
@@ -671,7 +648,6 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 	}
 	_ = wsBig.CloseNow()
 
-	// 2. Flood STUN UDP with 250 malformed, oversized, and unsupported packets.
 	floodUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		t.Fatal(err)
@@ -698,7 +674,6 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 	}
 	wg.Wait()
 
-	// 3. Burst WSS connection attempts beyond PerIPConnBurst (15) -> HTTP 429 rate limiting engages.
 	for i := 0; i < 25; i++ {
 		c, _, dErr := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: hc})
 		if dErr == nil {
@@ -714,29 +689,26 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 		t.Fatalf("T12: expected STUN flood counters > 0, got %+v", st.STUN)
 	}
 
-	// Wait briefly for token bucket refill (~100ms) and verify legitimate peers still connect!
 	time.Sleep(120 * time.Millisecond)
 
 	sessBCh := make(chan *peer.Session, 1)
-	clientA, _ := peer.NewClient(peer.Config{
+	clientA, _ := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerA,
-		Membership:      ids.memA,
-		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   "stuns:" + srv.STUNSAddr().String(),
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 	})
 	defer clientA.Close()
 
-	clientB, _ := peer.NewClient(peer.Config{
+	clientB, _ := peer.NewClient(&peer.Config{
 		KeyPair:         ids.peerB,
-		Membership:      ids.memB,
-		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
 		STUNServerURI:   "stuns:" + srv.STUNSAddr().String(),
 		IncludeLoopback: true,
+		Consent:         allowAllConsent(),
 		OnSession:       func(s *peer.Session) { sessBCh <- s },
 	})
 	defer clientB.Close()
@@ -759,8 +731,7 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 }
 
 // TestT13_TamperDTLSProtectedRecordNotDelivered verifies T13:
-// Flipping bits in an in-flight DTLS 1.3 ciphertext record causes AEAD authentication
-// rejection so tampered content is never delivered to the application.
+// Flipping bits in an in-flight DTLS 1.3 ciphertext record causes AEAD rejection.
 func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 	t.Parallel()
 
@@ -784,7 +755,6 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 		if src == "198.51.100.41" && dst == "198.51.100.42" && len(data) > 32 &&
 			dtlsProtocol.IsDTLS13Ciphertext(dtlsProtocol.ContentType(data[0])) {
 			if tamperNextCiphertext.CompareAndSwap(true, false) {
-				// Flip ciphertext / AEAD authentication tag bits in transit!
 				data[len(data)-1] ^= 0xff
 				data[len(data)-5] ^= 0xa5
 				tamperedCount.Add(1)
@@ -797,13 +767,11 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 	defer wan.Stop()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, nil)
+	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", nil)
 
 	sessBCh := make(chan *peer.Session, 1)
-	clientA, _ := peer.NewClient(peer.Config{
+	clientA, _ := peer.NewClient(&peer.Config{
 		KeyPair:             ids.peerA,
-		Membership:          ids.memA,
-		Policy:              ids.policy,
 		SignalingURL:        wsURL,
 		TLSConfig:           pki.clientTLS,
 		NetworkTypes:        []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
@@ -811,13 +779,12 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 		EnablePacketChannel: true,
 		VNet:                netA,
 		PionLoggerFactory:   lf,
+		Consent:             allowAllConsent(),
 	})
 	defer clientA.Close()
 
-	clientB, _ := peer.NewClient(peer.Config{
+	clientB, _ := peer.NewClient(&peer.Config{
 		KeyPair:             ids.peerB,
-		Membership:          ids.memB,
-		Policy:              ids.policy,
 		SignalingURL:        wsURL,
 		TLSConfig:           pki.clientTLS,
 		NetworkTypes:        []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
@@ -825,6 +792,7 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 		EnablePacketChannel: true,
 		VNet:                netB,
 		PionLoggerFactory:   lf,
+		Consent:             allowAllConsent(),
 		OnSession:           func(s *peer.Session) { sessBCh <- s },
 	})
 	defer clientB.Close()
@@ -840,7 +808,6 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 	}
 	sessB := <-sessBCh
 
-	// Wait until packet/v1 channel is open by sending a warmup datagram.
 	warmup := []byte("warmup-packet-v1")
 	for i := 0; i < 10; i++ {
 		_ = sessA.SendPacket(ctx, warmup)
@@ -855,13 +822,11 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 	t.Fatal("packet/v1 failed to open during warmup")
 
 packetOpen:
-	// Arm wire-level DTLS 1.3 record tampering for the next packet/v1 datagram (maxRetransmits=0).
 	tamperNextCiphertext.Store(true)
 	poisoned := []byte("FORGED-OR-CORRUPTED-PAYLOAD-MUST-NOT-ARRIVE")
 	if err := sessA.SendPacket(ctx, poisoned); err != nil {
 		t.Fatal(err)
 	}
-	// Wait until the filter confirms it tampered with the in-flight DTLS 1.3 ciphertext record.
 	deadline := time.Now().Add(2 * time.Second)
 	for tamperedCount.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -870,7 +835,6 @@ packetOpen:
 		t.Fatal("T13: tamper filter did not intercept DTLS 1.3 ciphertext")
 	}
 
-	// Send a subsequent authentic, untampered datagram.
 	authentic := []byte("AUTHENTIC-DTLS13-RECORD")
 	if err := sessA.SendPacket(ctx, authentic); err != nil {
 		t.Fatal(err)
@@ -884,5 +848,5 @@ packetOpen:
 	case <-ctx.Done():
 		t.Fatal("T13: authentic follow-up record did not arrive")
 	}
-	t.Logf("T13 Verified: TamperedDTLS13Records=%d (dropped by AEAD; zero corrupted bytes delivered)", tamperedCount.Load())
+	t.Logf("T13 Verified: TamperedDTLS13Records=%d", tamperedCount.Load())
 }

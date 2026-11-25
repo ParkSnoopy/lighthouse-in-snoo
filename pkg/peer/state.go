@@ -2,7 +2,7 @@ package peer
 
 import "errors"
 
-// ConnectionState models the normative peer connection state machine (Section 5.2).
+// ConnectionState models the peer connection state machine.
 type ConnectionState string
 
 const (
@@ -15,22 +15,22 @@ const (
 	StateFailed         ConnectionState = "Failed"
 )
 
-// DataChannel labels defined in Section 7.
+// DataChannel labels and transport limits.
 const (
 	ChannelLabelDataV1   = "data/v1"
 	ChannelLabelPacketV1 = "packet/v1"
 
-	// MaxApplicationMessageBytes is the initial per-message payload limit (16 KiB, Section 7).
+	// MaxApplicationMessageBytes is the per-message payload limit (16 KiB).
 	MaxApplicationMessageBytes = 16 * 1024
-	// DefaultApplicationQueueBytes is the bounded outbound queue limit per peer (1 MiB, Section 9).
+	// DefaultApplicationQueueBytes is the bounded outbound queue limit per peer (1 MiB).
 	DefaultApplicationQueueBytes = 1024 * 1024
 
-	// ExpectedDTLS13HexVersion is the RFC 9147 DTLS 1.3 version code (0xFEFC) reported by Pion TransportStats.
+	// ExpectedDTLS13HexVersion is the RFC 9147 DTLS 1.3 version code (0xFEFC).
 	ExpectedDTLS13HexVersion = "FEFC"
 )
 
 var (
-	ErrProhibitedCandidate   = errors.New("peer: prohibited relay or non-UDP ICE candidate")
+	ErrProhibitedCandidate   = errors.New("peer: prohibited relay or wrong-transport ICE candidate")
 	ErrProhibitedEndpoint    = errors.New("peer: prohibited hub service endpoint in candidate")
 	ErrInvalidICEConfig      = errors.New("peer: invalid or prohibited ICE server configuration")
 	ErrInsecureICEProhibited = errors.New("peer: plaintext stun:/turn: requires opt-in --insecure; use stuns:/turns:")
@@ -41,6 +41,8 @@ var (
 	ErrMessageTooLarge       = errors.New("peer: message exceeds negotiated 16 KiB limit")
 	ErrSessionClosed         = errors.New("peer: session is closed or failed")
 	ErrPeerOfflineOrDenied   = errors.New("peer: target peer offline or denied")
+	ErrUserDenied            = errors.New("peer: connection denied by user")
+	ErrPeerBlacklisted       = errors.New("peer: remote peer is blacklisted")
 	ErrHubDisconnected       = errors.New("peer: control-plane WSS connection unavailable")
 	ErrReplayedSignaling     = errors.New("peer: replayed signaling envelope rejected")
 	ErrStaleGeneration       = errors.New("peer: stale ICE generation rejected")
@@ -49,9 +51,10 @@ var (
 	ErrRestartExhausted      = errors.New("peer: ICE restart retry budget exhausted")
 )
 
-// SessionDiagnostics exposes non-sensitive connection state and transport metrics (Section 9 & 10).
+// SessionDiagnostics exposes non-sensitive connection state and transport metrics.
 type SessionDiagnostics struct {
 	RemotePeerID        string
+	RemoteVirtualIP     string
 	SessionID           string
 	Generation          uint32
 	State               ConnectionState

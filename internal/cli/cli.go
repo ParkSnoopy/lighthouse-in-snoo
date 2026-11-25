@@ -276,17 +276,18 @@ func (c *Command) parseLeafArgs(args []string, stderr io.Writer) ([]string, help
 				continue
 			}
 		}
-		if opt.Default != "" {
+		switch {
+		case opt.Default != "":
 			if err := opt.applyValue(opt.Default); err != nil {
 				return nil, helpNone, false, &ExitError{Code: 2, Err: err}
 			}
-		} else if opt.Kind == KindBool && opt.boolDst != nil {
+		case opt.Kind == KindBool && opt.boolDst != nil:
 			*opt.boolDst = false
-		} else if opt.Kind == KindString && opt.strDst != nil {
+		case opt.Kind == KindString && opt.strDst != nil:
 			*opt.strDst = ""
-		} else if opt.Kind == KindInt && opt.intDst != nil {
+		case opt.Kind == KindInt && opt.intDst != nil:
 			*opt.intDst = 0
-		} else if opt.Kind == KindDuration && opt.durDst != nil {
+		case opt.Kind == KindDuration && opt.durDst != nil:
 			*opt.durDst = 0
 		}
 	}
