@@ -1,0 +1,76 @@
+name: Warm APT and Go Module Caches
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - go.mod
+      - go.sum
+      - Dockerfile
+      - .github/workflows/cache.yml
+  schedule:
+    - cron: "0 0 */5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Go Modules
+        id: cache-gomod
+        uses: actions/cache@v6
+        with:
+          path: /tmp/cache/gomod
+          key: go-mod-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-${{ runner.os }}-
+
+      - name: Populate Go Module Cache
+        if: steps.cache-gomod.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/cache/gomod
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e GOMODCACHE=/cache/gomod \
+            -e GOFLAGS=-modcacherw \
+            -v /tmp/cache/gomod:/cache/gomod \
+            -v "${PWD}/go.mod:/src/go.mod:ro" \
+            -v "${PWD}/go.sum:/src/go.sum:ro" \
+            -w /src \
+            golang:1.27-alpine go mod download
+
+      - name: Cache Debian APT Packages
+        id: cache-apt
+        uses: actions/cache@v6
+        with:
+          path: /tmp/cache/apt
+          key: apt-debian13-${{ runner.os }}-${{ hashFiles('Dockerfile') }}
+          restore-keys: |
+            apt-debian13-${{ runner.os }}-
+
+      - name: Populate Debian APT Cache
+        if: steps.cache-apt.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/cache/apt/archives /tmp/cache/apt/lists
+          docker run --rm \
+            -v /tmp/cache/apt/archives:/var/cache/apt/archives \
+            -v /tmp/cache/apt/lists:/var/lib/apt/lists \
+            debian:13-slim sh -eu -c "
+              rm -f /etc/apt/apt.conf.d/docker-clean
+              apt-get update
+              apt-get install -y --download-only --no-install-recommends ca-certificates
+              rm -rf /var/cache/apt/archives/lock /var/cache/apt/archives/partial /var/lib/apt/lists/lock /var/lib/apt/lists/partial
+              chown -R $(id -u):$(id -g) /var/cache/apt/archives /var/lib/apt/lists
+            "

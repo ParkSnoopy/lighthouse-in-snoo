@@ -176,7 +176,13 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 	}
 
 	// Build definitions never duplicate Version or bake LIGHTHOUSE_* variables at build time.
-	for _, rel := range []string{"Dockerfile", "Makefile", "docker-compose.yml", filepath.Join(".github", "workflows", "build.yml")} {
+	for _, rel := range []string{
+		"Dockerfile",
+		"Makefile",
+		"docker-compose.yml",
+		filepath.Join(".github", "workflows", "build.yml"),
+		filepath.Join(".github", "workflows", "cache.yml"),
+	} {
 		data, readErr := os.ReadFile(filepath.Join("..", "..", rel))
 		if readErr != nil {
 			t.Fatalf("read %s: %v", rel, readErr)
@@ -202,6 +208,16 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 			}
 			if !strings.Contains(text, "pkg/version/version.go") {
 				t.Fatalf("%s must resolve release version from pkg/version/version.go", rel)
+			}
+			if !strings.Contains(text, "actions/cache@v6") {
+				t.Fatalf("%s must use actions/cache@v6 for APT and Go module caching", rel)
+			}
+		}
+		if rel == filepath.Join(".github", "workflows", "cache.yml") {
+			for _, want := range []string{"actions/cache@v6", "/tmp/cache/gomod", "/tmp/cache/apt"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("%s missing %q", rel, want)
+				}
 			}
 		}
 	}
