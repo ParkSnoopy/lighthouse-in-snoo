@@ -214,6 +214,7 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 		if err := clientB.Register(ctx); err != nil {
 			t.Fatalf("Register B: %v", err)
 		}
+		authorizeOnPassphrase(t, ctx, "tcp-only-v4", clientB, clientA)
 
 		sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 		if err != nil {
@@ -409,6 +410,7 @@ func TestTCPOnlyModeZeroUDPEndToEnd(t *testing.T) {
 		if err := clientB.Register(ctx); err != nil {
 			t.Fatal(err)
 		}
+		authorizeOnPassphrase(t, ctx, "tcp-only-v6", clientB, clientA)
 
 		sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 		if err != nil {

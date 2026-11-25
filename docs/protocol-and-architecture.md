@@ -4,12 +4,14 @@
 
 Lighthouse separates the network into two components:
 
-1. **Zero-Config Universal Hub (`cmd/lighthouse` / `internal/hub`)**: A stateless `CGO_ENABLED=0` static `linux/amd64` server with no policy files, ACLs, or database. It provides:
+1. **Zero-Config Universal Hub (`cmd/lighthouse` / `internal/hub`)**: A `CGO_ENABLED=0` static `linux/amd64` server with no static ACL policy files or database. It provides:
    - TLS 1.3 WSS signaling (`/v1/signal`) and privacy-preserving health endpoint (`/healthz`).
+   - Hub-managed IPv4 CIDR assignment (`--cidr` / `LIGHTHOUSE_CIDR`, default `10.88.0.0/16`), advertising `virtual_cidr` and `assigned_ip` in `registered`.
    - Passphrase-bucketed broadcast forwarding (opaque 32-byte `channel_id` tokens; the hub never sees raw passphrases or decrypted peer labels).
+   - Automatic server-side ACL derived purely from live passphrase channel membership and active broadcast status: a peer may initiate a new signaling session to target `B` if and only if `B` is actively broadcasting on a `channel_id` that the caller has joined or is also broadcasting on.
    - Optional offline shared hub passphrase gating (`--passphrase` / `LIGHTHOUSE_PASSPHRASE`) verified via challenge-bound HMAC.
    - Integrated universal DTLS 1.3 / UDP STUNS + TURNS relay (`:5349/udp`) that automatically mints 12-hour HMAC TURN REST credentials in `registered.relay` for every registered peer (or TLS 1.3 / TCP STUNS with zero UDP sockets under `--tcp-only`).
-2. **Bound OS Virtual Interface App (`cmd/lighthouse-ui` / `internal/ui` / `pkg/tun` / `pkg/peer`)**: A Fyne desktop application that binds a local OS TUN virtual interface (`lh0`, configurable IPv4 CIDR defaulting to `10.88.0.0/16`) directly to user-authorized DTLS 1.3 WebRTC tunnels.
+2. **Bound OS Virtual Interface App (`cmd/lighthouse-ui` / `internal/ui` / `pkg/tun` / `pkg/peer`)**: A Fyne desktop application that registers with the hub to receive its hub-assigned IP/CIDR and binds a local OS TUN virtual interface (`lh0`) directly to user-authorized DTLS 1.3 WebRTC tunnels.
 
 ## 2. Protocol Stack
 
@@ -40,7 +42,7 @@ Transport prioritization:
   - `nistp-256`, `nistp-384`, `nistp-521`: `<algo>:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("<algo>\x00" || spki_der))`.
   - `rsa` (RSA-PSS + SHA-256, `2048`–`8192` bits, default `3072`): `rsa:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("rsa\x00" || spki_der))`.
 - Private keys and local blacklist files (`blacklist.json`) are saved atomically with `0600` permissions and rejected if group/world-accessible.
-- Every `peer_id` deterministically maps to a usable host TUN IPv4 address via `SHA-256("LIGHTHOUSE-TUN-IPV4-V2\x00" || peer_id)` mapped into the configured IPv4 CIDR (`--cidr` / `LIGHTHOUSE_CIDR`, default `10.88.0.0/16`, `/1`–`/30`, excluding network and broadcast addresses).
+- Every `peer_id` deterministically maps to a usable host TUN IPv4 address via `SHA-256("LIGHTHOUSE-TUN-IPV4-V2\x00" || peer_id)` inside the hub's configured IPv4 CIDR (`lighthouse hub --cidr` / `LIGHTHOUSE_CIDR`, default `10.88.0.0/16`, `/1`–`/30`, excluding network and broadcast addresses). Peers validate the hub-advertised `virtual_cidr` and `assigned_ip` during `registered` before binding TUN.
 
 ### 3.2 Offline Passphrase Derivation
 
@@ -82,7 +84,7 @@ All signed frames use RFC 8785 JCS (`internal/jcs`), rejecting invalid UTF-8, du
 | --- | --- | --- |
 | `challenge` | Hub → Peer | Single-use challenge, canonical `hub_origin`, and `passphrase_required` flag |
 | `register` | Peer → Hub | `v:2`, `peer_id`, `public_key`, `hub_origin`, `challenge`, `proof`, optional `hub_auth` |
-| `registered` | Hub → Peer | Confirmation, lease TTL, heartbeat interval, and auto-minted universal `relay` credentials |
+| `registered` | Hub → Peer | Confirmation, lease TTL, heartbeat interval, hub `virtual_cidr` / `assigned_ip`, and auto-minted universal `relay` credentials |
 | `heartbeat` | Peer → Hub | Presence lease renewal |
 | `channel_join` | Peer → Hub | Subscribe to broadcasts for opaque `channel_id` |
 | `channel_leave` | Peer → Hub | Unsubscribe and withdraw any active broadcast on `channel_id` |

@@ -75,6 +75,7 @@ const (
 	ErrCodeUnauthenticated    = "unauthenticated"
 	ErrCodeChallengeInvalid   = "challenge_invalid"
 	ErrCodeAuthFailed         = "auth_failed"
+	ErrCodeNotAuthorized      = "not_authorized"
 	ErrCodePeerOffline        = "peer_offline"
 	ErrCodeSenderMismatch     = "sender_mismatch"
 	ErrCodeInvalidSignature   = "invalid_signature"
@@ -198,6 +199,8 @@ type RegisteredMessage struct {
 	PeerID               string     `json:"peer_id"`
 	ExpiresAt            int64      `json:"expires_at"`
 	HeartbeatIntervalSec int        `json:"heartbeat_interval_sec"`
+	VirtualCIDR          string     `json:"virtual_cidr,omitempty"`
+	AssignedIP           string     `json:"assigned_ip,omitempty"`
 	Relay                *RelayInfo `json:"relay,omitempty"`
 }
 

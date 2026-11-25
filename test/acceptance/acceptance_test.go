@@ -138,6 +138,7 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 	if mapped, err := clientA.ProbeSTUNS(ctx); err != nil || mapped == nil {
 		t.Fatalf("ProbeSTUNS DTLS 1.3 / UDP failed: mapped=%v err=%v", mapped, err)
 	}
+	authorizeOnPassphrase(t, ctx, "t01-room", clientB, clientA)
 
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 	if err != nil {
@@ -265,6 +266,7 @@ func TestT02_PublicIPv4AndIPv6Connectivity(t *testing.T) {
 			if err := clientB.Register(ctx); err != nil {
 				t.Fatal(err)
 			}
+			authorizeOnPassphrase(t, ctx, "t02-"+fam.name, clientB, clientA)
 
 			sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 			if err != nil {
@@ -351,6 +353,7 @@ func TestT05_PeerSupportsOnlyDTLS12Fails(t *testing.T) {
 	if err := clientB.Register(ctx); err != nil {
 		t.Fatal(err)
 	}
+	authorizeOnPassphrase(t, ctx, "t05-room", clientB, clientA)
 
 	if _, err := clientA.Connect(ctx, ids.peerB.PeerID); err == nil {
 		t.Fatal("T05 violation: DTLS 1.2 peer succeeded in connecting to DTLS 1.3 peer")
@@ -438,6 +441,7 @@ func TestT06_CompromisedHubTamperingFails(t *testing.T) {
 			defer cancel()
 			_ = clientA.Register(ctx)
 			_ = clientB.Register(ctx)
+			authorizeOnPassphrase(t, ctx, "t06-room", clientB, clientA)
 
 			if _, err := clientA.Connect(ctx, ids.peerB.PeerID); err == nil {
 				t.Fatalf("T06 (%s): expected tampered signaling to fail", tc.name)
@@ -492,6 +496,13 @@ func TestT07_DeniedBlacklistedAndReplayedSignalingRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 0. Server auto-ACL rejects C -> B before B enables broadcast on a shared passphrase.
+	if _, err := clientC.Connect(ctx, ids.peerB.PeerID); !errors.Is(err, peer.ErrNotAuthorized) {
+		t.Fatalf("T07: expected ErrNotAuthorized before broadcast, got %v", err)
+	}
+
+	authorizeOnPassphrase(t, ctx, "t07-room", clientDefaultDeny, clientC)
+
 	if _, err := clientC.Connect(ctx, ids.peerB.PeerID); !errors.Is(err, peer.ErrUserDenied) {
 		t.Fatalf("T07: expected ErrUserDenied on nil Consent handler, got %v", err)
 	}
@@ -526,6 +537,10 @@ func TestT07_DeniedBlacklistedAndReplayedSignalingRejected(t *testing.T) {
 	})
 	_ = wsA.Write(ctx, websocket.MessageText, regRaw)
 	_, _, _ = wsA.Read(ctx) // registered
+	t07Keys, _ := identity.DeriveChannelKeys("t07-room")
+	joinRaw, _ := json.Marshal(protocol.ChannelJoinMessage{V: protocol.Version, Type: protocol.TypeChannelJoin, ChannelID: t07Keys.ChannelID})
+	_ = wsA.Write(ctx, websocket.MessageText, joinRaw)
+	_, _, _ = wsA.Read(ctx) // channel_peers snapshot confirming auto-ACL membership
 
 	sid, _ := protocol.NewSessionID()
 	_, closeEnvRaw, err := protocol.SignEnvelope(
@@ -623,6 +638,7 @@ func TestT08_RelayAndHubEndpointCandidatesRejected(t *testing.T) {
 	if err := clientB.Register(ctx); err != nil {
 		t.Fatal(err)
 	}
+	authorizeOnPassphrase(t, ctx, "t08-room", clientA, clientB)
 
 	pcTmp, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -767,6 +783,7 @@ func TestT10_StopHubDuringHealthyDirectSession(t *testing.T) {
 	_ = clientA.Register(ctx)
 	_ = clientB.Register(ctx)
 	_ = clientC.Register(ctx)
+	authorizeOnPassphrase(t, ctx, "t10-room", clientB, clientA)
 
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 	if err != nil {
@@ -830,6 +847,8 @@ func TestGlareConcurrentOffers(t *testing.T) {
 	defer cancel()
 	_ = clientA.Register(ctx)
 	_ = clientB.Register(ctx)
+	authorizeOnPassphrase(t, ctx, "glare-room", clientB, clientA)
+	authorizeOnPassphrase(t, ctx, "glare-room", clientA, clientB)
 
 	var (
 		sessA, sessB *peer.Session
@@ -916,6 +935,7 @@ func TestMixedAlgorithmDirectP2PConnectivity(t *testing.T) {
 	if err := clientB.Register(ctx); err != nil {
 		t.Fatalf("Register RSA-2048 B: %v", err)
 	}
+	authorizeOnPassphrase(t, ctx, "mixed-algo-room", clientB, clientA)
 
 	sessA, err := clientA.Connect(ctx, peerB.PeerID)
 	if err != nil {

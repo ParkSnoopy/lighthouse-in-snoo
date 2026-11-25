@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -37,16 +38,18 @@ import (
 )
 
 // Config configures the zero-config Lighthouse universal public hub and relay.
-// The hub stores no ACLs, policy files, or SQLite state; security relies strictly
-// on peer cryptographic signatures, passphrase-scoped broadcasts, and explicit user allow actions.
+// The hub stores no static policy files or SQLite state; it owns the virtual IPv4 CIDR,
+// assigns each registered peer an IP from that CIDR, and enforces automatic in-memory ACL
+// based strictly on shared passphrase channels and active broadcast status.
 type Config struct {
 	HTTPSListenAddr string
 	HTTPSListener   net.Listener // Optional pre-bound TCP listener (used in tests).
 	TLSConfig       *tls.Config
 	TLSCertFile     string
 	TLSKeyFile      string
-	AutoTLS         bool   // Generate an ephemeral self-signed TLS 1.3 cert when cert/key are omitted.
-	HubOrigin       string // Canonical wss://host[:port] expected in registration proofs.
+	AutoTLS         bool         // Generate an ephemeral self-signed TLS 1.3 cert when cert/key are omitted.
+	HubOrigin       string       // Canonical wss://host[:port] expected in registration proofs.
+	VirtualCIDR     netip.Prefix // Virtual IPv4 subnet assigned to peers (default 10.88.0.0/16).
 
 	// Optional offline shared passphrase gating registration on this hub (never sent in plaintext).
 	// Leave empty to run as an open universal public relay where clients scope broadcasts per passphrase.
@@ -106,6 +109,7 @@ type Stats struct {
 	BroadcastsUpdated   uint64
 	SignalsForwarded    uint64
 	SignalsRejected     uint64
+	AutoACLDenied       uint64
 	RateLimited         uint64
 	STUN                stunserver.Stats
 }
@@ -116,6 +120,7 @@ type peerSession struct {
 	remoteIP   string
 	peerID     string
 	publicKey  identity.PublicKey
+	assignedIP netip.Addr
 	expiresAt  atomic.Int64 // Unix nanos of presence lease expiry
 	writeMu    sync.Mutex
 	closed     atomic.Bool
@@ -162,10 +167,12 @@ type negotiationRecord struct {
 }
 
 // Server is the zero-config Lighthouse control-plane and universal relay service.
-// It stores no ACLs or policies and never terminates peer-to-peer WebRTC DTLS 1.3 sessions.
+// It owns virtual CIDR assignment and automatic passphrase/broadcast ACL, and never
+// terminates peer-to-peer WebRTC DTLS 1.3 sessions.
 type Server struct {
 	cfg           Config
 	hubOrigin     string
+	virtualCIDR   netip.Prefix
 	hasPassphrase bool
 	hubKey        [32]byte
 	turnSecret    string
@@ -199,6 +206,7 @@ type Server struct {
 	bcastCount  atomic.Uint64
 	sigFwd      atomic.Uint64
 	sigRejected atomic.Uint64
+	aclDenied   atomic.Uint64
 	rateDropped atomic.Uint64
 }
 
@@ -212,6 +220,15 @@ func New(cfgIn *Config) (*Server, error) {
 	origin, err := identity.CanonicalizeOrigin(cfg.HubOrigin)
 	if err != nil {
 		return nil, fmt.Errorf("hub origin: %w", err)
+	}
+	virtualCIDR := cfg.VirtualCIDR
+	if !virtualCIDR.IsValid() {
+		virtualCIDR = identity.DefaultVirtualCIDR()
+	} else {
+		virtualCIDR, err = identity.ParseVirtualCIDR(virtualCIDR.String())
+		if err != nil {
+			return nil, fmt.Errorf("hub virtual cidr: %w", err)
+		}
 	}
 
 	var (
@@ -355,6 +372,7 @@ func New(cfgIn *Config) (*Server, error) {
 	s := &Server{
 		cfg:           cfg,
 		hubOrigin:     origin,
+		virtualCIDR:   virtualCIDR,
 		hasPassphrase: hasPassphrase,
 		hubKey:        hubKey,
 		turnSecret:    turnSecret,
@@ -631,6 +649,11 @@ func (s *Server) HubOrigin() string {
 	return s.hubOrigin
 }
 
+// VirtualCIDR returns the hub's configured IPv4 virtual subnet assigned to registered peers.
+func (s *Server) VirtualCIDR() netip.Prefix {
+	return s.virtualCIDR
+}
+
 // SetForwardTamperHookForTesting installs a raw frame mutator strictly for negative security tests.
 func (s *Server) SetForwardTamperHookForTesting(hook func(raw []byte) []byte) {
 	s.mu.Lock()
@@ -660,6 +683,7 @@ func (s *Server) Stats() Stats {
 		BroadcastsUpdated:   s.bcastCount.Load(),
 		SignalsForwarded:    s.sigFwd.Load(),
 		SignalsRejected:     s.sigRejected.Load(),
+		AutoACLDenied:       s.aclDenied.Load(),
 		RateLimited:         s.rateDropped.Load(),
 		STUN:                stunStats,
 	}
@@ -849,6 +873,8 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 		PeerID:               ps.peerID,
 		ExpiresAt:            time.Unix(0, ps.expiresAt.Load()).Unix(),
 		HeartbeatIntervalSec: hbSec,
+		VirtualCIDR:          s.virtualCIDR.String(),
+		AssignedIP:           ps.assignedIP.String(),
 		Relay:                s.buildRelayInfoForPeer(ps.peerID),
 	}); err != nil {
 		return
@@ -932,11 +958,17 @@ func (s *Server) authenticateRegistration(
 		}
 	}
 
+	assignedIP, err := identity.VirtualIPv4InPrefix(reg.PeerID, s.virtualCIDR)
+	if err != nil {
+		return nil, protocol.ErrCodeAuthFailed, "failed to assign virtual IP"
+	}
+
 	ps := &peerSession{
 		conn:       conn,
 		remoteIP:   remoteIP,
 		peerID:     reg.PeerID,
 		publicKey:  pub,
+		assignedIP: assignedIP,
 		cancel:     cancel,
 		subscribed: make(map[string]struct{}),
 		broadcasts: make(map[string]struct{}),
@@ -1305,12 +1337,16 @@ func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []by
 		return
 	}
 
-	if errCode := s.validateAndRecordSequence(env, now); errCode != "" {
+	if errCode, errDetail := s.validateAndRecordSequence(env, now); errCode != "" {
 		s.sigRejected.Add(1)
+		if errCode == protocol.ErrCodeNotAuthorized {
+			s.aclDenied.Add(1)
+		}
 		_ = ps.sendJSON(ctx, protocol.ErrorMessage{
 			V:         protocol.Version,
 			Type:      protocol.TypeError,
 			Code:      errCode,
+			Detail:    errDetail,
 			SessionID: env.SessionID,
 		})
 		return
@@ -1358,14 +1394,19 @@ func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []by
 	s.sigFwd.Add(1)
 }
 
-func (s *Server) validateAndRecordSequence(env *protocol.SignalEnvelope, now time.Time) string {
+func (s *Server) validateAndRecordSequence(env *protocol.SignalEnvelope, now time.Time) (errCode, errDetail string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	rec, exists := s.negotiations[env.SessionID]
 	if !exists {
 		if env.Seq != 0 {
-			return protocol.ErrCodeReplayedSignaling
+			return protocol.ErrCodeReplayedSignaling, "initial signaling sequence must be 0"
+		}
+		// Automatic server-side ACL: initiating a new session requires the target peer
+		// to be actively broadcasting on a passphrase channel joined/broadcasted by the caller.
+		if !s.autoACLAllowsLocked(env.From, env.To) {
+			return protocol.ErrCodeNotAuthorized, "target peer is not broadcasting on a shared passphrase channel"
 		}
 		if len(s.negotiations) >= s.cfg.MaxTrackedSessions {
 			s.evictOldestNegotiationLocked(now)
@@ -1382,14 +1423,14 @@ func (s *Server) validateAndRecordSequence(env *protocol.SignalEnvelope, now tim
 	} else {
 		validPair := (rec.peerA == env.From && rec.peerB == env.To) || (rec.peerA == env.To && rec.peerB == env.From)
 		if !validPair || rec.closed {
-			return protocol.ErrCodeReplayedSignaling
+			return protocol.ErrCodeReplayedSignaling, "replayed or closed signaling session"
 		}
 		if env.Generation < rec.activeGeneration {
-			return protocol.ErrCodeStaleGeneration
+			return protocol.ErrCodeStaleGeneration, "stale signaling generation"
 		}
 		if env.Generation > rec.activeGeneration {
 			if env.Type != protocol.TypeOffer || env.Seq != 0 {
-				return protocol.ErrCodeStaleGeneration
+				return protocol.ErrCodeStaleGeneration, "generation advance requires offer seq 0"
 			}
 			rec.activeGeneration = env.Generation
 		}
@@ -1402,17 +1443,46 @@ func (s *Server) validateAndRecordSequence(env *protocol.SignalEnvelope, now tim
 		rec.senderGens[genKey] = sg
 	}
 	if env.Seq != sg.nextSeq {
-		return protocol.ErrCodeReplayedSignaling
+		return protocol.ErrCodeReplayedSignaling, "out-of-sequence or replayed signaling envelope"
 	}
 	if env.Type == protocol.TypeCandidate {
 		if sg.candidateCount >= s.cfg.MaxCandidatesPerGen {
-			return protocol.ErrCodeCandidateLimit
+			return protocol.ErrCodeCandidateLimit, "candidate limit exceeded"
 		}
 		sg.candidateCount++
 	}
 	sg.nextSeq = env.Seq + 1
 	rec.updatedAt = now
-	return ""
+	return "", ""
+}
+
+// autoACLAllowsLocked enforces automatic hub-side ACL derived strictly from live passphrase
+// channel membership and target broadcast status: fromPeerID may initiate a new session to
+// toPeerID iff toPeerID is actively broadcasting on at least one channel that fromPeerID
+// has joined or is also broadcasting on.
+func (s *Server) autoACLAllowsLocked(fromPeerID, toPeerID string) bool {
+	fromSessions := s.sessions[fromPeerID]
+	if len(fromSessions) == 0 {
+		return false
+	}
+	nowNano := s.nowFunc().UnixNano()
+	for chID, broadcasters := range s.channels {
+		if _, targetBroadcasting := broadcasters[toPeerID]; !targetBroadcasting {
+			continue
+		}
+		for _, fs := range fromSessions {
+			if fs.closed.Load() || nowNano > fs.expiresAt.Load() {
+				continue
+			}
+			if _, sub := fs.subscribed[chID]; sub {
+				return true
+			}
+			if _, bcast := fs.broadcasts[chID]; bcast {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) markNegotiationClosed(sessionID string) {

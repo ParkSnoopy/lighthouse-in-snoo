@@ -226,3 +226,40 @@ func startTestHub(t *testing.T, network, listenAddr, stunsListenAddr string, stu
 	}
 	return srv, pki, logBuf, wsURL, stunsURI
 }
+
+// authorizeOnPassphrase enables broadcast on target and joins callers on passphrase,
+// waiting until the hub has propagated the broadcast snapshot so auto-ACL is active.
+func authorizeOnPassphrase(t *testing.T, ctx context.Context, passphrase string, target *peer.Client, callers ...*peer.Client) {
+	t.Helper()
+	chID, err := target.SetBroadcast(ctx, true, passphrase, "peer")
+	if err != nil {
+		t.Fatalf("SetBroadcast(%s): %v", passphrase, err)
+	}
+	for _, c := range callers {
+		if _, err := c.JoinChannel(ctx, passphrase); err != nil {
+			t.Fatalf("JoinChannel(%s): %v", passphrase, err)
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		allSeen := true
+		for _, c := range callers {
+			found := false
+			for _, dp := range c.DiscoveredPeers(chID) {
+				if dp.PeerID == target.PeerID() {
+					found = true
+					break
+				}
+			}
+			if !found {
+				allSeen = false
+				break
+			}
+		}
+		if allSeen {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for hub auto-ACL broadcast propagation on %q", passphrase)
+}

@@ -41,6 +41,7 @@ var (
 	ErrMessageTooLarge       = errors.New("peer: message exceeds negotiated 16 KiB limit")
 	ErrSessionClosed         = errors.New("peer: session is closed or failed")
 	ErrPeerOfflineOrDenied   = errors.New("peer: target peer offline or denied")
+	ErrNotAuthorized         = errors.New("peer: hub auto-ACL denied connection")
 	ErrUserDenied            = errors.New("peer: connection denied by user")
 	ErrPeerBlacklisted       = errors.New("peer: remote peer is blacklisted")
 	ErrHubDisconnected       = errors.New("peer: control-plane WSS connection unavailable")

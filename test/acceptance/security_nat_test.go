@@ -134,6 +134,7 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 	defer cancel()
 	_ = clientA.Register(ctx)
 	_ = clientB.Register(ctx)
+	authorizeOnPassphrase(t, ctx, "t03-room", clientB, clientA)
 
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 	if err != nil {
@@ -250,6 +251,7 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 	defer cancel()
 	_ = clientA.Register(ctx)
 	_ = clientB.Register(ctx)
+	authorizeOnPassphrase(t, ctx, "t04-room", clientB, clientA)
 
 	start := time.Now()
 	_, err := clientA.Connect(ctx, ids.peerB.PeerID)
@@ -352,6 +354,7 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	defer cancel()
 	_ = clientA.Register(ctx)
 	_ = clientB.Register(ctx)
+	authorizeOnPassphrase(t, ctx, "t09-room", clientB, clientA)
 
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 	if err != nil {
@@ -492,6 +495,7 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 		defer cancel()
 		_ = clientA.Register(ctx)
 		_ = clientB.Register(ctx)
+		authorizeOnPassphrase(t, ctx, "t11a-room", clientB, clientA)
 
 		sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 		if err != nil {
@@ -584,6 +588,7 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 		defer cancel()
 		_ = clientA.Register(ctx)
 		_ = clientB.Register(ctx)
+		authorizeOnPassphrase(t, ctx, "t11b-room", clientB, clientA)
 
 		sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 		if err != nil {
@@ -719,6 +724,7 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 	if err := clientB.Register(ctx); err != nil {
 		t.Fatalf("legitimate Register B after flood: %v", err)
 	}
+	authorizeOnPassphrase(t, ctx, "t12-room", clientB, clientA)
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 	if err != nil {
 		t.Fatalf("legitimate Connect after flood: %v", err)
@@ -801,6 +807,7 @@ func TestT13_TamperDTLSProtectedRecordNotDelivered(t *testing.T) {
 	defer cancel()
 	_ = clientA.Register(ctx)
 	_ = clientB.Register(ctx)
+	authorizeOnPassphrase(t, ctx, "t13-room", clientB, clientA)
 
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 	if err != nil {

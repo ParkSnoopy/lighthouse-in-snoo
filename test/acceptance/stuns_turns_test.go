@@ -173,6 +173,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		if _, err := clientA.ProbeSTUNS(ctx); err != nil {
 			t.Fatalf("ProbeSTUNS on TURNS DTLS 1.3 / UDP port failed: %v", err)
 		}
+		authorizeOnPassphrase(t, ctx, "turns-loop-room", clientB, clientA)
 
 		sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 		if err != nil {
@@ -331,6 +332,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		defer cancel()
 		_ = clientA.Register(ctx)
 		_ = clientB.Register(ctx)
+		authorizeOnPassphrase(t, ctx, "turns-nat-room", clientB, clientA)
 
 		sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 		if err != nil {
@@ -424,6 +426,7 @@ func TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		defer cancel()
 		_ = clientA.Register(ctx)
 		_ = clientB.Register(ctx)
+		authorizeOnPassphrase(t, ctx, "turns-insecure-room", clientB, clientA)
 
 		sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 		if err != nil {

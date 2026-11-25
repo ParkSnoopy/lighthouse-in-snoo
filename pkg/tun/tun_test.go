@@ -161,6 +161,22 @@ func TestRouterBidirectionalIPForwardingAndAntiSpoofing(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Hub auto-ACL requires target B to broadcast on a passphrase channel joined by caller A.
+	chID, err := clientB.SetBroadcast(ctx, true, "tun-room", "PeerB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientA.JoinChannel(ctx, "tun-room"); err != nil {
+		t.Fatal(err)
+	}
+	waitDisc := time.Now().Add(3 * time.Second)
+	for time.Now().Before(waitDisc) {
+		if len(clientA.DiscoveredPeers(chID)) == 1 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
 	sessA, err := clientA.Connect(ctx, kpB.PeerID)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)

@@ -67,8 +67,11 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 			t.Fatalf("lighthouse-ui --help missing %q:\n%s", want, string(uiHelpOut))
 		}
 	}
+	if strings.Contains(string(uiHelpOut), "--cidr") {
+		t.Fatalf("lighthouse-ui --help must not expose hub-only --cidr flag:\n%s", string(uiHelpOut))
+	}
 
-	// Hub subcommand help: zero config/policy/sqlite, includes --passphrase & universal relay options.
+	// Hub subcommand help: zero static ACL/policy/sqlite, includes --cidr, --passphrase & universal relay options.
 	hubHelp, err := exec.Command(hubBin, "help", "hub").CombinedOutput()
 	if err != nil {
 		t.Fatalf("lighthouse help hub failed: %v\n%s", err, string(hubHelp))
@@ -78,6 +81,8 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 		"--https-addr <ADDR>",
 		"[env: LIGHTHOUSE_HTTPS_ADDR]",
 		"--stuns-addr <ADDR>",
+		"--cidr <CIDR>",
+		"[env: LIGHTHOUSE_CIDR]",
 		"--passphrase <SECRET>",
 		"[env: LIGHTHOUSE_PASSPHRASE]",
 		"--no-relay",
@@ -121,6 +126,12 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 	}
 	if !strings.Contains(string(hubInsecureOut), "--insecure") {
 		t.Fatalf("expected --insecure hint:\n%s", string(hubInsecureOut))
+	}
+
+	// Invalid hub --cidr rejected with exit code 2.
+	badCIDRCmd := exec.Command(hubBin, "hub", "--cidr", "not-a-cidr")
+	if out, err := badCIDRCmd.CombinedOutput(); err == nil || badCIDRCmd.ProcessState.ExitCode() != 2 {
+		t.Fatalf("expected exit code 2 for invalid --cidr, got err=%v code=%d out=%s", err, badCIDRCmd.ProcessState.ExitCode(), string(out))
 	}
 
 	// Typo suggestion on unknown double-dash option.

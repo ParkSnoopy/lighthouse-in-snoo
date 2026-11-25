@@ -33,7 +33,6 @@ type Options struct {
 	AllowInsecureICE bool
 	IncludeLoopback  bool
 	InterfaceName    string
-	VirtualCIDR      netip.Prefix
 	OpenDevice       func(localIP netip.Addr) (tun.Device, error)
 	Logger           *slog.Logger
 }
@@ -86,11 +85,9 @@ type Controller struct {
 	HubURLInput     *rawblock.Input
 	HubPassInput    *rawblock.Input
 	IfNameInput     *rawblock.Input
-	CIDRInput       *rawblock.Input
 	HubURLEntry     *widget.Entry
 	HubPassEntry    *widget.Entry
 	IfNameEntry     *widget.Entry
-	CIDREntry       *widget.Entry
 	TCPOnlyCheck    *rawblock.Check
 	ConnectHubBtn   *rawblock.Button
 	PassphraseInput *rawblock.Input
@@ -133,20 +130,6 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	cidr := opts.VirtualCIDR
-	if !cidr.IsValid() {
-		cidr = identity.DefaultVirtualCIDR()
-	} else {
-		var parseErr error
-		cidr, parseErr = identity.ParseVirtualCIDR(cidr.String())
-		if parseErr != nil {
-			return nil, parseErr
-		}
-	}
-	vip, err := identity.VirtualIPv4InPrefix(opts.KeyPair.PeerID, cidr)
-	if err != nil {
-		return nil, err
-	}
 
 	a.Settings().SetTheme(rawblock.NewTheme())
 
@@ -157,8 +140,6 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 		app:    a,
 		window: w,
 		opts:   opts,
-		cidr:   cidr,
-		vip:    vip,
 	}
 	c.buildUI()
 	return c, nil
@@ -335,7 +316,7 @@ func (c *Controller) buildUI() {
 
 	// --- Left Rail: Elevated (5px border) Node & Hub Binding Card ---
 	c.PeerIDText = rawblock.NewMono(shortID(c.opts.KeyPair.PeerID), rawblock.ColorBlack)
-	c.VirtualIPText = rawblock.NewMono(c.vip.String(), rawblock.ColorBlack)
+	c.VirtualIPText = rawblock.NewMono("UNASSIGNED", rawblock.ColorBlack)
 	c.InterfaceText = rawblock.NewMono("UNBOUND", rawblock.ColorBlack)
 
 	copyIDBtn := rawblock.NewButton("COPY ID", rawblock.ButtonSecondary, rawblock.ButtonSmall, func() {
@@ -366,25 +347,6 @@ func (c *Controller) buildUI() {
 	c.IfNameEntry = c.IfNameInput.Entry
 	c.IfNameEntry.SetText(c.opts.InterfaceName)
 
-	c.CIDRInput = rawblock.NewInput("IP CIDR", identity.DefaultVirtualCIDRString, "", false)
-	c.CIDREntry = c.CIDRInput.Entry
-	c.CIDREntry.SetText(c.cidr.String())
-	c.CIDREntry.OnChanged = func(raw string) {
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" {
-			trimmed = identity.DefaultVirtualCIDRString
-		}
-		p, parseErr := identity.ParseVirtualCIDR(trimmed)
-		if parseErr != nil {
-			return
-		}
-		c.CIDRInput.SetError("")
-		if vip, vErr := identity.VirtualIPv4InPrefix(c.opts.KeyPair.PeerID, p); vErr == nil {
-			c.VirtualIPText.Text = vip.String()
-			c.VirtualIPText.Refresh()
-		}
-	}
-
 	c.TCPOnlyCheck = rawblock.NewCheck("TCP ONLY", nil)
 	c.TCPOnlyCheck.SetCheckedSilent(c.opts.TCPOnly)
 
@@ -397,7 +359,7 @@ func (c *Controller) buildUI() {
 		rawblock.NewDivider(rawblock.BorderThick),
 		c.HubURLInput,
 		c.HubPassInput,
-		rawblock.AsymmetricSplit(0.36, rawblock.Sp3, c.IfNameInput, c.CIDRInput),
+		c.IfNameInput,
 		c.TCPOnlyCheck,
 		c.ConnectHubBtn,
 	)
@@ -520,38 +482,77 @@ func (c *Controller) toggleConnection() {
 	}
 }
 
-// ConnectAndBind binds the OS TUN interface and registers with the Lighthouse hub.
+// ConnectAndBind registers with the Lighthouse hub to receive its assigned IP/CIDR,
+// then binds the local OS TUN interface to that assigned IP.
 func (c *Controller) ConnectAndBind(ctx context.Context) error {
 	var (
 		hubURL  string
 		hubPass string
 		ifName  string
-		cidrRaw string
 		tcpOnly bool
 	)
 	c.doUIWait(func() {
 		c.HubURLInput.SetError("")
-		c.CIDRInput.SetError("")
 		hubURL = strings.TrimSpace(c.HubURLEntry.Text)
 		hubPass = c.HubPassEntry.Text
 		ifName = strings.TrimSpace(c.IfNameEntry.Text)
-		cidrRaw = strings.TrimSpace(c.CIDREntry.Text)
 		tcpOnly = c.TCPOnlyCheck.Checked
 	})
 	if ifName == "" {
 		ifName = "lh0"
 	}
-	if cidrRaw == "" {
-		cidrRaw = identity.DefaultVirtualCIDRString
-	}
-	cidr, err := identity.ParseVirtualCIDR(cidrRaw)
-	if err != nil {
-		c.doUI(func() { c.CIDRInput.SetError("Invalid IPv4 CIDR") })
-		return fmt.Errorf("invalid IP CIDR %q: %w", cidrRaw, err)
-	}
-	localVIP, err := identity.VirtualIPv4InPrefix(c.opts.KeyPair.PeerID, cidr)
+
+	client, err := peer.NewClient(&peer.Config{
+		KeyPair:             c.opts.KeyPair,
+		SignalingURL:        hubURL,
+		HubPassphrase:       hubPass,
+		TLSConfig:           c.opts.TLSConfig,
+		STUNServerURI:       c.opts.STUNServerURI,
+		TCPOnly:             tcpOnly,
+		AllowInsecureICE:    c.opts.AllowInsecureICE,
+		IncludeLoopback:     c.opts.IncludeLoopback,
+		EnablePacketChannel: true,
+		BlacklistPath:       c.opts.BlacklistPath,
+		Consent:             c,
+		Logger:              c.opts.Logger,
+		OnSession: func(s *peer.Session) {
+			if r := c.Router(); r != nil {
+				if _, attachErr := r.AttachSession(s); attachErr != nil {
+					c.showError("TUN ROUTE ATTACH FAILED", attachErr)
+				}
+			}
+			c.refreshLists()
+		},
+		OnSessionClosed: func(remotePeerID, _ string) {
+			if r := c.Router(); r != nil {
+				r.DetachPeer(remotePeerID)
+			}
+			c.refreshLists()
+		},
+		OnPeersChanged: func(_ string, peers []peer.DiscoveredPeer) {
+			c.mu.Lock()
+			c.peers = peers
+			c.mu.Unlock()
+			c.refreshLists()
+		},
+	})
 	if err != nil {
 		return err
+	}
+
+	regCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	err = client.Register(regCtx)
+	cancel()
+	if err != nil {
+		_ = client.Close()
+		return err
+	}
+
+	localVIP := client.VirtualIP()
+	cidr := client.VirtualCIDR()
+	if !localVIP.IsValid() || !cidr.IsValid() {
+		_ = client.Close()
+		return fmt.Errorf("hub did not assign a valid virtual IP/CIDR")
 	}
 
 	openFn := c.opts.OpenDevice
@@ -568,56 +569,13 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 
 	dev, err := openFn(localVIP)
 	if err != nil {
+		_ = client.Close()
 		return fmt.Errorf("bind interface %s (%s/%d): %w", ifName, localVIP.String(), cidr.Bits(), err)
 	}
 	router, err := tun.NewRouter(dev, localVIP)
 	if err != nil {
 		_ = dev.Close()
-		return err
-	}
-
-	client, err := peer.NewClient(&peer.Config{
-		KeyPair:             c.opts.KeyPair,
-		SignalingURL:        hubURL,
-		HubPassphrase:       hubPass,
-		TLSConfig:           c.opts.TLSConfig,
-		STUNServerURI:       c.opts.STUNServerURI,
-		TCPOnly:             tcpOnly,
-		AllowInsecureICE:    c.opts.AllowInsecureICE,
-		IncludeLoopback:     c.opts.IncludeLoopback,
-		EnablePacketChannel: true,
-		BlacklistPath:       c.opts.BlacklistPath,
-		VirtualCIDR:         cidr,
-		Consent:             c,
-		Logger:              c.opts.Logger,
-		OnSession: func(s *peer.Session) {
-			if _, attachErr := router.AttachSession(s); attachErr != nil {
-				c.showError("TUN ROUTE ATTACH FAILED", attachErr)
-			}
-			c.refreshLists()
-		},
-		OnSessionClosed: func(remotePeerID, _ string) {
-			router.DetachPeer(remotePeerID)
-			c.refreshLists()
-		},
-		OnPeersChanged: func(_ string, peers []peer.DiscoveredPeer) {
-			c.mu.Lock()
-			c.peers = peers
-			c.mu.Unlock()
-			c.refreshLists()
-		},
-	})
-	if err != nil {
-		_ = router.Close()
-		return err
-	}
-
-	regCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	err = client.Register(regCtx)
-	cancel()
-	if err != nil {
 		_ = client.Close()
-		_ = router.Close()
 		return err
 	}
 
@@ -634,7 +592,6 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 	c.doUI(func() {
 		c.VirtualIPText.Text = localVIP.String()
 		c.VirtualIPText.Refresh()
-		c.CIDREntry.SetText(cidr.String())
 		c.InterfaceText.Text = dev.Name()
 		c.InterfaceText.Refresh()
 		c.StatusText.Text = ifInfo
@@ -654,6 +611,8 @@ func (c *Controller) Disconnect() {
 	router := c.router
 	c.client = nil
 	c.router = nil
+	c.cidr = netip.Prefix{}
+	c.vip = netip.Addr{}
 	c.connected = false
 	c.broadcasting = false
 	c.joinedChanID = ""
@@ -671,6 +630,8 @@ func (c *Controller) Disconnect() {
 
 	c.doUI(func() {
 		c.BroadcastCheck.SetCheckedSilent(false)
+		c.VirtualIPText.Text = "UNASSIGNED"
+		c.VirtualIPText.Refresh()
 		c.InterfaceText.Text = "UNBOUND"
 		c.InterfaceText.Refresh()
 		c.StatusText.Text = "UNBOUND"

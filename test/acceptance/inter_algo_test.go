@@ -277,6 +277,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			if _, err := clientA.ProbeSTUNS(ctx); err != nil {
 				t.Fatalf("ProbeSTUNS (%s CA -> %s leaf): %v", tc.hubCA, tc.hubLeaf, err)
 			}
+			authorizeOnPassphrase(t, ctx, "inter-algo-room", clientB, clientA)
 
 			sessA, err := clientA.Connect(ctx, peerB.PeerID)
 			if err != nil {

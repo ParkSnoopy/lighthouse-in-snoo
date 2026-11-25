@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -198,9 +199,16 @@ func TestHubPassphraseGateUniversalRelayAndBroadcastIsolation(t *testing.T) {
 	}
 	_ = cBadPass.CloseNow()
 
-	// 3. Valid registration succeeds and mints universal TURNS relay credentials.
+	// 3. Valid registration succeeds, assigns default 10.88.0.0/16 IP, and mints universal TURNS relay credentials.
 	cA, regA := dialAndRegister(t, ctx, hc, wsURL, origin, hubSecret, kpA)
 	defer cA.CloseNow()
+	if regA.VirtualCIDR != identity.DefaultVirtualCIDRString {
+		t.Fatalf("expected default virtual_cidr %q, got %q", identity.DefaultVirtualCIDRString, regA.VirtualCIDR)
+	}
+	wantIPA, _ := identity.VirtualIPv4FromPeerID(kpA.PeerID)
+	if regA.AssignedIP != wantIPA.String() {
+		t.Fatalf("expected assigned_ip %q, got %q", wantIPA.String(), regA.AssignedIP)
+	}
 	if regA.Relay == nil || len(regA.Relay.URIs) == 0 || !strings.HasPrefix(regA.Relay.URIs[0], "turns:") || regA.Relay.Username == "" || regA.Relay.Credential == "" {
 		t.Fatalf("expected auto-minted universal TURNS relay info, got %+v", regA.Relay)
 	}
@@ -329,5 +337,151 @@ func TestHubZeroConfigAutoTLS(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != `{"status":"ok"}` {
 		t.Fatalf("unexpected /healthz response: %d %q", resp.StatusCode, string(body))
+	}
+}
+
+func TestHubCustomCIDRAndPassphraseBroadcastAutoACL(t *testing.T) {
+	t.Parallel()
+
+	srvTLS, cliTLS := makeCert(t)
+	kpA, _ := identity.GenerateKeyPair()
+	kpB, _ := identity.GenerateKeyPair()
+	kpC, _ := identity.GenerateKeyPair()
+
+	customCIDR := netip.MustParsePrefix("10.99.0.0/24")
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin := "wss://" + ln.Addr().String()
+	srv, err := hub.New(&hub.Config{
+		HTTPSListener:   ln,
+		TLSConfig:       srvTLS,
+		HubOrigin:       origin,
+		VirtualCIDR:     customCIDR,
+		EnableSTUN:      true,
+		STUNSListenAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	if srv.VirtualCIDR() != customCIDR {
+		t.Fatalf("srv.VirtualCIDR() = %s; want %s", srv.VirtualCIDR(), customCIDR)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: cliTLS}}
+	wsURL := origin + "/v1/signal"
+
+	cA, regA := dialAndRegister(t, ctx, hc, wsURL, origin, "", kpA)
+	defer cA.CloseNow()
+	cB, regB := dialAndRegister(t, ctx, hc, wsURL, origin, "", kpB)
+	defer cB.CloseNow()
+	cC, _ := dialAndRegister(t, ctx, hc, wsURL, origin, "", kpC)
+	defer cC.CloseNow()
+
+	// Hub must assign every peer an IP inside its configured 10.99.0.0/24 CIDR.
+	ipA, err := netip.ParseAddr(regA.AssignedIP)
+	if err != nil || !customCIDR.Contains(ipA) || regA.VirtualCIDR != customCIDR.String() {
+		t.Fatalf("unexpected hub CIDR/IP assignment for A: cidr=%q ip=%q", regA.VirtualCIDR, regA.AssignedIP)
+	}
+	ipB, err := netip.ParseAddr(regB.AssignedIP)
+	if err != nil || !customCIDR.Contains(ipB) || regB.VirtualCIDR != customCIDR.String() {
+		t.Fatalf("unexpected hub CIDR/IP assignment for B: cidr=%q ip=%q", regB.VirtualCIDR, regB.AssignedIP)
+	}
+
+	sendOffer := func(sender *websocket.Conn, from *identity.KeyPair, toPeerID string) string {
+		t.Helper()
+		sid, _ := protocol.NewSessionID()
+		_, raw, sErr := protocol.SignEnvelope(
+			from,
+			protocol.TypeOffer,
+			toPeerID,
+			sid,
+			0,
+			0,
+			time.Now().Add(60*time.Second).Unix(),
+			protocol.SDPBody{SDP: "v=0\r\n"},
+		)
+		if sErr != nil {
+			t.Fatal(sErr)
+		}
+		if wErr := sender.Write(ctx, websocket.MessageText, raw); wErr != nil {
+			t.Fatal(wErr)
+		}
+		return sid
+	}
+
+	expectErrCode := func(conn *websocket.Conn, wantCode string) {
+		t.Helper()
+		_, raw, rErr := conn.Read(ctx)
+		if rErr != nil {
+			t.Fatalf("read error frame: %v", rErr)
+		}
+		var em protocol.ErrorMessage
+		if uErr := json.Unmarshal(raw, &em); uErr != nil || em.Type != protocol.TypeError || em.Code != wantCode {
+			t.Fatalf("expected error code %q, got %s", wantCode, string(raw))
+		}
+	}
+
+	// 1. Target A is NOT broadcasting -> offer from B MUST be denied by server auto-ACL.
+	sendOffer(cB, kpB, kpA.PeerID)
+	expectErrCode(cB, protocol.ErrCodeNotAuthorized)
+
+	// 2. Target A broadcasts on "room-alpha", C joins "room-beta", B joins "room-alpha".
+	alphaKeys, _ := identity.DeriveChannelKeys("room-alpha")
+	betaKeys, _ := identity.DeriveChannelKeys("room-beta")
+
+	joinAlpha, _ := json.Marshal(protocol.ChannelJoinMessage{V: protocol.Version, Type: protocol.TypeChannelJoin, ChannelID: alphaKeys.ChannelID})
+	joinBeta, _ := json.Marshal(protocol.ChannelJoinMessage{V: protocol.Version, Type: protocol.TypeChannelJoin, ChannelID: betaKeys.ChannelID})
+	_ = cB.Write(ctx, websocket.MessageText, joinAlpha)
+	_, _, _ = cB.Read(ctx) // empty snapshot
+	_ = cC.Write(ctx, websocket.MessageText, joinBeta)
+	_, _, _ = cC.Read(ctx) // empty snapshot
+
+	_, bcastOn, _ := protocol.SignBroadcast(kpA, alphaKeys.ChannelID, true, "", time.Now().Unix())
+	_ = cA.Write(ctx, websocket.MessageText, bcastOn)
+	_, _, _ = cB.Read(ctx) // snapshot with A
+
+	// 3. Peer C (different passphrase) -> A MUST be denied by server auto-ACL.
+	sendOffer(cC, kpC, kpA.PeerID)
+	expectErrCode(cC, protocol.ErrCodeNotAuthorized)
+
+	// 4. Peer B (shared passphrase, A broadcasting) -> A MUST be allowed by server auto-ACL.
+	allowedSID := sendOffer(cB, kpB, kpA.PeerID)
+	_, fwdRaw, err := cA.Read(ctx)
+	if err != nil {
+		t.Fatalf("read forwarded offer on A: %v", err)
+	}
+	var fwdEnv protocol.SignalEnvelope
+	if err := json.Unmarshal(fwdRaw, &fwdEnv); err != nil || fwdEnv.SessionID != allowedSID || fwdEnv.From != kpB.PeerID {
+		t.Fatalf("unexpected forwarded offer on A: %s", string(fwdRaw))
+	}
+
+	// 5. Target A turns broadcast OFF -> existing session answer still forwards, NEW session denied!
+	_, bcastOff, _ := protocol.SignBroadcast(kpA, alphaKeys.ChannelID, false, "", time.Now().Unix())
+	_ = cA.Write(ctx, websocket.MessageText, bcastOff)
+	_, _, _ = cB.Read(ctx) // empty snapshot confirming withdrawal
+
+	_, ansRaw, _ := protocol.SignEnvelope(kpA, protocol.TypeAnswer, kpB.PeerID, allowedSID, 0, 0, time.Now().Add(60*time.Second).Unix(), protocol.SDPBody{SDP: "v=0\r\n"})
+	_ = cA.Write(ctx, websocket.MessageText, ansRaw)
+	_, gotAnsRaw, err := cB.Read(ctx)
+	if err != nil {
+		t.Fatalf("expected existing session answer to pass after broadcast off: %v", err)
+	}
+	var gotAns protocol.SignalEnvelope
+	if err := json.Unmarshal(gotAnsRaw, &gotAns); err != nil || gotAns.Type != protocol.TypeAnswer || gotAns.SessionID != allowedSID {
+		t.Fatalf("unexpected answer frame: %s", string(gotAnsRaw))
+	}
+
+	// Brand-new offer from B -> A after A turned broadcast OFF MUST be denied by server auto-ACL.
+	sendOffer(cB, kpB, kpA.PeerID)
+	expectErrCode(cB, protocol.ErrCodeNotAuthorized)
+
+	if st := srv.Stats(); st.AutoACLDenied < 3 {
+		t.Fatalf("expected AutoACLDenied >= 3, got %+v", st)
 	}
 }

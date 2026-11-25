@@ -21,9 +21,9 @@ flowchart TB
     A <-->|"End-to-End Encrypted DTLS 1.3 Tunnel (IPv4 over TUN)"| B
 ```
 
-1. **Zero-Config Universal Hub & Relay**: `lighthouse hub` runs statelessly with no ACLs, policy files, or databases. It serves TLS 1.3 WSS signaling and an integrated DTLS 1.3 / UDP STUNS + TURNS relay (generating an ephemeral TLS certificate and relay credentials automatically when omitted). Operators running a private hub may optionally set `--passphrase` (`LIGHTHOUSE_PASSPHRASE`) to restrict hub registration via an offline shared passphrase.
-2. **Passphrase-Scoped Broadcasting**: Broadcasting is off by default. When a user enables broadcast with an offline shared passphrase, only peers listening on the exact same passphrase receive that broadcast and decrypt its peer label. The raw passphrase is never sent over the network.
-3. **Explicit User Consent & Blacklist**: Every peer holds a local cryptographic identity (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, or `rsa`) mapped to a deterministic virtual IP inside the configured subnet (default `10.88.0.0/16`). Incoming connection requests display the verified peer ID, key algorithm, virtual IP, and DTLS fingerprint and require explicit **Allow**, **Deny**, or **Blacklist** action. Blacklisted peers are dropped immediately and blocked from future offers.
+1. **Zero-Config Universal Hub & Relay**: `lighthouse hub` runs without static ACL files or databases. It serves TLS 1.3 WSS signaling, an integrated DTLS 1.3 / UDP STUNS + TURNS relay, assigns each peer a deterministic virtual IPv4 address from the hub's configured `--cidr` (`LIGHTHOUSE_CIDR`, default `10.88.0.0/16`), and enforces automatic server-side ACL based on passphrase channel membership and active broadcast status. Operators running a private hub may optionally set `--passphrase` (`LIGHTHOUSE_PASSPHRASE`) to restrict hub registration via an offline shared passphrase.
+2. **Passphrase-Scoped Broadcasting & Auto-ACL**: Broadcasting is off by default. When a peer enables broadcast under an offline shared passphrase, only peers joined to that exact passphrase discover it and are automatically permitted by the hub to initiate connection offers to it. Turning broadcast off immediately blocks new incoming connection attempts at the hub. The raw passphrase is never sent over the network.
+3. **Explicit User Consent & Blacklist**: Every peer holds a local cryptographic identity (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, or `rsa`) assigned an IP from the hub's CIDR upon registration. Incoming connection requests display the verified peer ID, key algorithm, virtual IP, and DTLS fingerprint and require explicit **Allow**, **Deny**, or **Blacklist** action. Blacklisted peers are dropped immediately and blocked from future offers.
 4. **Bound Virtual Network Interface**: Allowing a peer installs a route on the local TUN interface (`lh0`) backed by an end-to-end DTLS 1.3 WebRTC tunnel with source-IP anti-spoofing. UDP is prioritized by default; pass `--tcp-only` to disable UDP completely and operate over TLS 1.3 / TCP and ICE-TCP, or `--insecure` to allow plaintext `stun:`/`turn:`.
 
 ## Usage
@@ -69,6 +69,7 @@ Run with a TLS certificate and an optional offline hub passphrase:
 | --- | --- | --- | --- |
 | `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS/WSS signaling |
 | `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | Encrypted STUNS/TURNS address (UDP default; TCP with `--tcp-only`) |
+| `--cidr` | `LIGHTHOUSE_CIDR` | `10.88.0.0/16` | Virtual IPv4 subnet CIDR assigned to connected peers |
 | `-P, --passphrase` | `LIGHTHOUSE_PASSPHRASE` | *(open)* | Optional offline shared passphrase gating hub registration |
 | `--no-relay` | `LIGHTHOUSE_NO_RELAY` | `false` | Disable integrated universal TURNS relay |
 | `--turn-public-ip` | `LIGHTHOUSE_TURN_PUBLIC_IP` | *(auto)* | Public IP advertised in TURN relay allocations |
@@ -93,7 +94,7 @@ Launch `lighthouse-ui` (requires `CAP_NET_ADMIN` / TUN privileges to bind `lh0` 
 
 Inside the app:
 
-1. Click **Bind & Connect** to bind the local virtual network interface (`lh0`, default `10.88.0.0/16`) and connect to the hub.
+1. Click **Bind & Connect** to register with the hub, receive an assigned IP from the hub's CIDR (default `10.88.0.0/16`), and bind the local virtual network interface (`lh0`).
 2. Enter a shared passphrase and click **Join** to listen for peers on that passphrase. Toggle **Broadcast** only when you want peers with the same passphrase to discover you.
 3. Click **Connect** next to a discovered peer (or enter a Peer ID directly).
 4. On the receiving peer, review the incoming connection prompt and click **Allow**, **Deny**, or **Blacklist**. Manage active tunnels and blacklisted peers from their respective tabs.
@@ -103,7 +104,6 @@ Inside the app:
 | `--hub` | `LIGHTHOUSE_HUB_URL` | `wss://localhost:8443/v1/signal` | Universal hub WSS signaling URL |
 | `--hub-passphrase` | `LIGHTHOUSE_PASSPHRASE` | *(none)* | Optional offline hub registration passphrase |
 | `--ifname` | `LIGHTHOUSE_IFNAME` | `lh0` | OS TUN virtual network interface name |
-| `--cidr` | `LIGHTHOUSE_CIDR` | `10.88.0.0/16` | Virtual IPv4 subnet CIDR for TUN addressing |
 | `--ca` | `LIGHTHOUSE_CA` | *(system)* | Optional PEM Root CA bundle |
 | `-s, --stun` | `LIGHTHOUSE_STUN_URI` | *(auto)* | Optional explicit STUNS/TURNS URI |
 | `-k, --key` | — | `~/.config/lighthouse/identity.key` | Local identity key path (generated if absent) |

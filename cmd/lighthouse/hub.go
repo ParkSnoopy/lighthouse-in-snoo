@@ -14,6 +14,7 @@ import (
 	"lighthouse-in-snoo/internal/hub"
 	"lighthouse-in-snoo/internal/stunserver"
 	"lighthouse-in-snoo/internal/turnserver"
+	"lighthouse-in-snoo/pkg/identity"
 )
 
 func newHubCommand() *cli.Command {
@@ -21,6 +22,7 @@ func newHubCommand() *cli.Command {
 		httpsAddr        string
 		stunsAddr        string
 		stunAddr         string
+		cidrStr          string
 		passphrase       string
 		tcpOnly          bool
 		insecure         bool
@@ -42,11 +44,11 @@ func newHubCommand() *cli.Command {
 	cmd := &cli.Command{
 		Name:       "hub",
 		ShortAbout: "Run the zero-config universal signaling hub and relay",
-		LongAbout:  "Run a stateless Lighthouse signaling hub and universal DTLS 1.3/UDP STUNS+TURNS relay with zero ACLs or policy files. Pass --passphrase to gate hub registration with an offline shared passphrase, or --tcp-only to disable UDP.",
+		LongAbout:  "Run a Lighthouse signaling hub and universal DTLS 1.3/UDP STUNS+TURNS relay with hub-managed virtual IPv4 CIDR assignment (default 10.88.0.0/16) and automatic passphrase/broadcast ACL. Pass --passphrase to gate hub registration with an offline shared passphrase, or --tcp-only to disable UDP.",
 		Examples: []string{
 			"lighthouse hub",
+			"lighthouse hub --cidr 10.88.0.0/16 --passphrase <SECRET> --turn-public-ip 203.0.113.10",
 			"lighthouse hub --https-addr :8443 --stuns-addr :5349 --hub-origin wss://hub.example.com --tls-cert tls.crt --tls-key tls.key",
-			"lighthouse hub --passphrase <SECRET> --turn-public-ip 203.0.113.10",
 			"lighthouse hub --tcp-only --stuns-addr :5349",
 			"lighthouse hub --insecure --stun-addr :3478",
 		},
@@ -77,11 +79,18 @@ func newHubCommand() *cli.Command {
 				return &cli.ExitError{Code: 2, Err: portErr}
 			}
 
+			virtualCIDR, err := identity.ParseVirtualCIDR(cidrStr)
+			if err != nil {
+				fmt.Fprintf(ctx.Stderr, "error: invalid --cidr %q: %v\n", cidrStr, err)
+				return &cli.ExitError{Code: 2, Err: err}
+			}
+
 			enableRelay := !noRelay && !tcpOnly
 			autoTLS := tlsCert == "" && tlsKey == ""
 
 			srv, err := hub.New(&hub.Config{
 				HTTPSListenAddr:    httpsAddr,
+				VirtualCIDR:        virtualCIDR,
 				Passphrase:         passphrase,
 				TCPOnly:            tcpOnly,
 				AllowInsecure:      insecure,
@@ -120,6 +129,7 @@ func newHubCommand() *cli.Command {
 				"auto_tls", autoTLS,
 				"insecure", insecure,
 				"hub_origin", srv.HubOrigin(),
+				"virtual_cidr", srv.VirtualCIDR().String(),
 			)
 
 			sigCh := make(chan os.Signal, 2)
@@ -157,6 +167,14 @@ func newHubCommand() *cli.Command {
 		ShortHelp: "Plaintext STUN/TURN address (requires --insecure)",
 		LongHelp:  "Plaintext listen address for unencrypted stun:/turn:; rejected unless --insecure is set (default :3478)",
 		EnvVar:    "LIGHTHOUSE_STUN_ADDR",
+	})
+	cmd.StringOpt(&cidrStr, cli.Option{
+		Long:      "cidr",
+		ValueName: "CIDR",
+		ShortHelp: "Virtual IPv4 subnet CIDR assigned to peers",
+		LongHelp:  "IPv4 CIDR (/1../30) used by the hub to assign virtual TUN IPv4 addresses to registered peers",
+		EnvVar:    "LIGHTHOUSE_CIDR",
+		Default:   identity.DefaultVirtualCIDRString,
 	})
 	cmd.StringOpt(&passphrase, cli.Option{
 		Long:      "passphrase",

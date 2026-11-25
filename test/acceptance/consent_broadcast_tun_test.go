@@ -135,6 +135,17 @@ func TestPassphraseBroadcastIsolationAndUserConsent(t *testing.T) {
 		t.Fatalf("blast radius violation: Peer C on different passphrase saw %+v", gotC)
 	}
 
+	// Hub auto-ACL: Peer C (wrong passphrase) -> Peer A and Peer A -> Peer B (not broadcasting) MUST fail.
+	if _, err := clientC.Connect(ctx, ids.peerA.PeerID); !errors.Is(err, peer.ErrNotAuthorized) {
+		t.Fatalf("expected ErrNotAuthorized for wrong passphrase caller C -> A, got %v", err)
+	}
+	if _, err := clientA.Connect(ctx, ids.peerB.PeerID); !errors.Is(err, peer.ErrNotAuthorized) {
+		t.Fatalf("expected ErrNotAuthorized before Peer B broadcasts, got %v", err)
+	}
+
+	// Peer B enables broadcast on "project-apollo" and Peer A joins it -> hub auto-ACL permits A -> B.
+	authorizeOnPassphrase(t, ctx, "project-apollo", clientB, clientA)
+
 	// 1. User B denies incoming offer from Peer A.
 	if _, err := clientA.Connect(ctx, ids.peerB.PeerID); !errors.Is(err, peer.ErrUserDenied) {
 		t.Fatalf("expected ErrUserDenied, got %v", err)
@@ -322,6 +333,7 @@ func TestUniversalPublicRelayAutoProvisionedAcrossSymmetricNATs(t *testing.T) {
 	if err := clientB.Register(ctx); err != nil {
 		t.Fatalf("Register B: %v", err)
 	}
+	authorizeOnPassphrase(t, ctx, "universal-relay-room", clientB, clientA)
 
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
 	if err != nil {
