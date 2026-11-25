@@ -48,30 +48,32 @@ CGO_ENABLED=0 go build -o bin/lighthouse ./cmd/lighthouse
 
 ### 2. Provision Offline Authority, Peer Keys, and Policy
 
+All CLI options accept `--flag`, `-flag`, and short aliases (`-h` prints compact help; `--help` or `help <subcommand>` prints verbose help with defaults, environment variables, and examples).
+
 Generate an offline authority key and two peer keys:
 
 ```bash
-./bin/lighthouse admin keygen -out config/authority.key
-./bin/lighthouse admin keygen -out peer-a.key
-./bin/lighthouse admin keygen -out peer-b.key
+./bin/lighthouse admin keygen --out config/authority.key
+./bin/lighthouse admin keygen --out peer-a.key
+./bin/lighthouse admin keygen --out peer-b.key
 ```
 
 Issue offline-authority-signed membership records for each peer:
 
 ```bash
 ./bin/lighthouse admin issue-membership \
-  -authority config/authority.key \
-  -peer-pub <PEER_A_PUBLIC_KEY> \
-  -allow <PEER_B_ID> \
-  -ttl 720h \
-  -out peer-a-membership.json
+  --authority config/authority.key \
+  --peer-pub <PEER_A_PUBLIC_KEY> \
+  --allow <PEER_B_ID> \
+  --ttl 720h \
+  --out peer-a-membership.json
 
 ./bin/lighthouse admin issue-membership \
-  -authority config/authority.key \
-  -peer-pub <PEER_B_PUBLIC_KEY> \
-  -allow <PEER_A_ID> \
-  -ttl 720h \
-  -out peer-b-membership.json
+  --authority config/authority.key \
+  --peer-pub <PEER_B_PUBLIC_KEY> \
+  --allow <PEER_A_ID> \
+  --ttl 720h \
+  --out peer-b-membership.json
 ```
 
 Create `config/policy.json` (provisioned to the hub and each peer):
@@ -107,40 +109,40 @@ Start the responder peer:
 
 ```bash
 ./bin/lighthouse peer \
-  -key peer-b.key \
-  -membership peer-b-membership.json \
-  -policy config/policy.json \
-  -hub wss://hub.example.com/v1/signal \
-  -stun stun:hub.example.com:3478
+  --key peer-b.key \
+  --membership peer-b-membership.json \
+  --policy config/policy.json \
+  --hub wss://hub.example.com/v1/signal \
+  --stun stun:hub.example.com:3478
 ```
 
 Dial from the initiator peer:
 
 ```bash
 ./bin/lighthouse peer \
-  -key peer-a.key \
-  -membership peer-a-membership.json \
-  -policy config/policy.json \
-  -hub wss://hub.example.com/v1/signal \
-  -stun stun:hub.example.com:3478 \
-  -connect <PEER_B_ID>
+  --key peer-a.key \
+  --membership peer-a-membership.json \
+  --policy config/policy.json \
+  --hub wss://hub.example.com/v1/signal \
+  --stun stun:hub.example.com:3478 \
+  --connect <PEER_B_ID>
 ```
 
 ## Hub Configuration
 
-`lighthouse hub` accepts flags or environment variables:
+`lighthouse hub` accepts flags (with `--` or `-`) or environment variables:
 
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
-| `-https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS `/healthz` and WSS `/v1/signal` |
-| `-stun-addr` | `LIGHTHOUSE_STUN_ADDR` | `:3478` | UDP listen address for RFC 8489 STUN Binding |
-| `-hub-origin` | `LIGHTHOUSE_HUB_ORIGIN` | `wss://localhost:8443` | Canonical WSS origin bound into registration challenge proofs |
-| `-tls-cert` | `LIGHTHOUSE_TLS_CERT` | `/etc/lighthouse/tls.crt` | Server TLS certificate PEM |
-| `-tls-key` | `LIGHTHOUSE_TLS_KEY` | `/etc/lighthouse/tls.key` | Server TLS private key PEM |
-| `-policy` | `LIGHTHOUSE_POLICY` | `/etc/lighthouse/policy.json` | Trust, membership, ACL, and revocation policy file |
-| `-sqlite` | `LIGHTHOUSE_SQLITE` | *(disabled)* | Optional SQLite database path for persistent administrative policy |
-| `-presence-heartbeat` | — | `20s` | Advertised peer presence heartbeat interval |
-| `-presence-ttl` | — | `60s` | Ephemeral presence lease expiration |
+| `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS `/healthz` and WSS `/v1/signal` |
+| `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | `:3478` | UDP listen address for RFC 8489 STUN Binding |
+| `--hub-origin` | `LIGHTHOUSE_HUB_ORIGIN` | `wss://localhost:8443` | Canonical WSS origin bound into registration challenge proofs |
+| `--tls-cert` | `LIGHTHOUSE_TLS_CERT` | `/etc/lighthouse/tls.crt` | Server TLS certificate PEM |
+| `--tls-key` | `LIGHTHOUSE_TLS_KEY` | `/etc/lighthouse/tls.key` | Server TLS private key PEM |
+| `-p, --policy` | `LIGHTHOUSE_POLICY` | `/etc/lighthouse/policy.json` | Trust, membership, ACL, and revocation policy file |
+| `--sqlite` | `LIGHTHOUSE_SQLITE` | *(disabled)* | Optional SQLite database path for persistent administrative policy |
+| `--presence-heartbeat` | — | `20s` | Advertised peer presence heartbeat interval |
+| `--presence-ttl` | — | `60s` | Ephemeral presence lease expiration |
 
 ## Further Documentation
 
