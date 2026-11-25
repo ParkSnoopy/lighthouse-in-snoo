@@ -33,10 +33,11 @@ type ValueKind int
 const (
 	KindString ValueKind = iota
 	KindBool
+	KindInt
 	KindDuration
 )
 
-// Option defines a CLI flag accepting --long, -long, and optional -s / --s forms.
+// Option defines a CLI flag accepting --long and optional -s forms.
 type Option struct {
 	Long      string
 	Short     rune
@@ -50,6 +51,7 @@ type Option struct {
 
 	strDst  *string
 	boolDst *bool
+	intDst  *int
 	durDst  *time.Duration
 	isSet   bool
 }
@@ -92,6 +94,18 @@ func (c *Command) StringOpt(dst *string, opt Option) *Option {
 func (c *Command) BoolOpt(dst *bool, opt Option) *Option {
 	opt.Kind = KindBool
 	opt.boolDst = dst
+	o := &opt
+	c.Options = append(c.Options, o)
+	return o
+}
+
+// IntOpt binds an integer option to dst and registers it on c.
+func (c *Command) IntOpt(dst *int, opt Option) *Option {
+	opt.Kind = KindInt
+	opt.intDst = dst
+	if opt.ValueName == "" {
+		opt.ValueName = "INT"
+	}
 	o := &opt
 	c.Options = append(c.Options, o)
 	return o
@@ -270,6 +284,8 @@ func (c *Command) parseLeafArgs(args []string, stderr io.Writer) ([]string, help
 			*opt.boolDst = false
 		} else if opt.Kind == KindString && opt.strDst != nil {
 			*opt.strDst = ""
+		} else if opt.Kind == KindInt && opt.intDst != nil {
+			*opt.intDst = 0
 		} else if opt.Kind == KindDuration && opt.durDst != nil {
 			*opt.durDst = 0
 		}
@@ -522,6 +538,15 @@ func (o *Option) applyValue(raw string) error {
 		}
 		if o.boolDst != nil {
 			*o.boolDst = b
+		}
+		return nil
+	case KindInt:
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("expected integer")
+		}
+		if o.intDst != nil {
+			*o.intDst = v
 		}
 		return nil
 	case KindDuration:

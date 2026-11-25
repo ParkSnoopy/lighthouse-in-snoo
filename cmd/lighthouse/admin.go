@@ -28,17 +28,31 @@ func newAdminCommand() *cli.Command {
 }
 
 func newKeygenCommand() *cli.Command {
-	var outPath string
+	var (
+		outPath string
+		algoStr string
+		rsaBits int
+	)
 	cmd := &cli.Command{
 		Name:       "keygen",
-		ShortAbout: "Generate an Ed25519 identity or authority key pair",
-		LongAbout:  "Generate a new Ed25519 key pair, save it with 0600 permissions, and print its base64url peer_id and public_key.",
+		ShortAbout: "Generate an asymmetric identity or authority key pair",
+		LongAbout:  "Generate a new identity or authority key pair (ed25519, ed448, nistp-256, nistp-384, nistp-521, or rsa), save it with 0600 permissions, and print its algorithm, peer_id, and public_key.",
 		Examples: []string{
 			"lighthouse admin keygen --out authority.key",
-			"lighthouse admin keygen -o peer-a.key",
+			"lighthouse admin keygen --algo ed448 --out peer-ed448.key",
+			"lighthouse admin keygen --algo nistp-384 -o peer-p384.key",
+			"lighthouse admin keygen --algo rsa --bits 3072 --out peer-rsa.key",
 		},
 		Run: func(ctx *cli.Context) error {
-			kp, err := identity.GenerateKeyPair()
+			algo, err := identity.ParseAlgorithm(algoStr)
+			if err != nil {
+				fmt.Fprintln(ctx.Stderr, err)
+				return &cli.ExitError{Code: 2, Err: err}
+			}
+			kp, err := identity.GenerateKeyPairWithOptions(identity.KeyGenOptions{
+				Algorithm: algo,
+				RSABits:   rsaBits,
+			})
 			if err != nil {
 				fmt.Fprintln(ctx.Stderr, err)
 				return err
@@ -47,11 +61,16 @@ func newKeygenCommand() *cli.Command {
 				fmt.Fprintln(ctx.Stderr, err)
 				return err
 			}
-			summary, _ := json.MarshalIndent(map[string]string{
+			summary := map[string]any{
+				"algorithm":  string(kp.Algorithm),
 				"peer_id":    kp.PeerID,
 				"public_key": identity.EncodePublicKey(kp.PublicKey),
-			}, "", "  ")
-			fmt.Fprintln(ctx.Stdout, string(summary))
+			}
+			if bits := kp.PublicKey.BitLen(); bits > 0 {
+				summary["bits"] = bits
+			}
+			raw, _ := json.MarshalIndent(summary, "", "  ")
+			fmt.Fprintln(ctx.Stdout, string(raw))
 			return nil
 		},
 	}
@@ -60,8 +79,23 @@ func newKeygenCommand() *cli.Command {
 		Short:     'o',
 		ValueName: "PATH",
 		ShortHelp: "Output key file path (0600)",
-		LongHelp:  "Destination file path for the generated Ed25519 key JSON (created with 0600 permissions)",
+		LongHelp:  "Destination file path for the generated key JSON (created with 0600 permissions)",
 		Required:  true,
+	})
+	cmd.StringOpt(&algoStr, cli.Option{
+		Long:      "algo",
+		Short:     'a',
+		ValueName: "ALGO",
+		ShortHelp: "Key algorithm (ed25519, ed448, nistp-256, nistp-384, nistp-521, rsa)",
+		LongHelp:  "Asymmetric signing algorithm: ed25519, ed448, nistp-256, nistp-384, nistp-521, or rsa",
+		Default:   "ed25519",
+	})
+	cmd.IntOpt(&rsaBits, cli.Option{
+		Long:      "bits",
+		Short:     'b',
+		ValueName: "BITS",
+		ShortHelp: "RSA modulus bit length (2048..8192, default 3072 for rsa)",
+		LongHelp:  "Modulus size in bits when --algo rsa is selected (e.g. 2048, 3072, 4096; default 3072)",
 	})
 	return cmd
 }

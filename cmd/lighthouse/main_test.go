@@ -110,4 +110,62 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 	if !strings.Contains(string(badOut), "tip: a similar argument exists: '--policy'") {
 		t.Fatalf("expected typo suggestion in stderr:\n%s", string(badOut))
 	}
+
+	// Verify multi-algorithm keygen via CLI (ed25519, ed448, nistp-256, nistp-384, nistp-521, rsa).
+	algoChecks := []struct {
+		algo string
+		args []string
+	}{
+		{"ed25519", []string{"admin", "keygen", "--algo", "ed25519"}},
+		{"ed448", []string{"admin", "keygen", "-a", "ed448"}},
+		{"nistp-256", []string{"admin", "keygen", "--algo=nistp-256"}},
+		{"nistp-384", []string{"admin", "keygen", "--algo", "nistp-384"}},
+		{"nistp-521", []string{"admin", "keygen", "--algo", "nistp-521"}},
+		{"rsa", []string{"admin", "keygen", "--algo", "rsa", "--bits", "2048"}},
+	}
+
+	var authKeyPath, rsaPub string
+	for _, ac := range algoChecks {
+		outFile := filepath.Join(tmpDir, ac.algo+".key")
+		cmdArgs := append(append([]string(nil), ac.args...), "--out", outFile)
+		out, err := exec.Command(binPath, cmdArgs...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("keygen %s failed: %v\n%s", ac.algo, err, string(out))
+		}
+		var info map[string]any
+		if err := json.Unmarshal(out, &info); err != nil {
+			t.Fatalf("parse keygen %s output: %v", ac.algo, err)
+		}
+		if info["algorithm"] != ac.algo {
+			t.Fatalf("keygen %s returned algorithm=%v", ac.algo, info["algorithm"])
+		}
+		if ac.algo == "ed448" {
+			authKeyPath = outFile
+		}
+		if ac.algo == "rsa" {
+			rsaPub, _ = info["public_key"].(string)
+		}
+
+		// Reload key via lighthouse peer -ik <file> and confirm matching algorithm and peer_id.
+		pOut, err := exec.Command(binPath, "peer", "-ik", outFile).CombinedOutput()
+		if err != nil {
+			t.Fatalf("peer -ik %s failed: %v\n%s", ac.algo, err, string(pOut))
+		}
+		var pInfo map[string]any
+		if err := json.Unmarshal(pOut, &pInfo); err != nil {
+			t.Fatalf("parse peer -ik %s output: %v", ac.algo, err)
+		}
+		if pInfo["peer_id"] != info["peer_id"] || pInfo["algorithm"] != ac.algo {
+			t.Fatalf("peer -ik %s mismatch: got %+v want %+v", ac.algo, pInfo, info)
+		}
+	}
+
+	// Issue membership using Ed448 authority for RSA peer via unified CLI.
+	memOut, err := exec.Command(binPath, "admin", "issue-membership", "-a", authKeyPath, "--peer-pub", rsaPub, "--allow", "*").CombinedOutput()
+	if err != nil {
+		t.Fatalf("issue-membership ed448->rsa failed: %v\n%s", err, string(memOut))
+	}
+	if !strings.Contains(string(memOut), `"sig"`) {
+		t.Fatalf("unexpected membership output:\n%s", string(memOut))
+	}
 }

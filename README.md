@@ -50,12 +50,12 @@ CGO_ENABLED=0 go build -o bin/lighthouse ./cmd/lighthouse
 
 Full-word options use `--` (e.g., `--policy`, `--help`); single-character short flags use `-` and may be combined (e.g., `-gik peer.key`). Use `-h` for compact help and `--help` or `help <subcommand>` for verbose help.
 
-Generate an offline authority key and two peer keys:
+Generate an offline authority key and two peer keys (`--algo` supports `ed25519` [default], `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, and `rsa` with `--bits 2048..8192`):
 
 ```bash
 ./bin/lighthouse admin keygen --out config/authority.key
-./bin/lighthouse admin keygen --out peer-a.key
-./bin/lighthouse admin keygen --out peer-b.key
+./bin/lighthouse admin keygen --algo ed448 --out peer-a.key
+./bin/lighthouse admin keygen --algo nistp-384 --out peer-b.key
 ```
 
 Issue offline-authority-signed membership records for each peer:

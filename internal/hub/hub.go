@@ -2,7 +2,6 @@ package hub
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -79,7 +78,7 @@ type peerSession struct {
 	conn       *websocket.Conn
 	remoteIP   string
 	peerID     string
-	publicKey  ed25519.PublicKey
+	publicKey  identity.PublicKey
 	membership *identity.MembershipRecord
 	expiresAt  atomic.Int64 // Unix nanos of presence lease expiry
 	writeMu    sync.Mutex
@@ -787,7 +786,7 @@ func (s *Server) handleLookup(ctx context.Context, ps *peerSession, raw []byte) 
 	}
 
 	targetSess := s.latestOnlineSession(req.Target)
-	var targetPub ed25519.PublicKey
+	var targetPub identity.PublicKey
 	var targetMem *identity.MembershipRecord
 	if targetSess != nil {
 		targetPub = targetSess.publicKey
@@ -849,7 +848,7 @@ func (s *Server) handlePeerSignal(ctx context.Context, ps *peerSession, raw []by
 	}
 
 	targetSess := s.latestOnlineSession(env.To)
-	var targetPub ed25519.PublicKey
+	var targetPub identity.PublicKey
 	var targetMem *identity.MembershipRecord
 	if targetSess != nil {
 		targetPub = targetSess.publicKey

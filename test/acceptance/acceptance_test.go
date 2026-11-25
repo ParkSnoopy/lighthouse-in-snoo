@@ -888,3 +888,100 @@ func TestGlareConcurrentOffers(t *testing.T) {
 		t.Fatalf("unexpected message %q", string(got))
 	}
 }
+
+// TestMixedAlgorithmDirectP2PConnectivity verifies that non-Ed25519 keys
+// (Ed448 authority, NIST P-384 Peer A, RSA-2048 Peer B) interoperate end to end
+// across registration, independent membership verification, signed signaling, and DTLS 1.3.
+func TestMixedAlgorithmDirectP2PConnectivity(t *testing.T) {
+	t.Parallel()
+
+	authKP, err := identity.GenerateKeyPairWithOptions(identity.KeyGenOptions{Algorithm: identity.AlgorithmEd448})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerA, err := identity.GenerateKeyPairWithOptions(identity.KeyGenOptions{Algorithm: identity.AlgorithmNISTP384})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerB, err := identity.GenerateKeyPairWithOptions(identity.KeyGenOptions{Algorithm: identity.AlgorithmRSA, RSABits: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().Unix()
+	memA, err := identity.IssueMembership(authKP, peerA.PublicKey, now-60, now+3600, []string{peerB.PeerID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	memB, err := identity.IssueMembership(authKP, peerB.PublicKey, now-60, now+3600, []string{peerA.PeerID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	policy := identity.PolicyConfig{
+		Version:            1,
+		TrustedAuthorities: []string{identity.EncodePublicKey(authKP.PublicKey)},
+		ACLRules: []identity.ACLRule{
+			{PeerA: peerA.PeerID, PeerB: peerB.PeerID},
+		},
+	}
+
+	_, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", policy, nil)
+
+	sessBCh := make(chan *peer.Session, 1)
+	clientA, err := peer.NewClient(peer.Config{
+		KeyPair:         peerA,
+		Membership:      memA,
+		Policy:          policy,
+		SignalingURL:    wsURL,
+		TLSConfig:       pki.clientTLS,
+		STUNServerURI:   stunURI,
+		NetworkTypes:    []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
+		IncludeLoopback: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.Close()
+
+	clientB, err := peer.NewClient(peer.Config{
+		KeyPair:         peerB,
+		Membership:      memB,
+		Policy:          policy,
+		SignalingURL:    wsURL,
+		TLSConfig:       pki.clientTLS,
+		STUNServerURI:   stunURI,
+		NetworkTypes:    []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
+		IncludeLoopback: true,
+		OnSession:       func(s *peer.Session) { sessBCh <- s },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := clientA.Register(ctx); err != nil {
+		t.Fatalf("Register P-384 A: %v", err)
+	}
+	if err := clientB.Register(ctx); err != nil {
+		t.Fatalf("Register RSA-2048 B: %v", err)
+	}
+
+	sessA, err := clientA.Connect(ctx, peerB.PeerID)
+	if err != nil {
+		t.Fatalf("Connect P-384 -> RSA-2048: %v", err)
+	}
+	sessB := <-sessBCh
+
+	if diag := sessA.Diagnostics(); diag.DTLSVersion != peer.ExpectedDTLS13HexVersion {
+		t.Fatalf("expected DTLS 1.3, got %q", diag.DTLSVersion)
+	}
+	if err := sessA.Send(ctx, []byte("mixed-algo-ok")); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-sessB.Messages(); string(got) != "mixed-algo-ok" {
+		t.Fatalf("payload mismatch: %q", string(got))
+	}
+}

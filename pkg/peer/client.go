@@ -2,7 +2,6 @@ package peer
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
@@ -698,7 +697,7 @@ func (c *Client) Lookup(ctx context.Context, targetPeerID string) (*identity.Ver
 		if out.err != nil {
 			return nil, false, out.err
 		}
-		var pub ed25519.PublicKey
+		var pub identity.PublicKey
 		if out.res.PublicKey != "" {
 			pub, err = identity.DecodePublicKey(out.res.PublicKey)
 			if err != nil {
@@ -736,7 +735,7 @@ func (c *Client) removeLookupWaiter(target string, targetCh chan lookupWaiter) {
 }
 
 func (c *Client) resolveVerifiedRemotePeer(ctx context.Context, remotePeerID string) (*identity.VerifiedPeer, error) {
-	if vp, err := c.trust.VerifyPeer(remotePeerID, nil, nil); err == nil {
+	if vp, err := c.trust.VerifyPeer(remotePeerID, identity.PublicKey{}, nil); err == nil {
 		if aclErr := c.trust.AuthorizePair(c.PeerID(), remotePeerID, c.cfg.Membership, vp.Membership); aclErr != nil {
 			return nil, aclErr
 		}

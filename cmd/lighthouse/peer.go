@@ -24,6 +24,8 @@ func newPeerCommand() *cli.Command {
 	var (
 		keyPath    string
 		genKey     bool
+		algoStr    string
+		rsaBits    int
 		printID    bool
 		memPath    string
 		policyPath string
@@ -52,7 +54,15 @@ func newPeerCommand() *cli.Command {
 				err error
 			)
 			if genKey {
-				kp, err = identity.LoadOrGenerateKeyPair(keyPath)
+				algo, parseErr := identity.ParseAlgorithm(algoStr)
+				if parseErr != nil {
+					logger.Error("invalid key algorithm", "err", parseErr)
+					return &cli.ExitError{Code: 2, Err: parseErr}
+				}
+				kp, err = identity.LoadOrGenerateKeyPairWithOptions(keyPath, identity.KeyGenOptions{
+					Algorithm: algo,
+					RSABits:   rsaBits,
+				})
 			} else {
 				kp, err = identity.LoadKeyPair(keyPath)
 			}
@@ -62,10 +72,15 @@ func newPeerCommand() *cli.Command {
 			}
 
 			if printID {
-				out, _ := json.MarshalIndent(map[string]string{
+				summary := map[string]any{
+					"algorithm":  string(kp.Algorithm),
 					"peer_id":    kp.PeerID,
 					"public_key": identity.EncodePublicKey(kp.PublicKey),
-				}, "", "  ")
+				}
+				if bits := kp.PublicKey.BitLen(); bits > 0 {
+					summary["bits"] = bits
+				}
+				out, _ := json.MarshalIndent(summary, "", "  ")
 				fmt.Fprintln(cctx.Stdout, string(out))
 				return nil
 			}
@@ -218,7 +233,20 @@ func newPeerCommand() *cli.Command {
 		Long:      "gen-key",
 		Short:     'g',
 		ShortHelp: "Generate identity key if missing",
-		LongHelp:  "Create a new 0600 Ed25519 identity key at --key when the file does not exist",
+		LongHelp:  "Create a new 0600 identity key at --key when the file does not exist",
+	})
+	cmd.StringOpt(&algoStr, cli.Option{
+		Long:      "algo",
+		ValueName: "ALGO",
+		ShortHelp: "Algorithm for --gen-key (ed25519, ed448, nistp-256, nistp-384, nistp-521, rsa)",
+		LongHelp:  "Asymmetric signing algorithm used when --gen-key creates a new identity key",
+		Default:   "ed25519",
+	})
+	cmd.IntOpt(&rsaBits, cli.Option{
+		Long:      "bits",
+		ValueName: "BITS",
+		ShortHelp: "RSA modulus bit length for --gen-key --algo rsa",
+		LongHelp:  "Modulus size in bits when generating an RSA identity key (2048..8192, default 3072)",
 	})
 	cmd.BoolOpt(&printID, cli.Option{
 		Long:      "print-id",

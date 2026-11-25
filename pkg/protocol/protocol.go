@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -350,8 +349,10 @@ func SignEnvelope(
 	signingInput := make([]byte, 0, len(DomainSignalV1)+len(canon))
 	signingInput = append(signingInput, DomainSignalV1...)
 	signingInput = append(signingInput, canon...)
-	sig := ed25519.Sign(kp.PrivateKey, signingInput)
-	sigEnc := base64.RawURLEncoding.EncodeToString(sig)
+	sigEnc, err := kp.SignBase64URL(signingInput)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	env := &SignalEnvelope{
 		V:          unsigned.V,
@@ -445,11 +446,11 @@ func ParseUnsignedEnvelope(raw []byte, maxBytes int) (*SignalEnvelope, error) {
 	}, nil
 }
 
-// VerifyEnvelopeSignature checks expiry bounds and verifies the Ed25519 signature over
+// VerifyEnvelopeSignature checks expiry bounds and verifies the signature over
 // "LIGHTHOUSE-SIGNAL-V1\x00" + JCS(envelope without sig).
 func VerifyEnvelopeSignature(
 	env *SignalEnvelope,
-	senderPub ed25519.PublicKey,
+	senderPub identity.PublicKey,
 	now time.Time,
 	maxTTL time.Duration,
 	clockSkew time.Duration,
@@ -466,10 +467,6 @@ func VerifyEnvelopeSignature(
 	ttlSec := int64(maxTTL / time.Second)
 	if env.ExpiresAt+skewSec < nowUnix || env.ExpiresAt > nowUnix+ttlSec+skewSec {
 		return ErrExpiredEnvelope
-	}
-	sigBytes, err := base64.RawURLEncoding.DecodeString(env.Sig)
-	if err != nil || len(sigBytes) != ed25519.SignatureSize || base64.RawURLEncoding.EncodeToString(sigBytes) != env.Sig {
-		return ErrInvalidSignature
 	}
 
 	unsigned := unsignedSignalEnvelope{
@@ -490,7 +487,7 @@ func VerifyEnvelopeSignature(
 	signingInput := make([]byte, 0, len(DomainSignalV1)+len(canon))
 	signingInput = append(signingInput, DomainSignalV1...)
 	signingInput = append(signingInput, canon...)
-	if !ed25519.Verify(senderPub, signingInput, sigBytes) {
+	if err := senderPub.VerifyBase64URL(signingInput, env.Sig); err != nil {
 		return ErrInvalidSignature
 	}
 	return nil

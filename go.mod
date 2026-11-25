@@ -3,6 +3,7 @@ module lighthouse-in-snoo
 go 1.26.0
 
 require (
+	github.com/cloudflare/circl v1.6.5
 	github.com/coder/websocket v1.8.15
 	github.com/pion/dtls/v4 v4.0.1
 	github.com/pion/ice/v5 v5.0.0-rc.9
@@ -31,8 +32,8 @@ require (
 	github.com/pion/turn/v6 v6.0.0-rc.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
-	golang.org/x/net v0.50.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

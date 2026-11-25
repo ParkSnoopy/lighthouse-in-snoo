@@ -15,10 +15,15 @@ Control-plane signaling runs out of band over `wss://<host>/v1/signal` using TLS
 
 ## 2. Cryptographic Identity and Trust
 
-### 2.1 Peer Identifiers
+### 2.1 Peer Identifiers and Key Algorithms
 
-- Identity key algorithm: Ed25519 (RFC 8032). Private keys are stored with `0600` file permissions; `pkg/identity.LoadKeyPair` rejects group/world-accessible key files.
-- `peer_id`: unpadded `base64url` encoding (43 ASCII characters) of `SHA-256(raw_32_byte_ed25519_public_key)`.
+- Supported identity and authority signing algorithms (`--algo`):
+  - `ed25519` (default, RFC 8032): raw 32-byte unpadded `base64url` wire `public_key`; `peer_id = base64url(SHA-256(raw_32_bytes))`.
+  - `ed448` (RFC 8032): `ed448:<base64url(raw_57_bytes)>`; `peer_id = base64url(SHA-256("ed448\x00" || raw_57_bytes))`.
+  - `nistp-256` (ECDSA P-256 + SHA-256), `nistp-384` (ECDSA P-384 + SHA-384), `nistp-521` (ECDSA P-521 + SHA-512): `<algo>:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("<algo>\x00" || spki_der))`.
+  - `rsa` (RSA-PSS + SHA-256, `2048`–`8192` bits, default `3072`): `rsa:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("rsa\x00" || spki_der))`.
+- Private keys are stored with `0600` file permissions; `pkg/identity.LoadKeyPair` rejects group/world-accessible key files.
+- Every `peer_id` is a 43-character unpadded `base64url` SHA-256 digest.
 
 ### 2.2 Domain-Separated Signatures
 
