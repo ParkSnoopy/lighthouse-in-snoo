@@ -33,6 +33,7 @@ type Options struct {
 	AllowInsecureICE bool
 	IncludeLoopback  bool
 	InterfaceName    string
+	VirtualCIDR      netip.Prefix
 	OpenDevice       func(localIP netip.Addr) (tun.Device, error)
 	Logger           *slog.Logger
 }
@@ -43,12 +44,21 @@ type pendingConsent struct {
 	popup  *widget.PopUp
 }
 
+type activeAlert struct {
+	severity rawblock.AlertSeverity
+	title    string
+	detail   string
+	modal    *rawblock.AlertModal
+	popup    *widget.PopUp
+}
+
 // Controller binds a RawBlock-styled Fyne desktop UI to a Lighthouse peer Client
 // and OS TUN Router. All incoming connections require explicit Allow / Deny / Blacklist action.
 type Controller struct {
 	app    fyne.App
 	window fyne.Window
 	opts   Options
+	cidr   netip.Prefix
 	vip    netip.Addr
 
 	mu               sync.Mutex
@@ -65,6 +75,7 @@ type Controller struct {
 	blacklisted      []string
 	consentPrompting bool
 	activeConsent    *pendingConsent
+	alert            *activeAlert
 
 	// Exposed RawBlock components for user interaction and deterministic Fyne headless tests.
 	StatusChip      *rawblock.Chip
@@ -75,9 +86,11 @@ type Controller struct {
 	HubURLInput     *rawblock.Input
 	HubPassInput    *rawblock.Input
 	IfNameInput     *rawblock.Input
+	CIDRInput       *rawblock.Input
 	HubURLEntry     *widget.Entry
 	HubPassEntry    *widget.Entry
 	IfNameEntry     *widget.Entry
+	CIDREntry       *widget.Entry
 	TCPOnlyCheck    *rawblock.Check
 	ConnectHubBtn   *rawblock.Button
 	PassphraseInput *rawblock.Input
@@ -120,7 +133,17 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	vip, err := identity.VirtualIPv4FromPeerID(opts.KeyPair.PeerID)
+	cidr := opts.VirtualCIDR
+	if !cidr.IsValid() {
+		cidr = identity.DefaultVirtualCIDR()
+	} else {
+		var parseErr error
+		cidr, parseErr = identity.ParseVirtualCIDR(cidr.String())
+		if parseErr != nil {
+			return nil, parseErr
+		}
+	}
+	vip, err := identity.VirtualIPv4InPrefix(opts.KeyPair.PeerID, cidr)
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +157,7 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 		app:    a,
 		window: w,
 		opts:   opts,
+		cidr:   cidr,
 		vip:    vip,
 	}
 	c.buildUI()
@@ -157,6 +181,86 @@ func (c *Controller) Router() *tun.Router {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.router
+}
+
+// VirtualCIDR returns the currently active or configured IPv4 TUN CIDR.
+func (c *Controller) VirtualCIDR() netip.Prefix {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cidr
+}
+
+// ActiveAlert returns metadata for the currently displayed error/warning modal, if any.
+func (c *Controller) ActiveAlert() (severity rawblock.AlertSeverity, title, detail string, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.alert == nil {
+		return 0, "", "", false
+	}
+	return c.alert.severity, c.alert.title, c.alert.detail, true
+}
+
+// DismissAlert closes any currently visible error/warning modal.
+func (c *Controller) DismissAlert() {
+	c.mu.Lock()
+	al := c.alert
+	c.alert = nil
+	c.mu.Unlock()
+	if al != nil && al.popup != nil {
+		c.doUI(func() {
+			al.popup.Hide()
+		})
+	}
+}
+
+// ShowAlert opens a copyable RawBlock modal for an error or warning message.
+func (c *Controller) ShowAlert(severity rawblock.AlertSeverity, title, detail string) {
+	c.doUI(func() {
+		c.mu.Lock()
+		prev := c.alert
+		c.alert = nil
+		c.mu.Unlock()
+		if prev != nil && prev.popup != nil {
+			prev.popup.Hide()
+		}
+
+		var pop *widget.PopUp
+		modal := rawblock.NewAlertModal(severity, title, detail,
+			func(copyText string) {
+				c.app.Clipboard().SetContent(copyText)
+			},
+			func() {
+				c.DismissAlert()
+			},
+		)
+		pop = widget.NewModalPopUp(modal, c.window.Canvas())
+
+		c.mu.Lock()
+		c.alert = &activeAlert{
+			severity: severity,
+			title:    modal.Title,
+			detail:   modal.Detail,
+			modal:    modal,
+			popup:    pop,
+		}
+		c.mu.Unlock()
+
+		pop.Show()
+	})
+}
+
+func (c *Controller) showError(title string, err error) {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	c.setStatus("ERROR", rawblock.ChipError)
+	c.ShowAlert(rawblock.AlertError, title, detail)
+}
+
+func (c *Controller) showWarning(title, detail string) {
+	c.setStatus("WARNING", rawblock.ChipWarning)
+	c.ShowAlert(rawblock.AlertWarning, title, detail)
 }
 
 // PendingRequest returns the currently prompted incoming connection request, if any.
@@ -262,6 +366,25 @@ func (c *Controller) buildUI() {
 	c.IfNameEntry = c.IfNameInput.Entry
 	c.IfNameEntry.SetText(c.opts.InterfaceName)
 
+	c.CIDRInput = rawblock.NewInput("IP CIDR", identity.DefaultVirtualCIDRString, "", false)
+	c.CIDREntry = c.CIDRInput.Entry
+	c.CIDREntry.SetText(c.cidr.String())
+	c.CIDREntry.OnChanged = func(raw string) {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			trimmed = identity.DefaultVirtualCIDRString
+		}
+		p, parseErr := identity.ParseVirtualCIDR(trimmed)
+		if parseErr != nil {
+			return
+		}
+		c.CIDRInput.SetError("")
+		if vip, vErr := identity.VirtualIPv4InPrefix(c.opts.KeyPair.PeerID, p); vErr == nil {
+			c.VirtualIPText.Text = vip.String()
+			c.VirtualIPText.Refresh()
+		}
+	}
+
 	c.TCPOnlyCheck = rawblock.NewCheck("TCP ONLY", nil)
 	c.TCPOnlyCheck.SetCheckedSilent(c.opts.TCPOnly)
 
@@ -274,7 +397,7 @@ func (c *Controller) buildUI() {
 		rawblock.NewDivider(rawblock.BorderThick),
 		c.HubURLInput,
 		c.HubPassInput,
-		c.IfNameInput,
+		rawblock.AsymmetricSplit(0.36, rawblock.Sp3, c.IfNameInput, c.CIDRInput),
 		c.TCPOnlyCheck,
 		c.ConnectHubBtn,
 	)
@@ -298,13 +421,12 @@ func (c *Controller) buildUI() {
 	c.DirectPeerInput = rawblock.NewInput("DIRECT PEER ID", "PEER ID", "", false)
 	c.DirectPeerEntry = c.DirectPeerInput.Entry
 	c.DirectConnBtn = rawblock.NewButton("CONNECT", rawblock.ButtonSecondary, rawblock.ButtonMedium, func() {
-		var target string
-		c.doUIWait(func() {
-			target = strings.TrimSpace(c.DirectPeerEntry.Text)
-		})
-		if target != "" {
-			go c.connectPeerAction(target)
+		target := strings.TrimSpace(c.DirectPeerEntry.Text)
+		if target == "" {
+			c.showWarning("MISSING PEER ID", "Enter a remote Peer ID before connecting.")
+			return
 		}
+		go c.connectPeerAction(target)
 	})
 
 	c.PeersBox = rawblock.GapVBox(0, emptyListRow("NO PEERS"))
@@ -394,10 +516,7 @@ func (c *Controller) toggleConnection() {
 		return
 	}
 	if err := c.ConnectAndBind(context.Background()); err != nil {
-		c.setStatus("ERROR", rawblock.ChipError)
-		c.doUI(func() {
-			c.HubURLInput.SetError(err.Error())
-		})
+		c.showError("BIND & CONNECT FAILED", err)
 	}
 }
 
@@ -407,36 +526,51 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 		hubURL  string
 		hubPass string
 		ifName  string
+		cidrRaw string
 		tcpOnly bool
 	)
 	c.doUIWait(func() {
 		c.HubURLInput.SetError("")
+		c.CIDRInput.SetError("")
 		hubURL = strings.TrimSpace(c.HubURLEntry.Text)
 		hubPass = c.HubPassEntry.Text
 		ifName = strings.TrimSpace(c.IfNameEntry.Text)
+		cidrRaw = strings.TrimSpace(c.CIDREntry.Text)
 		tcpOnly = c.TCPOnlyCheck.Checked
 	})
 	if ifName == "" {
 		ifName = "lh0"
 	}
+	if cidrRaw == "" {
+		cidrRaw = identity.DefaultVirtualCIDRString
+	}
+	cidr, err := identity.ParseVirtualCIDR(cidrRaw)
+	if err != nil {
+		c.doUI(func() { c.CIDRInput.SetError("Invalid IPv4 CIDR") })
+		return fmt.Errorf("invalid IP CIDR %q: %w", cidrRaw, err)
+	}
+	localVIP, err := identity.VirtualIPv4InPrefix(c.opts.KeyPair.PeerID, cidr)
+	if err != nil {
+		return err
+	}
 
 	openFn := c.opts.OpenDevice
 	if openFn == nil {
-		openFn = func(localIP netip.Addr) (tun.Device, error) {
+		openFn = func(ip netip.Addr) (tun.Device, error) {
 			return tun.OpenLinux(tun.LinuxConfig{
 				Name:        ifName,
-				LocalCIDR:   netip.PrefixFrom(localIP, tun.DefaultSubnetPrefixBits),
+				LocalCIDR:   netip.PrefixFrom(ip, cidr.Bits()),
 				MTU:         tun.DefaultMTU,
 				ConfigureOS: true,
 			})
 		}
 	}
 
-	dev, err := openFn(c.vip)
+	dev, err := openFn(localVIP)
 	if err != nil {
-		return fmt.Errorf("bind interface: %w", err)
+		return fmt.Errorf("bind interface %s (%s/%d): %w", ifName, localVIP.String(), cidr.Bits(), err)
 	}
-	router, err := tun.NewRouter(dev, c.vip)
+	router, err := tun.NewRouter(dev, localVIP)
 	if err != nil {
 		_ = dev.Close()
 		return err
@@ -453,10 +587,13 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 		IncludeLoopback:     c.opts.IncludeLoopback,
 		EnablePacketChannel: true,
 		BlacklistPath:       c.opts.BlacklistPath,
+		VirtualCIDR:         cidr,
 		Consent:             c,
 		Logger:              c.opts.Logger,
 		OnSession: func(s *peer.Session) {
-			_, _ = router.AttachSession(s)
+			if _, attachErr := router.AttachSession(s); attachErr != nil {
+				c.showError("TUN ROUTE ATTACH FAILED", attachErr)
+			}
 			c.refreshLists()
 		},
 		OnSessionClosed: func(remotePeerID, _ string) {
@@ -487,13 +624,18 @@ func (c *Controller) ConnectAndBind(ctx context.Context) error {
 	c.mu.Lock()
 	c.client = client
 	c.router = router
+	c.cidr = cidr
+	c.vip = localVIP
 	c.connected = true
 	c.blacklisted = client.BlacklistedPeers()
 	c.mu.Unlock()
 
-	ifInfo := fmt.Sprintf("%s %s/%d", dev.Name(), c.vip.String(), tun.DefaultSubnetPrefixBits)
+	ifInfo := fmt.Sprintf("%s %s/%d", dev.Name(), localVIP.String(), cidr.Bits())
 	c.doUI(func() {
-		c.InterfaceText.Text = ifInfo
+		c.VirtualIPText.Text = localVIP.String()
+		c.VirtualIPText.Refresh()
+		c.CIDREntry.SetText(cidr.String())
+		c.InterfaceText.Text = dev.Name()
 		c.InterfaceText.Refresh()
 		c.StatusText.Text = ifInfo
 		c.StatusText.Refresh()
@@ -550,13 +692,12 @@ func (c *Controller) joinChannelAction() {
 	client := c.client
 	c.mu.Unlock()
 	if client == nil {
-		c.setStatus("OFFLINE", rawblock.ChipWarning)
+		c.showWarning("NOT CONNECTED", "Bind and connect to a hub before joining a passphrase channel.")
 		return
 	}
 	chID, err := client.JoinChannel(context.Background(), pass)
 	if err != nil {
-		c.setStatus("JOIN ERROR", rawblock.ChipError)
-		c.doUI(func() { c.PassphraseInput.SetError(err.Error()) })
+		c.showError("JOIN CHANNEL FAILED", err)
 		return
 	}
 	c.mu.Lock()
@@ -582,16 +723,15 @@ func (c *Controller) broadcastToggleAction(enabled bool) {
 	if client == nil {
 		if enabled {
 			c.doUI(func() { c.BroadcastCheck.SetCheckedSilent(false) })
-			c.setStatus("OFFLINE", rawblock.ChipWarning)
+			c.showWarning("NOT CONNECTED", "Bind and connect to a hub before enabling broadcast.")
 		}
 		return
 	}
 	if _, err := client.SetBroadcast(context.Background(), enabled, pass, label); err != nil {
 		c.doUI(func() {
 			c.BroadcastCheck.SetCheckedSilent(!enabled)
-			c.PassphraseInput.SetError(err.Error())
 		})
-		c.setStatus("BROADCAST ERR", rawblock.ChipError)
+		c.showError("BROADCAST FAILED", err)
 		return
 	}
 	c.mu.Lock()
@@ -609,14 +749,14 @@ func (c *Controller) connectPeerAction(targetPeerID string) {
 	client := c.client
 	c.mu.Unlock()
 	if client == nil {
-		c.setStatus("OFFLINE", rawblock.ChipWarning)
+		c.showWarning("NOT CONNECTED", "Bind and connect to a hub before connecting to a peer.")
 		return
 	}
 	c.setStatus("CONNECTING", rawblock.ChipWarning)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := client.Connect(ctx, targetPeerID); err != nil {
-		c.setStatus("CONNECT ERR", rawblock.ChipError)
+		c.showError("PEER CONNECTION FAILED", err)
 		return
 	}
 	c.setStatus("CONNECTED", rawblock.ChipActive)
@@ -629,10 +769,11 @@ func (c *Controller) blacklistPeerAction(peerID string) {
 	router := c.router
 	c.mu.Unlock()
 	if client == nil {
+		c.showWarning("NOT CONNECTED", "Bind and connect to a hub before modifying the blacklist.")
 		return
 	}
 	if err := client.Blacklist(peerID); err != nil {
-		c.setStatus("BLOCK ERR", rawblock.ChipError)
+		c.showError("BLACKLIST FAILED", err)
 		return
 	}
 	if router != nil {
@@ -647,9 +788,13 @@ func (c *Controller) unblacklistPeerAction(peerID string) {
 	client := c.client
 	c.mu.Unlock()
 	if client == nil {
+		c.showWarning("NOT CONNECTED", "Bind and connect to a hub before modifying the blacklist.")
 		return
 	}
-	_ = client.Unblacklist(peerID)
+	if err := client.Unblacklist(peerID); err != nil {
+		c.showError("UNBLACKLIST FAILED", err)
+		return
+	}
 	c.setStatus("CONNECTED", rawblock.ChipActive)
 	c.refreshLists()
 }

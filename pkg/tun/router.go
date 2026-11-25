@@ -87,9 +87,16 @@ func (r *Router) AttachSession(sess *peer.Session) (netip.Addr, error) {
 		return netip.Addr{}, errors.New("tun: session is nil")
 	}
 	remoteID := sess.RemotePeerID()
-	remoteIP, err := identity.VirtualIPv4FromPeerID(remoteID)
-	if err != nil {
-		return netip.Addr{}, err
+	remoteIP := sess.RemoteVirtualIP()
+	if !remoteIP.IsValid() {
+		var err error
+		remoteIP, err = identity.VirtualIPv4FromPeerID(remoteID)
+		if err != nil {
+			return netip.Addr{}, err
+		}
+	}
+	if remoteIP == r.localIP {
+		return netip.Addr{}, errors.New("tun: remote virtual IP collides with local virtual IP")
 	}
 
 	r.mu.Lock()

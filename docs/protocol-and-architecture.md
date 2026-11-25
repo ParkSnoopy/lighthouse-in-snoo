@@ -9,12 +9,12 @@ Lighthouse separates the network into two components:
    - Passphrase-bucketed broadcast forwarding (opaque 32-byte `channel_id` tokens; the hub never sees raw passphrases or decrypted peer labels).
    - Optional offline shared hub passphrase gating (`--passphrase` / `LIGHTHOUSE_PASSPHRASE`) verified via challenge-bound HMAC.
    - Integrated universal DTLS 1.3 / UDP STUNS + TURNS relay (`:5349/udp`) that automatically mints 12-hour HMAC TURN REST credentials in `registered.relay` for every registered peer (or TLS 1.3 / TCP STUNS with zero UDP sockets under `--tcp-only`).
-2. **Bound OS Virtual Interface App (`cmd/lighthouse-ui` / `internal/ui` / `pkg/tun` / `pkg/peer`)**: A Fyne desktop application that binds a local OS TUN virtual interface (`lh0`, RFC 6598 `100.64.0.0/10`) directly to user-authorized DTLS 1.3 WebRTC tunnels.
+2. **Bound OS Virtual Interface App (`cmd/lighthouse-ui` / `internal/ui` / `pkg/tun` / `pkg/peer`)**: A Fyne desktop application that binds a local OS TUN virtual interface (`lh0`, configurable IPv4 CIDR defaulting to `10.88.0.0/16`) directly to user-authorized DTLS 1.3 WebRTC tunnels.
 
 ## 2. Protocol Stack
 
 ```text
-OS IPv4 / IPv6 packets via TUN virtual interface (lh0, 100.64.0.0/10, MTU 1280)
+OS IPv4 / IPv6 packets via TUN virtual interface (lh0, default 10.88.0.0/16, MTU 1380)
 TUN Router (pkg/tun): strict cryptographic source-IP anti-spoofing
 WebRTC DataChannel / DCEP ("packet/v1" unordered datagrams, "data/v1" ordered fallback, <= 16 KiB)
 SCTP (congestion control active, max-message-size = 16384)
@@ -40,7 +40,7 @@ Transport prioritization:
   - `nistp-256`, `nistp-384`, `nistp-521`: `<algo>:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("<algo>\x00" || spki_der))`.
   - `rsa` (RSA-PSS + SHA-256, `2048`–`8192` bits, default `3072`): `rsa:<base64url(PKIX_SPKI_DER)>`; `peer_id = base64url(SHA-256("rsa\x00" || spki_der))`.
 - Private keys and local blacklist files (`blacklist.json`) are saved atomically with `0600` permissions and rejected if group/world-accessible.
-- Every `peer_id` deterministically maps to a unique RFC 6598 TUN IPv4 address via `SHA-256("LIGHTHOUSE-TUN-IPV4-V2\x00" || peer_id)` mapped into `100.64.0.0/10`.
+- Every `peer_id` deterministically maps to a usable host TUN IPv4 address via `SHA-256("LIGHTHOUSE-TUN-IPV4-V2\x00" || peer_id)` mapped into the configured IPv4 CIDR (`--cidr` / `LIGHTHOUSE_CIDR`, default `10.88.0.0/16`, `/1`–`/30`, excluding network and broadcast addresses).
 
 ### 3.2 Offline Passphrase Derivation
 

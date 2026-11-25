@@ -13,8 +13,8 @@ const (
 	// DefaultMTU keeps raw IP packets comfortably under the 16 KiB WebRTC SCTP limit
 	// and avoids outer UDP fragmentation on standard 1500-byte paths.
 	DefaultMTU = 1380
-	// DefaultSubnetPrefixBits is the RFC 6598 CGNAT /10 mask (100.64.0.0/10).
-	DefaultSubnetPrefixBits = 10
+	// DefaultSubnetPrefixBits is the default Lighthouse virtual IPv4 mask (10.88.0.0/16).
+	DefaultSubnetPrefixBits = 16
 )
 
 var (

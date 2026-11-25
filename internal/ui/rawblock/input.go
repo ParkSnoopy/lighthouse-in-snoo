@@ -18,6 +18,24 @@ type rawEntry struct {
 	hovered       bool
 }
 
+type borderlessEntryRenderer struct {
+	fyne.WidgetRenderer
+}
+
+// Objects removes Fyne's stock Entry background/border rectangles so RawBlock draws
+// a single crisp outer border with zero double-box artifact in all states (including focus).
+func (r *borderlessEntryRenderer) Objects() []fyne.CanvasObject {
+	base := r.WidgetRenderer.Objects()
+	out := make([]fyne.CanvasObject, 0, len(base))
+	for _, o := range base {
+		if _, isRect := o.(*canvas.Rectangle); isRect {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
 func newRawEntry(placeholder string, password bool, onStateChange func(focused, hovered bool)) *rawEntry {
 	e := &rawEntry{onStateChange: onStateChange}
 	e.PlaceHolder = placeholder
@@ -31,6 +49,10 @@ func newRawEntry(placeholder string, password bool, onStateChange func(focused, 
 	e.TextStyle = StyleMono
 	e.ExtendBaseWidget(e)
 	return e
+}
+
+func (e *rawEntry) CreateRenderer() fyne.WidgetRenderer {
+	return &borderlessEntryRenderer{WidgetRenderer: e.Entry.CreateRenderer()}
 }
 
 func (e *rawEntry) FocusGained() {
@@ -67,8 +89,8 @@ func (e *rawEntry) MouseOut() {
 
 // Input implements RawBlock text/password fields:
 //   - Surface sunken (#F0F0F0), Space Mono 15px, 10px/12px padding, razor-sharp 0px square corners
-//   - Default: 3px black border; Hover: #E8E8E8 bg; Focus: 5px black border
-//   - Error: 3px #FF0000 border; Disabled: 3px #CCCCCC border + #F5F5F5 bg (no double inner border)
+//   - Default & Focus: single 3px black border (focus keeps identical frame with only text caret)
+//   - Hover (unfocused): #E8E8E8 bg; Error: 3px #FF0000 border; Disabled: 3px #CCCCCC + #F5F5F5 bg
 //   - Label: Archivo Black 14px uppercase (4px margin-bottom)
 //   - Helper/Error text: Work Sans 14px (4px margin-top)
 type Input struct {
@@ -127,6 +149,9 @@ func (ri *Input) SetText(s string) {
 // Text returns the current entry text.
 func (ri *Input) Text() string { return ri.Entry.Text }
 
+// Focusable returns the mounted inner Fyne Focusable widget (for Canvas().Focus).
+func (ri *Input) Focusable() fyne.Focusable { return ri.inner }
+
 // SetError activates error border (#FF0000) and error helper text (clears if empty).
 func (ri *Input) SetError(msg string) {
 	ri.errText = msg
@@ -157,6 +182,7 @@ func (ri *Input) Enable() {
 func (ri *Input) Disabled() bool { return ri.inner.Disabled() }
 
 // FrameStyle returns current (fill, borderColor, borderWidth) for rendering and tests.
+// Focused state keeps the exact non-focus single-box style so only the text caret indicates focus.
 func (ri *Input) FrameStyle() (fill, border color.Color, borderW float32) {
 	switch {
 	case ri.inner.Disabled():
@@ -164,7 +190,7 @@ func (ri *Input) FrameStyle() (fill, border color.Color, borderW float32) {
 	case ri.errText != "":
 		return ColorSurfaceSunken, ColorError, BorderThick
 	case ri.focused:
-		return ColorSurfaceSunken, ColorBlack, BorderHeavy
+		return ColorSurfaceSunken, ColorBlack, BorderThick
 	case ri.hovered:
 		return ColorSurfaceHover, ColorBlack, BorderThick
 	default:

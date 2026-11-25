@@ -27,6 +27,7 @@ func main() {
 		caPath        string
 		stunURI       string
 		ifName        string
+		cidrStr       string
 		tcpOnly       bool
 		insecure      bool
 	)
@@ -71,6 +72,12 @@ func main() {
 				}
 			}
 
+			virtualCIDR, err := identity.ParseVirtualCIDR(cidrStr)
+			if err != nil {
+				fmt.Fprintln(ctx.Stderr, err)
+				return &cli.ExitError{Code: 2, Err: err}
+			}
+
 			fyneApp := app.NewWithID("io.lighthouse.ui")
 			ctrl, err := ui.NewController(fyneApp, ui.Options{
 				KeyPair:          kp,
@@ -82,6 +89,7 @@ func main() {
 				TCPOnly:          tcpOnly,
 				AllowInsecureICE: insecure,
 				InterfaceName:    ifName,
+				VirtualCIDR:      virtualCIDR,
 			})
 			if err != nil {
 				fmt.Fprintln(ctx.Stderr, err)
@@ -152,6 +160,13 @@ func main() {
 		ShortHelp: "OS TUN interface name",
 		EnvVar:    "LIGHTHOUSE_IFNAME",
 		Default:   "lh0",
+	})
+	cmd.StringOpt(&cidrStr, cli.Option{
+		Long:      "cidr",
+		ValueName: "CIDR",
+		ShortHelp: "Virtual IPv4 subnet CIDR for TUN addressing",
+		EnvVar:    "LIGHTHOUSE_CIDR",
+		Default:   identity.DefaultVirtualCIDRString,
 	})
 	cmd.BoolOpt(&tcpOnly, cli.Option{
 		Long:      "tcp-only",

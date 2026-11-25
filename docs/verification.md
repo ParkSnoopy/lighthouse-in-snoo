@@ -68,7 +68,7 @@ go test -race -count=1 ./...
 | Package | Command | Covered Invariants |
 | --- | --- | --- |
 | `cmd/lighthouse` | `go test -race ./cmd/lighthouse` | Zero-config hub CLI flags, POSIX double-dash enforcement, single-source `pkg/version/version.go` alignment across `lighthouse` and `lighthouse-ui`, runtime `.env`/`LIGHTHOUSE_*` loading |
-| `pkg/identity` | `go test -race ./pkg/identity` | Multi-algorithm keygen, `0600` key and blacklist permissions, Argon2id `DeriveChannelKeys`, XChaCha20-Poly1305 `SealBroadcastMeta`/`OpenBroadcastMeta`, hub passphrase HMAC proofs, RFC 6598 virtual IP derivation |
+| `pkg/identity` | `go test -race ./pkg/identity` | Multi-algorithm keygen, `0600` key and blacklist permissions, Argon2id `DeriveChannelKeys`, XChaCha20-Poly1305 `SealBroadcastMeta`/`OpenBroadcastMeta`, hub passphrase HMAC proofs, configurable IPv4 virtual CIDR (`10.88.0.0/16` default) derivation |
 | `pkg/protocol` | `go test -race ./pkg/protocol` | v2 wire schemas, `64 KiB` limit, JCS signaling and broadcast signatures, embedded `public_key` binding |
 | `pkg/tun` | `go test -race ./pkg/tun` | IPv4/IPv6 header endpoint parsing, bidirectional TUN packet forwarding over DTLS 1.3 WebRTC, outbound and inbound cryptographic source-IP anti-spoofing |
 | `internal/ui` | `go test -race ./internal/ui` | Headless Fyne v2 controller binding TUN interface, passphrase-scoped broadcast discovery, explicit Allow/Deny/Blacklist modal workflow, live TUN routing, and blacklist teardown/unblacklist |

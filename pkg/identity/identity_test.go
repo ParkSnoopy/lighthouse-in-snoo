@@ -271,13 +271,19 @@ func TestVirtualIPv4FromPeerIDAndBlacklistPersistence(t *testing.T) {
 	kpA, _ := identity.GenerateKeyPair()
 	kpB, _ := identity.GenerateKeyPair()
 
-	cgnat := netip.MustParsePrefix("100.64.0.0/10")
+	defaultCIDR := netip.MustParsePrefix("10.88.0.0/16")
+	if identity.DefaultVirtualCIDR() != defaultCIDR {
+		t.Fatalf("DefaultVirtualCIDR() = %s; want %s", identity.DefaultVirtualCIDR(), defaultCIDR)
+	}
 	ipA, err := identity.VirtualIPv4FromPeerID(kpA.PeerID)
 	if err != nil {
 		t.Fatalf("VirtualIPv4FromPeerID: %v", err)
 	}
-	if !cgnat.Contains(ipA) {
-		t.Fatalf("virtual IP %s outside 100.64.0.0/10", ipA)
+	if !defaultCIDR.Contains(ipA) {
+		t.Fatalf("virtual IP %s outside default 10.88.0.0/16", ipA)
+	}
+	if ipA == netip.MustParseAddr("10.88.0.0") || ipA == netip.MustParseAddr("10.88.255.255") {
+		t.Fatalf("virtual IP %s must not be network or broadcast", ipA)
 	}
 	ipARepeat, err := identity.VirtualIPv4FromPeerID(kpA.PeerID)
 	if err != nil || ipARepeat != ipA {
@@ -285,6 +291,30 @@ func TestVirtualIPv4FromPeerIDAndBlacklistPersistence(t *testing.T) {
 	}
 	if _, err := identity.VirtualIPv4FromPeerID("bad-peer-id"); err == nil {
 		t.Fatal("expected error for invalid peer ID")
+	}
+
+	// Custom CIDR parsing, normalization, and usable-host derivation.
+	norm, err := identity.ParseVirtualCIDR(" 10.99.5.42/24 ")
+	if err != nil || norm != netip.MustParsePrefix("10.99.5.0/24") {
+		t.Fatalf("ParseVirtualCIDR normalization = (%s, %v); want 10.99.5.0/24", norm, err)
+	}
+	for _, cidrStr := range []string{"10.99.5.0/24", "172.20.0.0/16", "100.64.0.0/10", "10.1.2.0/30"} {
+		pfx, parseErr := identity.ParseVirtualCIDR(cidrStr)
+		if parseErr != nil {
+			t.Fatalf("ParseVirtualCIDR(%q): %v", cidrStr, parseErr)
+		}
+		derived, dErr := identity.VirtualIPv4InPrefix(kpA.PeerID, pfx)
+		if dErr != nil {
+			t.Fatalf("VirtualIPv4InPrefix(%q): %v", cidrStr, dErr)
+		}
+		if !pfx.Contains(derived) || derived == pfx.Addr() {
+			t.Fatalf("derived %s invalid for %s", derived, pfx)
+		}
+	}
+	for _, bad := range []string{"", "not-a-cidr", "10.88.0.0/31", "10.88.0.1/32", "0.0.0.0/0", "fd00::/64"} {
+		if _, err := identity.ParseVirtualCIDR(bad); err == nil {
+			t.Fatalf("expected ParseVirtualCIDR(%q) error", bad)
+		}
 	}
 
 	blPath := filepath.Join(t.TempDir(), "blacklist.json")

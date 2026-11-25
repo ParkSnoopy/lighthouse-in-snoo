@@ -86,7 +86,8 @@ type Config struct {
 	Consent        ConsentHandler
 	ConsentTimeout time.Duration // Default 60s.
 	Blacklist      *identity.Blacklist
-	BlacklistPath  string // Optional 0600 file path for persisting blacklist mutations.
+	BlacklistPath  string       // Optional 0600 file path for persisting blacklist mutations.
+	VirtualCIDR    netip.Prefix // Optional virtual IPv4 subnet (default 10.88.0.0/16).
 
 	EnablePacketChannel     bool // Negotiate unordered packet/v1 DataChannel (used for IP TUN packets).
 	MaxQueueBytes           int
@@ -118,11 +119,12 @@ type Config struct {
 // passphrase-scoped broadcasting/discovery, local blacklist, explicit incoming consent,
 // and DTLS 1.3 WebRTC sessions.
 type Client struct {
-	cfg       Config
-	hubOrigin string
-	localVIP  netip.Addr
-	blacklist *identity.Blacklist
-	log       *slog.Logger
+	cfg         Config
+	hubOrigin   string
+	virtualCIDR netip.Prefix
+	localVIP    netip.Addr
+	blacklist   *identity.Blacklist
+	log         *slog.Logger
 
 	iceMu               sync.RWMutex
 	resolvedICE         []resolvedICEServer
@@ -170,7 +172,17 @@ func NewClient(cfgIn *Config) (*Client, error) {
 	if err := identity.ValidatePeerID(cfg.KeyPair.PeerID); err != nil {
 		return nil, err
 	}
-	localVIP, err := identity.VirtualIPv4FromPeerID(cfg.KeyPair.PeerID)
+	virtualCIDR := cfg.VirtualCIDR
+	if !virtualCIDR.IsValid() {
+		virtualCIDR = identity.DefaultVirtualCIDR()
+	} else {
+		var parseErr error
+		virtualCIDR, parseErr = identity.ParseVirtualCIDR(virtualCIDR.String())
+		if parseErr != nil {
+			return nil, parseErr
+		}
+	}
+	localVIP, err := identity.VirtualIPv4InPrefix(cfg.KeyPair.PeerID, virtualCIDR)
 	if err != nil {
 		return nil, err
 	}
@@ -281,6 +293,7 @@ func NewClient(cfgIn *Config) (*Client, error) {
 	c := &Client{
 		cfg:                 cfg,
 		hubOrigin:           origin,
+		virtualCIDR:         virtualCIDR,
 		localVIP:            localVIP,
 		blacklist:           bl,
 		log:                 cfg.Logger,
@@ -540,9 +553,14 @@ func (c *Client) PeerID() string {
 	return c.cfg.KeyPair.PeerID
 }
 
-// VirtualIP returns this client's deterministic RFC 6598 TUN IPv4 address.
+// VirtualIP returns this client's deterministic TUN IPv4 address within VirtualCIDR().
 func (c *Client) VirtualIP() netip.Addr {
 	return c.localVIP
+}
+
+// VirtualCIDR returns the configured virtual IPv4 subnet (default 10.88.0.0/16).
+func (c *Client) VirtualCIDR() netip.Prefix {
+	return c.virtualCIDR
 }
 
 // ICETCPAddr returns the bound passive ICE-TCP listen address when TCPOnly=true, or nil otherwise.
@@ -1121,7 +1139,7 @@ func (c *Client) handleChannelPeers(raw []byte) {
 			c.lastSignalRejected.Add(1)
 			continue
 		}
-		vip, err := identity.VirtualIPv4FromPeerID(bp.PeerID)
+		vip, err := identity.VirtualIPv4InPrefix(bp.PeerID, c.virtualCIDR)
 		if err != nil {
 			continue
 		}
@@ -1331,7 +1349,7 @@ func (c *Client) handlePeerEnvelope(raw []byte) error {
 			return ErrUserDenied
 		}
 
-		vip, err := identity.VirtualIPv4FromPeerID(env.From)
+		vip, err := identity.VirtualIPv4InPrefix(env.From, c.virtualCIDR)
 		if err != nil {
 			return err
 		}
@@ -1696,7 +1714,11 @@ type Session struct {
 }
 
 func newSession(client *Client, remotePeerID string, remotePub identity.PublicKey, sessionID string, initiator bool) *Session {
-	vip, _ := identity.VirtualIPv4FromPeerID(remotePeerID)
+	cidr := identity.DefaultVirtualCIDR()
+	if client != nil && client.virtualCIDR.IsValid() {
+		cidr = client.virtualCIDR
+	}
+	vip, _ := identity.VirtualIPv4InPrefix(remotePeerID, cidr)
 	s := &Session{
 		client:             client,
 		remotePeerID:       remotePeerID,

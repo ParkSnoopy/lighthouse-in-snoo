@@ -22,6 +22,7 @@ import (
 
 	"lighthouse-in-snoo/internal/hub"
 	"lighthouse-in-snoo/internal/ui"
+	"lighthouse-in-snoo/internal/ui/rawblock"
 	"lighthouse-in-snoo/pkg/identity"
 	"lighthouse-in-snoo/pkg/peer"
 	"lighthouse-in-snoo/pkg/tun"
@@ -262,5 +263,170 @@ func TestFyneControllerBindBroadcastConsentAllowDenyBlacklist(t *testing.T) {
 	}
 	if ctrlB.Client().IsBlacklisted(kpA.PeerID) {
 		t.Fatal("expected A removed from blacklist")
+	}
+}
+
+func TestFyneControllerCustomCIDRAndCopyableAlertModals(t *testing.T) {
+	srvTLS, cliTLS := makeUITestTLS(t)
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin := "wss://" + ln.Addr().String()
+	srv, err := hub.New(&hub.Config{
+		HTTPSListener:   ln,
+		TLSConfig:       srvTLS,
+		HubOrigin:       origin,
+		EnableSTUN:      true,
+		STUNSListenAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	wsURL := origin + "/v1/signal"
+	stunsURI := "stuns:" + srv.STUNSAddr().String()
+	kpA, _ := identity.GenerateKeyPair()
+	kpB, _ := identity.GenerateKeyPair()
+	customCIDR := netip.MustParsePrefix("10.99.0.0/24")
+
+	appA := fyneTest.NewTempApp(t)
+	ctrlA, err := ui.NewController(appA, ui.Options{
+		KeyPair:         kpA,
+		BlacklistPath:   filepath.Join(t.TempDir(), "blA.json"),
+		HubURL:          wsURL,
+		STUNServerURI:   stunsURI,
+		TLSConfig:       cliTLS,
+		IncludeLoopback: true,
+		InterfaceName:   "lhA",
+		OpenDevice:      func(_ netip.Addr) (tun.Device, error) { return tun.NewMemoryDevice("lhA", tun.DefaultMTU), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlA.Disconnect()
+
+	// Default CIDR must be 10.88.0.0/16.
+	if got := ctrlA.VirtualCIDR(); got != netip.MustParsePrefix("10.88.0.0/16") {
+		t.Fatalf("default VirtualCIDR = %s; want 10.88.0.0/16", got)
+	}
+
+	waitAlert := func(c *ui.Controller) (rawblock.AlertSeverity, string, string) {
+		t.Helper()
+		dl := time.Now().Add(2 * time.Second)
+		for time.Now().Before(dl) {
+			if sev, title, detail, ok := c.ActiveAlert(); ok {
+				return sev, title, detail
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatal("timed out waiting for alert modal")
+		return 0, "", ""
+	}
+
+	// Warning modal on offline Join action.
+	fyneTest.Tap(ctrlA.JoinBtn)
+	sev, title, _ := waitAlert(ctrlA)
+	if sev != rawblock.AlertWarning || title != "NOT CONNECTED" {
+		t.Fatalf("expected WARNING/NOT CONNECTED modal, got %v/%q", sev, title)
+	}
+	ctrlA.DismissAlert()
+
+	// Error modal on invalid IP CIDR when tapping Bind & Connect.
+	ctrlA.CIDRInput.SetText("not-a-valid-cidr")
+	fyneTest.Tap(ctrlA.ConnectHubBtn)
+	sev, title, detail := waitAlert(ctrlA)
+	if sev != rawblock.AlertError || title != "BIND & CONNECT FAILED" || detail == "" {
+		t.Fatalf("expected ERROR modal for invalid CIDR, got %v/%q/%q", sev, title, detail)
+	}
+	ctrlA.DismissAlert()
+
+	// Configure custom 10.99.0.0/24 CIDR via UI input on A and Options on B, then route IPv4 traffic.
+	devA := tun.NewMemoryDevice("lhA", tun.DefaultMTU)
+	devB := tun.NewMemoryDevice("lhB", tun.DefaultMTU)
+
+	appA2 := fyneTest.NewTempApp(t)
+	ctrlA2, err := ui.NewController(appA2, ui.Options{
+		KeyPair:         kpA,
+		BlacklistPath:   filepath.Join(t.TempDir(), "blA2.json"),
+		HubURL:          wsURL,
+		STUNServerURI:   stunsURI,
+		TLSConfig:       cliTLS,
+		IncludeLoopback: true,
+		InterfaceName:   "lhA",
+		OpenDevice:      func(_ netip.Addr) (tun.Device, error) { return devA, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlA2.Disconnect()
+	ctrlA2.CIDRInput.SetText(customCIDR.String())
+
+	appB := fyneTest.NewTempApp(t)
+	ctrlB, err := ui.NewController(appB, ui.Options{
+		KeyPair:         kpB,
+		BlacklistPath:   filepath.Join(t.TempDir(), "blB.json"),
+		HubURL:          wsURL,
+		STUNServerURI:   stunsURI,
+		TLSConfig:       cliTLS,
+		IncludeLoopback: true,
+		InterfaceName:   "lhB",
+		VirtualCIDR:     customCIDR,
+		OpenDevice:      func(_ netip.Addr) (tun.Device, error) { return devB, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrlB.Disconnect()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := ctrlA2.ConnectAndBind(ctx); err != nil {
+		t.Fatalf("ctrlA2.ConnectAndBind: %v", err)
+	}
+	if err := ctrlB.ConnectAndBind(ctx); err != nil {
+		t.Fatalf("ctrlB.ConnectAndBind: %v", err)
+	}
+	if !customCIDR.Contains(ctrlA2.Client().VirtualIP()) || !customCIDR.Contains(ctrlB.Client().VirtualIP()) {
+		t.Fatalf("expected virtual IPs in %s, got A=%s B=%s", customCIDR, ctrlA2.Client().VirtualIP(), ctrlB.Client().VirtualIP())
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, cErr := ctrlA2.Client().Connect(ctx, kpB.PeerID)
+		errCh <- cErr
+	}()
+	dl := time.Now().Add(5 * time.Second)
+	for time.Now().Before(dl) {
+		if _, ok := ctrlB.PendingRequest(); ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !ctrlB.RespondIncoming(peer.ConsentAllow) {
+		t.Fatal("RespondIncoming(Allow) failed")
+	}
+	if cErr := <-errCh; cErr != nil {
+		t.Fatalf("Connect with custom CIDR failed: %v", cErr)
+	}
+
+	dl = time.Now().Add(3 * time.Second)
+	for time.Now().Before(dl) {
+		if len(ctrlA2.Router().Routes()) == 1 && len(ctrlB.Router().Routes()) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	pkt := buildIPv4(ctrlA2.Client().VirtualIP(), ctrlB.Client().VirtualIP(), []byte("custom-cidr-10-99"))
+	if err := devA.InjectOutbound(ctx, pkt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := devB.ReadInbound(ctx)
+	if err != nil {
+		t.Fatalf("ReadInbound B on custom CIDR: %v", err)
+	}
+	if !bytes.Equal(got, pkt) {
+		t.Fatal("TUN packet mismatch on custom CIDR")
 	}
 }

@@ -65,6 +65,7 @@ var (
 	ErrEmptyPassphrase      = errors.New("identity: passphrase must not be empty")
 	ErrInvalidChannelID     = errors.New("identity: invalid channel_id")
 	ErrInvalidSealedMeta    = errors.New("identity: invalid or undecryptable broadcast metadata")
+	ErrInvalidCIDR          = errors.New("identity: invalid virtual IPv4 CIDR")
 )
 
 // ParseAlgorithm normalizes user-supplied algorithm names and aliases.

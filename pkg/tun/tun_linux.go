@@ -20,7 +20,7 @@ import (
 // LinuxConfig configures binding a real Linux /dev/net/tun Layer-3 TUN interface.
 type LinuxConfig struct {
 	Name        string       // Requested interface name (default "lh0", max 15 ASCII bytes).
-	LocalCIDR   netip.Prefix // Local virtual IP/mask to assign (e.g. 100.64.x.y/10).
+	LocalCIDR   netip.Prefix // Local virtual IP/mask to assign (e.g. 10.88.x.y/16).
 	MTU         int          // Interface MTU (default 1380).
 	ConfigureOS bool         // Assign IP, MTU, and bring link UP via `ip`.
 }

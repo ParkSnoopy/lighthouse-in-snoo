@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,9 @@ const (
 	// ChannelIDEncodedLen is the base64url (unpadded) length of a 32-byte passphrase channel token.
 	ChannelIDEncodedLen = 43
 
+	// DefaultVirtualCIDRString is the default IPv4 virtual network CIDR for Lighthouse TUN peers.
+	DefaultVirtualCIDRString = "10.88.0.0/16"
+
 	domainHubAuthV2 = "LIGHTHOUSE-HUB-AUTH-V2\x00"
 	domainTunIPv4V2 = "LIGHTHOUSE-TUN-IPV4-V2\x00"
 
@@ -34,8 +38,9 @@ const (
 )
 
 var (
-	channelSalt = []byte("LIGHTHOUSE-CHANNEL-V2")
-	hubKeySalt  = []byte("LIGHTHOUSE-HUB-KEY-V2")
+	channelSalt        = []byte("LIGHTHOUSE-CHANNEL-V2")
+	hubKeySalt         = []byte("LIGHTHOUSE-HUB-KEY-V2")
+	defaultVirtualCIDR = netip.MustParsePrefix(DefaultVirtualCIDRString)
 )
 
 // ChannelKeys holds the passphrase-derived broadcast bucket ID and metadata encryption key.
@@ -189,26 +194,56 @@ func VerifyHubPassphraseProofWithKey(hubKey [32]byte, challenge, hubOrigin, peer
 	return nil
 }
 
-// VirtualIPv4FromPeerID deterministically derives a unique RFC 6598 (100.64.0.0/10)
-// TUN IPv4 address bound to peerID.
-func VirtualIPv4FromPeerID(peerID string) (netip.Addr, error) {
+// DefaultVirtualCIDR returns the default Lighthouse virtual IPv4 subnet (10.88.0.0/16).
+func DefaultVirtualCIDR() netip.Prefix {
+	return defaultVirtualCIDR
+}
+
+// ParseVirtualCIDR validates and canonicalizes an IPv4 CIDR (/1 through /30) for TUN addressing.
+func ParseVirtualCIDR(raw string) (netip.Prefix, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return netip.Prefix{}, fmt.Errorf("%w: CIDR must not be empty", ErrInvalidCIDR)
+	}
+	p, err := netip.ParsePrefix(trimmed)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%w: %w", ErrInvalidCIDR, err)
+	}
+	if !p.Addr().Is4() {
+		return netip.Prefix{}, fmt.Errorf("%w: IPv4 CIDR required (got %q)", ErrInvalidCIDR, trimmed)
+	}
+	if p.Bits() < 1 || p.Bits() > 30 {
+		return netip.Prefix{}, fmt.Errorf("%w: prefix length /%d must be between /1 and /30", ErrInvalidCIDR, p.Bits())
+	}
+	return p.Masked(), nil
+}
+
+// VirtualIPv4InPrefix deterministically derives a usable host IPv4 address inside prefix
+// bound to peerID, avoiding the network and broadcast addresses.
+func VirtualIPv4InPrefix(peerID string, prefix netip.Prefix) (netip.Addr, error) {
 	if err := ValidatePeerID(peerID); err != nil {
 		return netip.Addr{}, err
 	}
+	if !prefix.IsValid() || !prefix.Addr().Is4() || prefix.Bits() < 1 || prefix.Bits() > 30 {
+		return netip.Addr{}, fmt.Errorf("%w: IPv4 CIDR with /1../30 prefix required", ErrInvalidCIDR)
+	}
+	masked := prefix.Masked()
+	baseBytes := masked.Addr().As4()
+	base := binary.BigEndian.Uint32(baseBytes[:])
+	hostBits := uint(32 - masked.Bits())
+	usable := (uint64(1) << hostBits) - 2
 	sum := sha256.Sum256([]byte(domainTunIPv4V2 + peerID))
-	b1 := 64 + (sum[0] & 0x3F)
-	b2 := sum[1]
-	b3 := sum[2]
-	switch b3 {
-	case 0:
-		b3 = 1
-	case 255:
-		b3 = 254
-	}
-	if b1 == 64 && b2 == 0 && b3 == 1 {
-		b3 = 2
-	}
-	return netip.AddrFrom4([4]byte{100, b1, b2, b3}), nil
+	offset := (binary.BigEndian.Uint64(sum[:8]) % usable) + 1
+	ipNum := base + uint32(offset)
+	var out [4]byte
+	binary.BigEndian.PutUint32(out[:], ipNum)
+	return netip.AddrFrom4(out), nil
+}
+
+// VirtualIPv4FromPeerID deterministically derives a TUN IPv4 address in the default
+// Lighthouse CIDR (10.88.0.0/16) bound to peerID.
+func VirtualIPv4FromPeerID(peerID string) (netip.Addr, error) {
+	return VirtualIPv4InPrefix(peerID, defaultVirtualCIDR)
 }
 
 // Blacklist stores locally blocked peer_ids enforced client-side.

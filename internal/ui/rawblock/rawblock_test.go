@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/driver/desktop"
 	fyneTest "fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/theme"
@@ -196,10 +197,30 @@ func TestCardsInputsChipsListCheckRadioTooltipAndLink(t *testing.T) {
 		t.Fatalf("inverted card fill = %v; want black", fill)
 	}
 
-	// Input: Default (#F0F0F0/3px), Error (#FF0000), Disabled (#F5F5F5/#CCCCCC).
+	// Input: Default (#F0F0F0/3px), Focus (keeps exact non-focus 3px single box), Error (#FF0000), Disabled (#F5F5F5/#CCCCCC).
 	in := rawblock.NewInput("endpoint", "wss://...", "helper", false)
 	if fill, border, bw := in.FrameStyle(); fill != rawblock.ColorSurfaceSunken || border != rawblock.ColorBlack || bw != rawblock.BorderThick {
 		t.Fatalf("unexpected input default style: %v %v %v", fill, border, bw)
+	}
+	// Focus must keep the exact non-focus border and fill (zero double box, only text caret).
+	w.SetContent(in)
+	w.Canvas().Focus(in.Focusable())
+	if fill, border, bw := in.FrameStyle(); fill != rawblock.ColorSurfaceSunken || border != rawblock.ColorBlack || bw != rawblock.BorderThick {
+		t.Fatalf("focused input must keep non-focus style, got %v %v %v", fill, border, bw)
+	}
+	// Verify inner borderless Entry renderer emits zero canvas.Rectangle objects (no double box).
+	for _, obj := range in.CreateRenderer().Objects() {
+		if c, ok := obj.(*fyne.Container); ok {
+			for _, child := range c.Objects {
+				if wid, ok := child.(fyne.Widget); ok {
+					for _, ro := range wid.CreateRenderer().Objects() {
+						if _, isRect := ro.(*canvas.Rectangle); isRect {
+							t.Fatal("borderless inner entry must not draw stock Fyne box/border rectangles")
+						}
+					}
+				}
+			}
+		}
 	}
 	in.SetError("invalid url")
 	if _, border, _ := in.FrameStyle(); border != rawblock.ColorError {
@@ -321,5 +342,28 @@ func TestCardsInputsChipsListCheckRadioTooltipAndLink(t *testing.T) {
 	fyneTest.Tap(lnk)
 	if !linkTapped {
 		t.Fatal("link tap failed")
+	}
+
+	// Copyable AlertModal (Error & Warning).
+	var copiedText string
+	closed := false
+	errModal := rawblock.NewAlertModal(rawblock.AlertError, "bind failed", "permission denied opening /dev/net/tun",
+		func(s string) { copiedText = s },
+		func() { closed = true },
+	)
+	if errModal.CopyText() != "[ERROR] BIND FAILED\npermission denied opening /dev/net/tun" {
+		t.Fatalf("unexpected AlertModal CopyText: %q", errModal.CopyText())
+	}
+	fyneTest.Tap(errModal.CopyBtn)
+	if copiedText != errModal.CopyText() || errModal.CopyBtn.Text != "COPIED" {
+		t.Fatalf("AlertModal copy action failed: copied=%q label=%q", copiedText, errModal.CopyBtn.Text)
+	}
+	fyneTest.Tap(errModal.CloseBtn)
+	if !closed {
+		t.Fatal("AlertModal close action failed")
+	}
+	warnModal := rawblock.NewAlertModal(rawblock.AlertWarning, "not connected", "connect first", nil, nil)
+	if warnModal.Severity.String() != "WARNING" {
+		t.Fatalf("unexpected warning severity: %q", warnModal.Severity.String())
 	}
 }
