@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	fyneTest "fyne.io/fyne/v2/test"
 
 	"lighthouse-in-snoo/internal/ui"
@@ -78,6 +79,15 @@ func TestAppIconResourceAndControllerBinding(t *testing.T) {
 	}
 	if recApp.win == nil || recApp.win.Icon() == nil || len(recApp.win.Icon().Content()) == 0 {
 		t.Fatal("expected NewController to call window.SetIcon")
+	}
+	if ctrl.MastheadIcon == nil || ctrl.MastheadIcon.Resource == nil || len(ctrl.MastheadIcon.Resource.Content()) == 0 {
+		t.Fatal("expected MastheadIcon to be mounted with embedded app icon resource")
+	}
+	if ctrl.MastheadIcon.FillMode != canvas.ImageFillContain {
+		t.Fatalf("MastheadIcon.FillMode = %v; want ImageFillContain", ctrl.MastheadIcon.FillMode)
+	}
+	if ms := ctrl.MastheadIcon.MinSize(); ms.Width < 40 || ms.Width != ms.Height {
+		t.Fatalf("MastheadIcon.MinSize = %v; want square >= 40px", ms)
 	}
 }
 

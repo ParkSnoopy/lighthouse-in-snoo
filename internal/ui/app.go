@@ -77,6 +77,7 @@ type Controller struct {
 	alert            *activeAlert
 
 	// Exposed RawBlock components for user interaction and deterministic Fyne headless tests.
+	MastheadIcon    *canvas.Image
 	StatusChip      *rawblock.Chip
 	StatusText      *canvas.Text
 	PeerIDText      *canvas.Text
@@ -296,8 +297,13 @@ func (c *Controller) RespondIncoming(decision peer.ConsentDecision) bool {
 }
 
 func (c *Controller) buildUI() {
-	// --- Inverted Black Masthead (Archivo Black 48px + Status Chip) ---
+	// --- Inverted Black Masthead (Icon + Archivo Black 48px + Status Chip) ---
+	c.MastheadIcon = canvas.NewImageFromResource(AppIcon())
+	c.MastheadIcon.FillMode = canvas.ImageFillContain
+	c.MastheadIcon.ScaleMode = canvas.ImageScaleSmooth
+	c.MastheadIcon.SetMinSize(fyne.NewSize(52, 52))
 	title := rawblock.NewH2("LIGHTHOUSE", rawblock.ColorWhite)
+	mastheadBrand := rawblock.GapHBox(rawblock.Sp3, c.MastheadIcon, title)
 	c.StatusChip = rawblock.NewStatusChip("DISCONNECTED", rawblock.ChipDefault)
 	c.StatusText = rawblock.NewMono("UNBOUND", rawblock.ColorWhite)
 	c.StatusText.Alignment = fyne.TextAlignTrailing
@@ -305,7 +311,7 @@ func (c *Controller) buildUI() {
 		container.NewBorder(nil, nil, nil, c.StatusChip),
 		c.StatusText,
 	)
-	mastheadInner := container.NewBorder(nil, nil, nil, mastheadRight, title)
+	mastheadInner := container.NewBorder(nil, nil, nil, mastheadRight, mastheadBrand)
 	mastheadBG := canvas.NewRectangle(rawblock.ColorBlack)
 	mastheadBG.CornerRadius = rawblock.RadiusNone
 	masthead := container.NewBorder(
