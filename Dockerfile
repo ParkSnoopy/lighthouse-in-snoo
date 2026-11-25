@@ -2,9 +2,6 @@
 FROM golang:1.26-alpine AS builder
 
 ARG VERSION=0.1.0
-ARG LIGHTHOUSE_STUN_DOMAIN=""
-ARG LIGHTHOUSE_STUN_PORT=5349
-ARG LIGHTHOUSE_HUB_ORIGIN=""
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -12,7 +9,7 @@ RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-    -ldflags="-s -w -X main.appVersion=${VERSION} -X main.defaultSTUNDomain=${LIGHTHOUSE_STUN_DOMAIN} -X main.defaultSTUNPort=${LIGHTHOUSE_STUN_PORT} -X main.defaultHubOrigin=${LIGHTHOUSE_HUB_ORIGIN}" \
+    -ldflags="-s -w -X main.appVersion=${VERSION}" \
     -o /out/lighthouse ./cmd/lighthouse
 
 FROM gcr.io/distroless/static-debian12:nonroot

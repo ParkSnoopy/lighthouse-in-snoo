@@ -204,7 +204,7 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 	}
 }
 
-func TestVersionAlignmentAndBuildTimeSTUNDomainDefaults(t *testing.T) {
+func TestVersionAlignmentAndRuntimeEnvDefaults(t *testing.T) {
 	t.Parallel()
 
 	// Verify VERSION file, default binary --version, and README.md stay strictly synchronized.
@@ -224,42 +224,89 @@ func TestVersionAlignmentAndBuildTimeSTUNDomainDefaults(t *testing.T) {
 		t.Fatalf("README.md does not contain current version v%s", fileVer)
 	}
 
-	// Build a binary with compile-time VERSION + LIGHTHOUSE_STUN_DOMAIN injected via -ldflags.
-	tmpDir := t.TempDir()
-	bakedBin := filepath.Join(tmpDir, "lighthouse-baked")
-	ldflags := "-X main.appVersion=9.8.7 -X main.defaultSTUNDomain=stun.baked.example -X main.defaultSTUNPort=5350 -X main.defaultHubOrigin=wss://hub.baked.example"
-	if out, err := exec.Command("go", "build", "-ldflags", ldflags, "-o", bakedBin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build with ldflags failed: %v\n%s", err, string(out))
-	}
-
-	verOut, err := exec.Command(bakedBin, "--version").CombinedOutput()
-	if err != nil || strings.TrimSpace(string(verOut)) != "lighthouse 9.8.7" {
-		t.Fatalf("baked --version = %q (err=%v); want 'lighthouse 9.8.7'", strings.TrimSpace(string(verOut)), err)
-	}
-
-	peerHelp, err := exec.Command(bakedBin, "peer", "--help").CombinedOutput()
-	if err != nil {
-		t.Fatalf("baked peer --help failed: %v\n%s", err, string(peerHelp))
-	}
-	for _, want := range []string{
-		"[default: stuns:stun.baked.example:5350]",
-		"[default: wss://hub.baked.example/v1/signal]",
-		"--insecure",
-		"--turn <URI>",
-	} {
-		if !strings.Contains(string(peerHelp), want) {
-			t.Fatalf("baked peer --help missing %q:\n%s", want, string(peerHelp))
+	// Verify build definitions never bake LIGHTHOUSE_* variables at build time.
+	for _, rel := range []string{"Dockerfile", "Makefile", "docker-compose.yml", filepath.Join(".github", "workflows", "build.yml")} {
+		data, readErr := os.ReadFile(filepath.Join("..", "..", rel))
+		if readErr != nil {
+			t.Fatalf("read %s: %v", rel, readErr)
+		}
+		if strings.Contains(string(data), "LIGHTHOUSE_") {
+			t.Fatalf("%s must not reference LIGHTHOUSE_* variables at build time", rel)
 		}
 	}
 
-	// Verify runtime ENV LIGHTHOUSE_STUN_DOMAIN overrides compile-time default with stuns:.
-	envCmd := exec.Command(bakedBin, "peer", "--help")
-	envCmd.Env = append(os.Environ(), "LIGHTHOUSE_STUN_DOMAIN=stun.env.example", "LIGHTHOUSE_STUN_PORT=5351")
+	// Build a single binary (only version injected at build time).
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "lighthouse-ver")
+	if out, err := exec.Command("go", "build", "-ldflags", "-X main.appVersion=9.8.7", "-o", binPath, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build with version ldflags failed: %v\n%s", err, string(out))
+	}
+
+	verOut, err := exec.Command(binPath, "--version").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(verOut)) != "lighthouse 9.8.7" {
+		t.Fatalf("--version = %q (err=%v); want 'lighthouse 9.8.7'", strings.TrimSpace(string(verOut)), err)
+	}
+
+	// Verify runtime .env file sets LIGHTHOUSE_* defaults when process env is unset.
+	dotEnvDir := t.TempDir()
+	dotEnvContent := strings.Join([]string{
+		"# Runtime defaults",
+		"LIGHTHOUSE_STUN_DOMAIN=stun.dotenv.example",
+		"LIGHTHOUSE_STUN_PORT=5350",
+		"LIGHTHOUSE_HUB_ORIGIN=wss://hub.dotenv.example",
+		"NON_LIGHTHOUSE_VAR=ignored",
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dotEnvDir, ".env"), []byte(dotEnvContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dotEnvCmd := exec.Command(binPath, "peer", "--help")
+	dotEnvCmd.Dir = dotEnvDir
+	dotEnvCmd.Env = stripLighthouseEnv(os.Environ())
+	dotEnvHelp, err := dotEnvCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dotenv peer --help failed: %v\n%s", err, string(dotEnvHelp))
+	}
+	for _, want := range []string{
+		"[default: stuns:stun.dotenv.example:5350]",
+		"[default: wss://hub.dotenv.example/v1/signal]",
+		"--insecure",
+		"--turn <URI>",
+	} {
+		if !strings.Contains(string(dotEnvHelp), want) {
+			t.Fatalf("dotenv peer --help missing %q:\n%s", want, string(dotEnvHelp))
+		}
+	}
+
+	// Verify explicit runtime process ENV overrides .env values without rebuilding.
+	envCmd := exec.Command(binPath, "peer", "--help")
+	envCmd.Dir = dotEnvDir
+	envCmd.Env = append(stripLighthouseEnv(os.Environ()),
+		"LIGHTHOUSE_STUN_DOMAIN=stun.env.example",
+		"LIGHTHOUSE_STUN_PORT=5351",
+		"LIGHTHOUSE_HUB_ORIGIN=wss://hub.env.example",
+	)
 	envHelp, err := envCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("env peer --help failed: %v\n%s", err, string(envHelp))
 	}
-	if !strings.Contains(string(envHelp), "[default: stuns:stun.env.example:5351]") {
-		t.Fatalf("runtime env STUNS override not reflected in help:\n%s", string(envHelp))
+	for _, want := range []string{
+		"[default: stuns:stun.env.example:5351]",
+		"[default: wss://hub.env.example/v1/signal]",
+	} {
+		if !strings.Contains(string(envHelp), want) {
+			t.Fatalf("runtime env override missing %q:\n%s", want, string(envHelp))
+		}
 	}
+}
+
+func stripLighthouseEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LIGHTHOUSE_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

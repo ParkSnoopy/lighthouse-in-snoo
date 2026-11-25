@@ -1,18 +1,49 @@
 package main
 
 import (
+	"bufio"
 	"net"
 	"os"
 	"strings"
 )
 
-// Build-time injectable defaults (set via -ldflags "-X main.<var>=...").
-var (
-	appVersion        = "0.1.0"
-	defaultSTUNDomain = ""
-	defaultSTUNPort   = "5349"
-	defaultHubOrigin  = ""
-)
+// appVersion is the release version reported by --version (matching VERSION).
+var appVersion = "0.1.0"
+
+// loadDotEnvIfPresent reads optional LIGHTHOUSE_* runtime variables from a local
+// .env file without overriding variables already set in the process environment.
+func loadDotEnvIfPresent(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if !strings.HasPrefix(key, "LIGHTHOUSE_") {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
+			val = val[1 : len(val)-1]
+		}
+		_ = os.Setenv(key, val)
+	}
+}
 
 func resolvedDefaultSTUNURI() string {
 	if uri := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_URI")); uri != "" {
@@ -20,15 +51,9 @@ func resolvedDefaultSTUNURI() string {
 	}
 	port := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_PORT"))
 	if port == "" {
-		port = strings.TrimSpace(defaultSTUNPort)
-	}
-	if port == "" {
 		port = "5349"
 	}
 	if domain := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_DOMAIN")); domain != "" {
-		return formatSTUNURI(domain, port)
-	}
-	if domain := strings.TrimSpace(defaultSTUNDomain); domain != "" {
 		return formatSTUNURI(domain, port)
 	}
 	return "stuns:127.0.0.1:" + port
@@ -42,13 +67,7 @@ func resolvedDefaultHubOrigin() string {
 	if origin := strings.TrimSpace(os.Getenv("LIGHTHOUSE_HUB_ORIGIN")); origin != "" {
 		return origin
 	}
-	if origin := strings.TrimSpace(defaultHubOrigin); origin != "" {
-		return origin
-	}
 	if domain := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_DOMAIN")); domain != "" {
-		return "wss://" + stripSTUNHost(domain)
-	}
-	if domain := strings.TrimSpace(defaultSTUNDomain); domain != "" {
 		return "wss://" + stripSTUNHost(domain)
 	}
 	return "wss://localhost:8443"

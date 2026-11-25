@@ -301,6 +301,7 @@ func newPeerCommand() *cli.Command {
 		ValueName: "PATH",
 		ShortHelp: "PEM Root CA bundle for hub TLS/DTLS",
 		LongHelp:  "Optional custom PEM Root CA certificate file for validating hub TLS 1.3 WSS and DTLS 1.3 STUNS/TURNS certificates",
+		EnvVar:    "LIGHTHOUSE_CA",
 	})
 	cmd.StringOpt(&stunURI, cli.Option{
 		Long:      "stun",
@@ -337,6 +338,7 @@ func newPeerCommand() *cli.Command {
 		Long:      "insecure",
 		ShortHelp: "Allow plaintext stun:/turn: URIs",
 		LongHelp:  "Opt in to unencrypted stun: and turn: server URIs; WSS TLS 1.3 and peer DTLS 1.3 remain enforced",
+		EnvVar:    "LIGHTHOUSE_INSECURE",
 	})
 	cmd.StringOpt(&targetID, cli.Option{
 		Long:      "connect",

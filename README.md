@@ -42,16 +42,16 @@ flowchart TB
 
 ## Quick Start
 
-### 1. Build Binary (with Optional `.env` / ENV Default STUNS Domain)
+### 1. Build Binary
 
-Build directly with Go or via `Makefile` / `.env` (copy `.env.example` to `.env`) to bake a default STUNS domain, port (`5349`), hub origin, and version (`VERSION` / `lighthouse --version`) into the binary:
+Build directly with Go or `Makefile` (only `VERSION` is embedded at build time; all `LIGHTHOUSE_*` environment variables and optional local `.env` entries are read exclusively at runtime):
 
 ```bash
-# Plain static linux/amd64 build
+# Static linux/amd64 build
 CGO_ENABLED=0 GOARCH=amd64 go build -o bin/lighthouse ./cmd/lighthouse
 
-# Build with default STUNS domain via ENV or .env
-LIGHTHOUSE_STUN_DOMAIN=stun.example.com LIGHTHOUSE_HUB_ORIGIN=wss://hub.example.com make build
+# Or build via Makefile
+make build
 ```
 
 ### 2. Provision Offline Authority, Peer Keys, and Policy
@@ -109,7 +109,7 @@ Pull the `linux/amd64` hub container published to GitHub Container Registry by `
 # Pull published linux/amd64 hub image matching lighthouse --version (v0.1.0)
 docker pull ghcr.io/<owner>/<repo>:v0.1.0
 
-# Or build and run locally (reads optional .env for LIGHTHOUSE_STUN_DOMAIN / VERSION)
+# Or build and run locally (loads optional .env at runtime via Compose env_file)
 docker compose up -d --build
 ```
 
@@ -169,7 +169,7 @@ Plaintext `stun:` and `turn:` URIs require explicit `--insecure`:
 | `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for TLS 1.3 `/healthz` and WSS `/v1/signal` |
 | `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | UDP listen address for DTLS 1.3 STUNS (and TURNS when credentials are set) |
 | `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext UDP STUN/TURN address; requires `--insecure` (`:3478` when `--insecure` is set) |
-| `--insecure` | — | `false` | Opt in to unencrypted UDP `stun:`/`turn:` listener on `--stun-addr` |
+| `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Opt in to unencrypted UDP `stun:`/`turn:` listener on `--stun-addr` |
 | `--turn-secret` | `LIGHTHOUSE_TURN_SECRET` | *(disabled)* | Shared secret enabling authenticated DTLS 1.3 TURNS (HMAC TURN REST credentials) |
 | `--turn-users` | `LIGHTHOUSE_TURN_USERS` | *(disabled)* | Static `user=pass[,user=pass]` credentials enabling authenticated DTLS 1.3 TURNS |
 | `--turn-realm` | `LIGHTHOUSE_TURN_REALM` | `lighthouse` | RFC 8656 TURN authentication realm |

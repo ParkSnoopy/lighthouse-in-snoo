@@ -180,6 +180,7 @@ func newHubCommand() *cli.Command {
 		Long:      "insecure",
 		ShortHelp: "Enable plaintext UDP stun:/turn: listener",
 		LongHelp:  "Opt in to unencrypted UDP STUN/TURN on --stun-addr alongside DTLS 1.3 STUNS/TURNS",
+		EnvVar:    "LIGHTHOUSE_INSECURE",
 	})
 	cmd.StringOpt(&turnSecret, cli.Option{
 		Long:      "turn-secret",
