@@ -1,7 +1,7 @@
-VERSION ?= $(shell tr -d '[:space:]' < VERSION)
+VERSION := $(shell sed -n 's/^const Version = "\(.*\)"/\1/p' cmd/lighthouse/version.go)
 IMAGE ?= lighthouse:$(VERSION)
 
-LDFLAGS := -s -w -X main.appVersion=$(VERSION)
+LDFLAGS := -s -w
 
 .PHONY: build test vet version docker-build
 
@@ -20,5 +20,4 @@ version:
 docker-build:
 	docker build \
 		--platform linux/amd64 \
-		--build-arg VERSION="$(VERSION)" \
 		-t "$(IMAGE)" .

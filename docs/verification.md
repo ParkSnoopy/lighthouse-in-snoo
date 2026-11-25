@@ -47,17 +47,18 @@ Each acceptance requirement in `test/acceptance` exercises independently authent
 | `T13` | `TestT13_TamperDTLSProtectedRecordNotDelivered` | `go test -race -v ./test/acceptance -run TestT13_TamperDTLSProtectedRecordNotDelivered` | In-flight bit flips on DTLS 1.3 ciphertext records (`IsDTLS13Ciphertext`) are dropped by AEAD verification and never delivered to `Session.Packets()`, while subsequent untampered records arrive intact. |
 | `ALGO` | `TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix` | `go test -race -v ./test/acceptance -run TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix` | Interoperability across `ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, and `rsa` identities, cross-algorithm CA/leaf TLS 1.3 WSS + DTLS 1.3 / UDP STUNS certificates, and cross-algorithm peer DTLS 1.3 certificates. |
 | `ICE-SEC` | `TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn` | `go test -race -v ./test/acceptance -run TestSTUNSAndTURNSDTLS13UDPAndInsecureOptIn` | Plaintext `stun:`/`turn:` rejected by default; untrusted STUNS CA rejected; DTLS 1.3 / UDP `turns:` relay establishes end-to-end DTLS 1.3 (`FEFC`) sessions on loopback and across symmetric NATs; opt-in `--insecure` enables plaintext `stun:`/`turn:`. |
+| `TCP-ONLY` | `TestTCPOnlyModeZeroUDPEndToEnd` | `go test -race -v ./test/acceptance -run TestTCPOnlyModeZeroUDPEndToEnd` | `--tcp-only` hub binds zero UDP sockets and serves TLS 1.3 / TCP STUNS; peers reject UDP configs/candidates, verify STUNS over TLS 1.3 / TCP, and exchange `data/v1` and `packet/v1` payloads over IPv4 and IPv6 ICE-TCP with DTLS 1.3 (`FEFC`). |
 
 ## 4. Unit Test Suites
 
 | Package | Command | Covered Invariants |
 | --- | --- | --- |
-| `cmd/lighthouse` | `go test -race ./cmd/lighthouse` | Clap/POSIX flag rules, `VERSION`/`README.md` sync, runtime-only `LIGHTHOUSE_*` env/`.env` loading, `--insecure` rejection on hub and peer CLI |
+| `cmd/lighthouse` | `go test -race ./cmd/lighthouse` | Clap/POSIX flag rules, single-source `version.go` / `README.md` sync (no duplicated `ARG VERSION`), runtime-only `LIGHTHOUSE_*` env/`.env` loading, `--insecure` and `--tcp-only` CLI validation |
 | `internal/jcs` | `go test -race ./internal/jcs` | RFC 8785 UTF-16 key sorting, ES6 number canonicalization, duplicate-key rejection, strict field decoding |
 | `pkg/identity` | `go test -race ./pkg/identity` | Multi-algorithm keygen, `0600` file mode enforcement, `peer_id` derivation, registration proofs, authority memberships, ACLs, revocations |
 | `pkg/protocol` | `go test -race ./pkg/protocol` | 12 message schemas, `64 KiB` limit, JCS envelope signatures, clock skew and TTL bounds |
-| `internal/stunserver` | `go test -race ./internal/stunserver` | DTLS 1.3 / UDP IPv4/IPv6 `XOR-MAPPED-ADDRESS`, DTLS 1.2 rejection, TURN `Allocate` error rejection, opt-in `AllowInsecure` plaintext UDP |
-| `internal/turnserver` | `go test -race ./internal/turnserver` | DTLS 1.3 / UDP TURNS + STUNS Binding, HMAC TURN REST authentication, `AllowInsecure` gate for plaintext UDP TURN |
+| `internal/stunserver` | `go test -race ./internal/stunserver` | DTLS 1.3 / UDP and TLS 1.3 / TCP `XOR-MAPPED-ADDRESS`, DTLS 1.2 and TLS 1.2 rejection, TURN `Allocate` error rejection, opt-in `AllowInsecure` plaintext UDP/TCP |
+| `internal/turnserver` | `go test -race ./internal/turnserver` | DTLS 1.3 / UDP and TLS 1.3 / TCP TURNS + STUNS Binding, HMAC TURN REST authentication, `AllowInsecure` gate for plaintext UDP/TCP TURN |
 | `internal/store` | `go test -race ./internal/store` | Pure-Go SQLite persistence of authorities, peers, memberships, ACL rules, and revocations |
 | `internal/hub` | `go test -race ./internal/hub` | Unauthenticated gating, single-use challenges, concurrent-session caps, live revocation eviction |
-| `pkg/peer` | `go test -race ./pkg/peer` | `stuns:`/`turns:` default enforcement, UDP prioritization, `--insecure` opt-in, audio/video and `ice-lite` SDP rejection, candidate filtering |
+| `pkg/peer` | `go test -race ./pkg/peer` | `stuns:`/`turns:` default enforcement, UDP prioritization, `--insecure` opt-in, `--tcp-only` policy enforcement, audio/video and `ice-lite` SDP rejection, candidate filtering |

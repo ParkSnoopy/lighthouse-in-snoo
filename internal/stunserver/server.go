@@ -3,8 +3,10 @@ package stunserver
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -23,29 +25,37 @@ import (
 const (
 	// MinSTUNHeaderBytes is the fixed 20-byte RFC 8489 STUN header length.
 	MinSTUNHeaderBytes = 20
+	// stunMagicCookie is the fixed RFC 8489 Section 6 STUN magic cookie.
+	stunMagicCookie uint32 = 0x2112A442
 	// DefaultMaxDatagramBytes bounds incoming plaintext STUN messages.
 	DefaultMaxDatagramBytes = 576
 	// DefaultMaxDTLSDatagramBytes bounds raw UDP datagrams carrying DTLS 1.3 records.
 	DefaultMaxDTLSDatagramBytes = 4096
-	// DefaultSTUNSAddr is the default RFC 7350 DTLS-over-UDP STUNS port.
+	// DefaultSTUNSAddr is the default RFC 7350 DTLS/UDP (or TLS/TCP in --tcp-only) STUNS port.
 	DefaultSTUNSAddr = ":5349"
-	// DefaultInsecureSTUNAddr is the default plaintext UDP STUN port (opt-in only).
+	// DefaultInsecureSTUNAddr is the default plaintext STUN port (opt-in only).
 	DefaultInsecureSTUNAddr = ":3478"
 )
 
-// ErrInsecureSTUNProhibited is returned when plaintext UDP STUN is configured without AllowInsecure.
-var ErrInsecureSTUNProhibited = errors.New("stunserver: plaintext UDP STUN requires AllowInsecure=true; use DTLS 1.3 STUNS over UDP")
+// ErrInsecureSTUNProhibited is returned when plaintext STUN is configured without AllowInsecure.
+var ErrInsecureSTUNProhibited = errors.New("stunserver: plaintext STUN requires AllowInsecure=true; use encrypted STUNS")
 
 // Config configures the RFC 8489 / RFC 7350 STUN Binding server.
-// By default it serves STUNS over DTLS 1.3 / UDP (:5349/udp). Plaintext UDP STUN requires AllowInsecure=true.
+// By default it serves STUNS over DTLS 1.3 / UDP (:5349/udp).
+// For TCP-only deployments, configure TLSListenAddr/TLSListener to serve STUNS over TLS 1.3 / TCP with zero UDP sockets.
+// Plaintext UDP or TCP STUN requires AllowInsecure=true.
 type Config struct {
-	DTLSListenAddr string         // UDP listen address for DTLS 1.3 STUNS (default :5349).
+	DTLSListenAddr string         // UDP listen address for DTLS 1.3 STUNS (default :5349 when not TCP-only).
 	DTLSPacketConn net.PacketConn // Optional pre-bound UDP PacketConn wrapped with DTLS 1.3.
-	TLSConfig      *tls.Config    // Required for DTLS 1.3 STUNS (provides server certificate chain).
+	TLSListenAddr  string         // Optional TCP listen address for TLS 1.3 STUNS (TCP-only mode).
+	TLSListener    net.Listener   // Optional pre-bound TCP listener wrapped with TLS 1.3.
+	TLSConfig      *tls.Config    // Required for DTLS 1.3 or TLS 1.3 STUNS (provides server certificate chain).
 
-	AllowInsecure bool           // Explicit opt-in required to serve plaintext UDP STUN.
+	AllowInsecure bool           // Explicit opt-in required to serve plaintext UDP/TCP STUN.
 	ListenAddr    string         // Plaintext UDP listen address (requires AllowInsecure).
 	PacketConn    net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure).
+	TCPListenAddr string         // Plaintext TCP listen address (requires AllowInsecure).
+	TCPListener   net.Listener   // Optional pre-bound plaintext TCP listener (requires AllowInsecure).
 
 	MaxDatagramBytes int
 	PerIPRPS         float64
@@ -71,13 +81,15 @@ type Stats struct {
 }
 
 // Server implements an RFC 8489 / RFC 7350 STUN Binding responder returning XOR-MAPPED-ADDRESS
-// over DTLS 1.3 / UDP (STUNS) by default, and optionally plaintext UDP when AllowInsecure is set.
+// over DTLS 1.3 / UDP (default), TLS 1.3 / TCP (TCP-only), and optionally plaintext UDP/TCP when AllowInsecure is set.
 type Server struct {
 	dtlsLn       net.Listener
 	dtlsRawConn  net.PacketConn
 	ownsDTLSConn bool
+	tlsLn        net.Listener
 	udpConn      net.PacketConn
 	ownsUDP      bool
+	tcpLn        net.Listener
 	maxBytes     int
 	readTimeout  time.Duration
 	ipLimiter    *ratelimit.KeyedLimiter
@@ -97,19 +109,22 @@ type Server struct {
 	rateLimited        atomic.Uint64
 }
 
-// New creates and starts a DTLS 1.3 / UDP STUNS and/or opt-in insecure UDP STUN Binding server.
+// New creates and starts a STUNS (DTLS 1.3/UDP or TLS 1.3/TCP) and/or opt-in insecure STUN Binding server.
 func New(cfg Config) (*Server, error) {
 	wantsPlainUDP := cfg.ListenAddr != "" || cfg.PacketConn != nil
-	if wantsPlainUDP && !cfg.AllowInsecure {
+	wantsPlainTCP := cfg.TCPListenAddr != "" || cfg.TCPListener != nil
+	if (wantsPlainUDP || wantsPlainTCP) && !cfg.AllowInsecure {
 		return nil, ErrInsecureSTUNProhibited
 	}
 
-	wantsDTLS := cfg.TLSConfig != nil || cfg.DTLSListenAddr != "" || cfg.DTLSPacketConn != nil
-	if !wantsDTLS && !wantsPlainUDP {
-		return nil, errors.New("stunserver: TLSConfig is required for DTLS 1.3 STUNS (or opt in with AllowInsecure for plaintext UDP)")
+	wantsTLS := cfg.TLSListenAddr != "" || cfg.TLSListener != nil
+	wantsDTLS := cfg.DTLSListenAddr != "" || cfg.DTLSPacketConn != nil ||
+		(cfg.TLSConfig != nil && !wantsTLS && !wantsPlainUDP && !wantsPlainTCP)
+	if !wantsDTLS && !wantsTLS && !wantsPlainUDP && !wantsPlainTCP {
+		return nil, errors.New("stunserver: TLSConfig is required for encrypted STUNS (or opt in with AllowInsecure)")
 	}
-	if wantsDTLS && (cfg.TLSConfig == nil || len(cfg.TLSConfig.Certificates) == 0) {
-		return nil, errors.New("stunserver: TLSConfig with certificate is required for DTLS 1.3 STUNS")
+	if (wantsDTLS || wantsTLS) && (cfg.TLSConfig == nil || len(cfg.TLSConfig.Certificates) == 0) {
+		return nil, errors.New("stunserver: TLSConfig with certificate is required for DTLS/TLS STUNS")
 	}
 
 	maxBytes := cfg.MaxDatagramBytes
@@ -169,6 +184,24 @@ func New(cfg Config) (*Server, error) {
 		activeConns: make(map[net.Conn]struct{}),
 	}
 
+	cleanupOnErr := func() {
+		if s.dtlsLn != nil {
+			_ = s.dtlsLn.Close()
+		}
+		if s.ownsDTLSConn && s.dtlsRawConn != nil {
+			_ = s.dtlsRawConn.Close()
+		}
+		if s.tlsLn != nil {
+			_ = s.tlsLn.Close()
+		}
+		if s.ownsUDP && s.udpConn != nil {
+			_ = s.udpConn.Close()
+		}
+		if s.tcpLn != nil {
+			_ = s.tcpLn.Close()
+		}
+	}
+
 	if wantsDTLS {
 		rawConn := cfg.DTLSPacketConn
 		ownsDTLS := false
@@ -209,6 +242,27 @@ func New(cfg Config) (*Server, error) {
 		s.ownsDTLSConn = ownsDTLS
 	}
 
+	if wantsTLS {
+		tcfg := cfg.TLSConfig.Clone()
+		tcfg.MinVersion = tls.VersionTLS13
+		tcfg.MaxVersion = tls.VersionTLS13
+
+		rawLn := cfg.TLSListener
+		if rawLn == nil {
+			addr := cfg.TLSListenAddr
+			if addr == "" {
+				addr = DefaultSTUNSAddr
+			}
+			var err error
+			rawLn, err = net.Listen("tcp", addr)
+			if err != nil {
+				cleanupOnErr()
+				return nil, fmt.Errorf("listen stuns tls/tcp %s: %w", addr, err)
+			}
+		}
+		s.tlsLn = tls.NewListener(rawLn, tcfg)
+	}
+
 	if wantsPlainUDP {
 		udpConn := cfg.PacketConn
 		ownsUDP := false
@@ -220,12 +274,7 @@ func New(cfg Config) (*Server, error) {
 			var err error
 			udpConn, err = net.ListenPacket("udp", addr)
 			if err != nil {
-				if s.dtlsLn != nil {
-					_ = s.dtlsLn.Close()
-				}
-				if s.ownsDTLSConn && s.dtlsRawConn != nil {
-					_ = s.dtlsRawConn.Close()
-				}
+				cleanupOnErr()
 				return nil, fmt.Errorf("listen insecure stun udp %s: %w", addr, err)
 			}
 			ownsUDP = true
@@ -234,13 +283,38 @@ func New(cfg Config) (*Server, error) {
 		s.ownsUDP = ownsUDP
 	}
 
+	if wantsPlainTCP {
+		tcpLn := cfg.TCPListener
+		if tcpLn == nil {
+			addr := cfg.TCPListenAddr
+			if addr == "" {
+				addr = DefaultInsecureSTUNAddr
+			}
+			var err error
+			tcpLn, err = net.Listen("tcp", addr)
+			if err != nil {
+				cleanupOnErr()
+				return nil, fmt.Errorf("listen insecure stun tcp %s: %w", addr, err)
+			}
+		}
+		s.tcpLn = tcpLn
+	}
+
 	if s.dtlsLn != nil {
 		s.wg.Add(1)
 		go s.serveDTLSLoop()
 	}
+	if s.tlsLn != nil {
+		s.wg.Add(1)
+		go s.serveStreamLoop(s.tlsLn)
+	}
 	if s.udpConn != nil {
 		s.wg.Add(1)
 		go s.serveUDPLoop()
+	}
+	if s.tcpLn != nil {
+		s.wg.Add(1)
+		go s.serveStreamLoop(s.tcpLn)
 	}
 	return s, nil
 }
@@ -253,6 +327,14 @@ func (s *Server) DTLSAddr() net.Addr {
 	return s.dtlsLn.Addr()
 }
 
+// TLSAddr returns the bound TLS 1.3 / TCP STUNS address, or nil if disabled.
+func (s *Server) TLSAddr() net.Addr {
+	if s.tlsLn == nil {
+		return nil
+	}
+	return s.tlsLn.Addr()
+}
+
 // UDPAddr returns the bound plaintext UDP STUN address, or nil if disabled.
 func (s *Server) UDPAddr() net.Addr {
 	if s.udpConn == nil {
@@ -261,13 +343,27 @@ func (s *Server) UDPAddr() net.Addr {
 	return s.udpConn.LocalAddr()
 }
 
-// LocalAddr returns the DTLS 1.3 STUNS address when active, otherwise the plaintext UDP address.
+// TCPAddr returns the bound plaintext TCP STUN address, or nil if disabled.
+func (s *Server) TCPAddr() net.Addr {
+	if s.tcpLn == nil {
+		return nil
+	}
+	return s.tcpLn.Addr()
+}
+
+// LocalAddr returns the primary active STUNS/STUN address.
 func (s *Server) LocalAddr() net.Addr {
 	if s.dtlsLn != nil {
 		return s.dtlsLn.Addr()
 	}
+	if s.tlsLn != nil {
+		return s.tlsLn.Addr()
+	}
 	if s.udpConn != nil {
 		return s.udpConn.LocalAddr()
+	}
+	if s.tcpLn != nil {
+		return s.tcpLn.Addr()
 	}
 	return nil
 }
@@ -289,9 +385,19 @@ func (s *Server) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	var dtlsErr, rawErr, udpErr error
+	var dtlsErr, rawErr, tlsErr, udpErr, tcpErr error
 	if s.dtlsLn != nil {
 		dtlsErr = s.dtlsLn.Close()
+	}
+	if s.tlsLn != nil {
+		if err := s.tlsLn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			tlsErr = err
+		}
+	}
+	if s.tcpLn != nil {
+		if err := s.tcpLn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			tcpErr = err
+		}
 	}
 	s.activeMu.Lock()
 	conns := make([]net.Conn, 0, len(s.activeConns))
@@ -319,7 +425,7 @@ func (s *Server) Close() error {
 		}
 	}
 	s.wg.Wait()
-	return errors.Join(dtlsErr, rawErr, udpErr)
+	return errors.Join(dtlsErr, rawErr, tlsErr, udpErr, tcpErr)
 }
 
 type guardedDTLSPacketConn struct {
@@ -458,6 +564,117 @@ func (s *Server) handleDTLSConn(conn net.Conn, remoteIP net.IP, remotePort int, 
 		}
 
 		out, shouldReply := s.processMessage(&req, &resp, buf[:n], remoteIP, remotePort)
+		if !shouldReply {
+			continue
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(out); err != nil {
+			return
+		}
+		if resp.Type == stun.BindingSuccess {
+			s.bindingResps.Add(1)
+		}
+	}
+}
+
+func (s *Server) serveStreamLoop(ln net.Listener) {
+	defer s.wg.Done()
+
+	for !s.closed.Load() {
+		conn, err := ln.Accept()
+		if err != nil {
+			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+
+		ip, port, ok := extractIPPort(conn.RemoteAddr())
+		if !ok {
+			s.malformedPackets.Add(1)
+			_ = conn.Close()
+			continue
+		}
+
+		ipKey := ip.String()
+		if !s.connConc.Acquire(ipKey) {
+			s.rateLimited.Add(1)
+			_ = conn.Close()
+			continue
+		}
+
+		s.activeMu.Lock()
+		if s.closed.Load() {
+			s.activeMu.Unlock()
+			s.connConc.Release(ipKey)
+			_ = conn.Close()
+			return
+		}
+		s.activeConns[conn] = struct{}{}
+		s.activeMu.Unlock()
+
+		s.wg.Add(1)
+		go func(c net.Conn, remoteIP net.IP, remotePort int, key string) {
+			defer s.wg.Done()
+			defer func() {
+				s.activeMu.Lock()
+				delete(s.activeConns, c)
+				s.activeMu.Unlock()
+			}()
+			defer s.connConc.Release(key)
+			defer c.Close()
+			s.handleStreamConn(c, remoteIP, remotePort, key)
+		}(conn, ip, port, ipKey)
+	}
+}
+
+func (s *Server) handleStreamConn(conn net.Conn, remoteIP net.IP, remotePort int, ipKey string) {
+	if tc, ok := conn.(*tls.Conn); ok {
+		hsCtx, cancel := context.WithTimeout(context.Background(), s.readTimeout)
+		err := tc.HandshakeContext(hsCtx)
+		cancel()
+		if err != nil {
+			return
+		}
+	}
+
+	buf := make([]byte, max(s.maxBytes, MinSTUNHeaderBytes))
+	var req stun.Message
+	var resp stun.Message
+
+	for !s.closed.Load() {
+		_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+		if _, err := io.ReadFull(conn, buf[:MinSTUNHeaderBytes]); err != nil {
+			return
+		}
+		if !s.globalLim.Allow() || !s.ipLimiter.Allow(ipKey) {
+			s.rateLimited.Add(1)
+			return
+		}
+
+		// RFC 8489 Section 6: top two bits must be 00, magic cookie must be 0x2112A442,
+		// and body length must be a multiple of 4 bytes.
+		if buf[0]&0xC0 != 0 || binary.BigEndian.Uint32(buf[4:8]) != stunMagicCookie {
+			s.malformedPackets.Add(1)
+			return
+		}
+		bodyLen := int(binary.BigEndian.Uint16(buf[2:4]))
+		if bodyLen%4 != 0 {
+			s.malformedPackets.Add(1)
+			return
+		}
+		totalLen := MinSTUNHeaderBytes + bodyLen
+		if totalLen > s.maxBytes {
+			s.oversizedPackets.Add(1)
+			return
+		}
+		if bodyLen > 0 {
+			if _, err := io.ReadFull(conn, buf[MinSTUNHeaderBytes:totalLen]); err != nil {
+				return
+			}
+		}
+
+		out, shouldReply := s.processMessage(&req, &resp, buf[:totalLen], remoteIP, remotePort)
 		if !shouldReply {
 			continue
 		}

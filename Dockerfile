@@ -1,29 +1,26 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS builder
 
-ARG VERSION=0.1.0
-
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-    -ldflags="-s -w -X main.appVersion=${VERSION}" \
+    -ldflags="-s -w" \
     -o /out/lighthouse ./cmd/lighthouse
 
 FROM gcr.io/distroless/static-debian12:nonroot
-ARG VERSION=0.1.0
 
 LABEL org.opencontainers.image.title="lighthouse" \
-      org.opencontainers.image.description="WebRTC Lighthouse hub (TLS 1.3 WSS + DTLS 1.3 UDP STUNS/TURNS)" \
-      org.opencontainers.image.version="${VERSION}"
+      org.opencontainers.image.description="WebRTC Lighthouse hub (TLS 1.3 WSS + DTLS 1.3 UDP / optional TLS 1.3 TCP STUNS/TURNS)"
 
 COPY --from=builder /out/lighthouse /usr/local/bin/lighthouse
 
 USER 10001:10001
 EXPOSE 8443/tcp
 EXPOSE 5349/udp
+EXPOSE 5349/tcp
 
 ENTRYPOINT ["/usr/local/bin/lighthouse"]
 CMD ["hub"]

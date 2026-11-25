@@ -10,7 +10,7 @@ import (
 func newRootCommand() *cli.Command {
 	root := &cli.Command{
 		Name:       "lighthouse",
-		Version:    appVersion,
+		Version:    Version,
 		ShortAbout: "WebRTC Lighthouse hub, peer client, and admin CLI",
 		LongAbout:  "WebRTC Lighthouse hub, peer client, and policy administration tool.",
 		Examples: []string{

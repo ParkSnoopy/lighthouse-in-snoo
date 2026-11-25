@@ -37,12 +37,15 @@ type Config struct {
 	TLSKeyFile      string
 	HubOrigin       string // Canonical wss://host[:port] expected in registration proofs.
 
-	AllowInsecure   bool           // Explicit opt-in required to serve plaintext UDP STUN/TURN.
-	EnableSTUN      bool           // Enable DTLS 1.3 STUNS over UDP (and plaintext UDP if AllowInsecure).
-	STUNSListenAddr string         // DTLS 1.3 UDP listen address for STUNS/TURNS (default :5349).
-	STUNSPacketConn net.PacketConn // Optional pre-bound UDP PacketConn for DTLS 1.3 STUNS/TURNS.
-	STUNListenAddr  string         // Plaintext UDP STUN/TURN listen address (requires AllowInsecure).
-	STUNPacketConn  net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure).
+	TCPOnly          bool           // Explicit opt-in to disable all UDP sockets and serve STUNS/TURNS over TLS 1.3/TCP only.
+	AllowInsecure    bool           // Explicit opt-in required to serve plaintext UDP (or TCP in TCPOnly) STUN/TURN.
+	EnableSTUN       bool           // Enable STUNS (DTLS 1.3/UDP default; TLS 1.3/TCP when TCPOnly) and plaintext if AllowInsecure.
+	STUNSListenAddr  string         // Encrypted STUNS/TURNS listen address (default :5349; UDP unless TCPOnly).
+	STUNSPacketConn  net.PacketConn // Optional pre-bound UDP PacketConn for DTLS 1.3 STUNS/TURNS (prohibited when TCPOnly).
+	STUNSTLSListener net.Listener   // Optional pre-bound TCP listener for TLS 1.3 STUNS/TURNS (TCPOnly).
+	STUNListenAddr   string         // Plaintext STUN/TURN listen address (requires AllowInsecure; UDP unless TCPOnly).
+	STUNPacketConn   net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure; prohibited when TCPOnly).
+	STUNTCPListener  net.Listener   // Optional pre-bound plaintext TCP listener (requires AllowInsecure and TCPOnly).
 
 	EnableTURN         bool              // Enable authenticated DTLS 1.3 TURNS (and plaintext TURN if AllowInsecure).
 	TURNSTLSListenAddr string            // Optional secondary TLS 1.3 TCP listen address for ?transport=tcp fallback.
@@ -236,8 +239,16 @@ func New(cfg Config) (*Server, error) {
 	}
 	ln := tls.NewListener(rawLn, tlsCfg)
 
-	wantsPlainUDP := cfg.STUNListenAddr != "" || cfg.STUNPacketConn != nil
-	if wantsPlainUDP && !cfg.AllowInsecure {
+	if cfg.TCPOnly && (cfg.STUNSPacketConn != nil || cfg.STUNPacketConn != nil) {
+		_ = ln.Close()
+		if sqlStore != nil {
+			_ = sqlStore.Close()
+		}
+		return nil, errors.New("hub: UDP PacketConn is prohibited when TCPOnly=true")
+	}
+
+	wantsPlain := cfg.STUNListenAddr != "" || cfg.STUNPacketConn != nil || cfg.STUNTCPListener != nil
+	if wantsPlain && !cfg.AllowInsecure {
 		_ = ln.Close()
 		if sqlStore != nil {
 			_ = sqlStore.Close()
@@ -246,8 +257,8 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	wantsTURN := cfg.EnableTURN || cfg.TURNSecret != "" || len(cfg.TURNUsers) > 0 || cfg.TURNAuthHandler != nil
-	wantsSTUNS := cfg.STUNSListenAddr != "" || cfg.STUNSPacketConn != nil
-	if (cfg.EnableSTUN || wantsTURN) && !wantsSTUNS && !wantsPlainUDP && cfg.TURNSTLSListenAddr == "" {
+	wantsSTUNS := cfg.STUNSListenAddr != "" || cfg.STUNSPacketConn != nil || cfg.STUNSTLSListener != nil
+	if (cfg.EnableSTUN || wantsTURN) && !wantsSTUNS && !wantsPlain && cfg.TURNSTLSListenAddr == "" {
 		cfg.STUNSListenAddr = stunserver.DefaultSTUNSAddr
 		wantsSTUNS = true
 	}
@@ -261,8 +272,6 @@ func New(cfg Config) (*Server, error) {
 			TLSConfig:        tlsCfg,
 			AllowInsecure:    cfg.AllowInsecure,
 			TLSListenAddr:    cfg.TURNSTLSListenAddr,
-			UDPListenAddr:    cfg.STUNListenAddr,
-			UDPPacketConn:    cfg.STUNPacketConn,
 			Realm:            cfg.TURNRealm,
 			SharedSecret:     cfg.TURNSecret,
 			Users:            cfg.TURNUsers,
@@ -274,9 +283,26 @@ func New(cfg Config) (*Server, error) {
 			RelayNet:         cfg.TURNNet,
 			LoggerFactory:    cfg.PionLoggerFactory,
 		}
-		if wantsSTUNS {
-			turnCfg.DTLSListenAddr = cfg.STUNSListenAddr
-			turnCfg.DTLSPacketConn = cfg.STUNSPacketConn
+		if cfg.TCPOnly {
+			if wantsSTUNS {
+				if turnCfg.TLSListenAddr == "" {
+					turnCfg.TLSListenAddr = cfg.STUNSListenAddr
+				}
+				turnCfg.TLSListener = cfg.STUNSTLSListener
+			}
+			if wantsPlain {
+				turnCfg.TCPListenAddr = cfg.STUNListenAddr
+				turnCfg.TCPListener = cfg.STUNTCPListener
+			}
+		} else {
+			if wantsSTUNS {
+				turnCfg.DTLSListenAddr = cfg.STUNSListenAddr
+				turnCfg.DTLSPacketConn = cfg.STUNSPacketConn
+			}
+			if wantsPlain {
+				turnCfg.UDPListenAddr = cfg.STUNListenAddr
+				turnCfg.UDPPacketConn = cfg.STUNPacketConn
+			}
 		}
 		turnSrv, err = turnserver.New(turnCfg)
 		if err != nil {
@@ -286,20 +312,34 @@ func New(cfg Config) (*Server, error) {
 			}
 			return nil, err
 		}
-	} else if wantsSTUNS || wantsPlainUDP {
+	} else if wantsSTUNS || wantsPlain {
 		stunCfg := stunserver.Config{
 			AllowInsecure: cfg.AllowInsecure,
-			ListenAddr:    cfg.STUNListenAddr,
-			PacketConn:    cfg.STUNPacketConn,
 			PerIPRPS:      cfg.STUNPerIPRPS,
 			PerIPBurst:    cfg.STUNPerIPBurst,
 			LoggerFactory: cfg.PionLoggerFactory,
 			Logger:        cfg.Logger,
 		}
-		if wantsSTUNS {
-			stunCfg.TLSConfig = tlsCfg
-			stunCfg.DTLSListenAddr = cfg.STUNSListenAddr
-			stunCfg.DTLSPacketConn = cfg.STUNSPacketConn
+		if cfg.TCPOnly {
+			if wantsSTUNS {
+				stunCfg.TLSConfig = tlsCfg
+				stunCfg.TLSListenAddr = cfg.STUNSListenAddr
+				stunCfg.TLSListener = cfg.STUNSTLSListener
+			}
+			if wantsPlain {
+				stunCfg.TCPListenAddr = cfg.STUNListenAddr
+				stunCfg.TCPListener = cfg.STUNTCPListener
+			}
+		} else {
+			if wantsSTUNS {
+				stunCfg.TLSConfig = tlsCfg
+				stunCfg.DTLSListenAddr = cfg.STUNSListenAddr
+				stunCfg.DTLSPacketConn = cfg.STUNSPacketConn
+			}
+			if wantsPlain {
+				stunCfg.ListenAddr = cfg.STUNListenAddr
+				stunCfg.PacketConn = cfg.STUNPacketConn
+			}
 		}
 		stunSrv, err = stunserver.New(stunCfg)
 		if err != nil {
@@ -444,8 +484,13 @@ func (s *Server) HTTPSAddr() net.Addr {
 	return s.httpsListener.Addr()
 }
 
-// STUNSAddr returns the bound DTLS 1.3 / UDP STUNS/TURNS address, or nil if disabled.
-func (s *Server) STUNSAddr() net.Addr {
+// TCPOnly reports whether the hub is operating in TCP-only mode with UDP disabled.
+func (s *Server) TCPOnly() bool {
+	return s.cfg.TCPOnly
+}
+
+// STUNSDTLSAddr returns the bound DTLS 1.3 / UDP STUNS/TURNS address, or nil if disabled.
+func (s *Server) STUNSDTLSAddr() net.Addr {
 	if s.turnSrv != nil && s.turnSrv.DTLSAddr() != nil {
 		return s.turnSrv.DTLSAddr()
 	}
@@ -455,7 +500,26 @@ func (s *Server) STUNSAddr() net.Addr {
 	return nil
 }
 
-// TURNSTLSAddr returns the optional TLS 1.3 / TCP TURNS address, or nil if disabled.
+// STUNSTLSAddr returns the bound TLS 1.3 / TCP STUNS/TURNS address, or nil if disabled.
+func (s *Server) STUNSTLSAddr() net.Addr {
+	if s.turnSrv != nil && s.turnSrv.TLSAddr() != nil {
+		return s.turnSrv.TLSAddr()
+	}
+	if s.stunSrv != nil && s.stunSrv.TLSAddr() != nil {
+		return s.stunSrv.TLSAddr()
+	}
+	return nil
+}
+
+// STUNSAddr returns the bound encrypted STUNS/TURNS address (DTLS/UDP default, or TLS/TCP in TCP-only mode).
+func (s *Server) STUNSAddr() net.Addr {
+	if a := s.STUNSDTLSAddr(); a != nil {
+		return a
+	}
+	return s.STUNSTLSAddr()
+}
+
+// TURNSTLSAddr returns the TLS 1.3 / TCP TURNS address, or nil if disabled.
 func (s *Server) TURNSTLSAddr() net.Addr {
 	if s.turnSrv != nil {
 		return s.turnSrv.TLSAddr()
@@ -474,12 +538,26 @@ func (s *Server) STUNUDPAddr() net.Addr {
 	return nil
 }
 
-// STUNAddr returns the primary STUNS/TURNS DTLS address when active, otherwise the plaintext UDP address.
+// STUNTCPAddr returns the bound opt-in plaintext TCP STUN/TURN address, or nil if disabled.
+func (s *Server) STUNTCPAddr() net.Addr {
+	if s.turnSrv != nil && s.turnSrv.TCPAddr() != nil {
+		return s.turnSrv.TCPAddr()
+	}
+	if s.stunSrv != nil && s.stunSrv.TCPAddr() != nil {
+		return s.stunSrv.TCPAddr()
+	}
+	return nil
+}
+
+// STUNAddr returns the primary STUNS/TURNS encrypted address when active, otherwise the plaintext address.
 func (s *Server) STUNAddr() net.Addr {
 	if a := s.STUNSAddr(); a != nil {
 		return a
 	}
-	return s.STUNUDPAddr()
+	if a := s.STUNUDPAddr(); a != nil {
+		return a
+	}
+	return s.STUNTCPAddr()
 }
 
 // TURNActive reports whether the integrated TURNS/TURN relay service is running.

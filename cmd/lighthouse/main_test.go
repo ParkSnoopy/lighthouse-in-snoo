@@ -32,7 +32,7 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 	}
 
 	verOut, err := exec.Command(binPath, "-V").CombinedOutput()
-	if err != nil || !strings.Contains(string(verOut), "lighthouse 0.1.0") {
+	if err != nil || !strings.Contains(string(verOut), "lighthouse "+Version) {
 		t.Fatalf("lighthouse -V failed: err=%v out=%q", err, string(verOut))
 	}
 
@@ -48,6 +48,8 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 		"[default: :8443]",
 		"--stuns-addr <ADDR>",
 		"[default: :5349]",
+		"--tcp-only",
+		"[env: LIGHTHOUSE_TCP_ONLY]",
 		"--insecure",
 		"--turn-secret <SECRET>",
 	} {
@@ -135,6 +137,16 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 		t.Fatalf("expected --insecure hint in peer error:\n%s", string(peerInsecureOut))
 	}
 
+	// Verify peer --tcp-only rejects ?transport=udp with exit code 2.
+	peerTCPUDPCmd := exec.Command(binPath, "peer", "--tcp-only", "--key", keyPath, "--policy", polPath, "--stun", "stuns:127.0.0.1:5349?transport=udp")
+	peerTCPUDPOut, peerTCPUDPErr := peerTCPUDPCmd.CombinedOutput()
+	if peerTCPUDPErr == nil || peerTCPUDPCmd.ProcessState.ExitCode() != 2 {
+		t.Fatalf("expected exit code 2 for peer --tcp-only with ?transport=udp, got err=%v code=%d out=%s", peerTCPUDPErr, peerTCPUDPCmd.ProcessState.ExitCode(), string(peerTCPUDPOut))
+	}
+	if !strings.Contains(string(peerTCPUDPOut), "TCP-only") {
+		t.Fatalf("expected TCP-only error message, got:\n%s", string(peerTCPUDPOut))
+	}
+
 	// Verify clap-like typo suggestion on unknown double-dash option.
 	badCmd := exec.Command(binPath, "hub", "--polcy", "x")
 	badOut, badErr := badCmd.CombinedOutput()
@@ -207,44 +219,44 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 func TestVersionAlignmentAndRuntimeEnvDefaults(t *testing.T) {
 	t.Parallel()
 
-	// Verify VERSION file, default binary --version, and README.md stay strictly synchronized.
-	verBytes, err := os.ReadFile(filepath.Join("..", "..", "VERSION"))
-	if err != nil {
-		t.Fatalf("read VERSION: %v", err)
-	}
-	fileVer := strings.TrimSpace(string(verBytes))
-	if fileVer != appVersion {
-		t.Fatalf("VERSION file (%q) != appVersion (%q)", fileVer, appVersion)
+	// Verify cmd/lighthouse/version.go is the single source of truth (no duplicate root VERSION file).
+	if _, err := os.Stat(filepath.Join("..", "..", "VERSION")); !os.IsNotExist(err) {
+		t.Fatalf("duplicate root VERSION file must not exist (use cmd/lighthouse/version.go only), stat err=%v", err)
 	}
 	readmeBytes, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
 	if err != nil {
 		t.Fatalf("read README.md: %v", err)
 	}
-	if !strings.Contains(string(readmeBytes), "v"+fileVer) {
-		t.Fatalf("README.md does not contain current version v%s", fileVer)
+	if !strings.Contains(string(readmeBytes), "v"+Version) {
+		t.Fatalf("README.md does not contain current version v%s", Version)
 	}
 
-	// Verify build definitions never bake LIGHTHOUSE_* variables at build time.
+	// Verify build definitions never duplicate Version or bake LIGHTHOUSE_* variables at build time.
 	for _, rel := range []string{"Dockerfile", "Makefile", "docker-compose.yml", filepath.Join(".github", "workflows", "build.yml")} {
 		data, readErr := os.ReadFile(filepath.Join("..", "..", rel))
 		if readErr != nil {
 			t.Fatalf("read %s: %v", rel, readErr)
 		}
-		if strings.Contains(string(data), "LIGHTHOUSE_") {
+		text := string(data)
+		if strings.Contains(text, "LIGHTHOUSE_") {
 			t.Fatalf("%s must not reference LIGHTHOUSE_* variables at build time", rel)
+		}
+		if strings.Contains(text, "ARG VERSION") || strings.Contains(text, "appVersion") || strings.Contains(text, Version) {
+			t.Fatalf("%s must not hardcode or duplicate version %q (single source is cmd/lighthouse/version.go)", rel, Version)
 		}
 	}
 
-	// Build a single binary (only version injected at build time).
+	// Build a single binary directly from source (Version comes solely from version.go).
 	tmpDir := t.TempDir()
 	binPath := filepath.Join(tmpDir, "lighthouse-ver")
-	if out, err := exec.Command("go", "build", "-ldflags", "-X main.appVersion=9.8.7", "-o", binPath, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build with version ldflags failed: %v\n%s", err, string(out))
+	if out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build binary failed: %v\n%s", err, string(out))
 	}
 
 	verOut, err := exec.Command(binPath, "--version").CombinedOutput()
-	if err != nil || strings.TrimSpace(string(verOut)) != "lighthouse 9.8.7" {
-		t.Fatalf("--version = %q (err=%v); want 'lighthouse 9.8.7'", strings.TrimSpace(string(verOut)), err)
+	wantVer := "lighthouse " + Version
+	if err != nil || strings.TrimSpace(string(verOut)) != wantVer {
+		t.Fatalf("--version = %q (err=%v); want %q", strings.TrimSpace(string(verOut)), err, wantVer)
 	}
 
 	// Verify runtime .env file sets LIGHTHOUSE_* defaults when process env is unset.
@@ -270,6 +282,9 @@ func TestVersionAlignmentAndRuntimeEnvDefaults(t *testing.T) {
 	for _, want := range []string{
 		"[default: stuns:stun.dotenv.example:5350]",
 		"[default: wss://hub.dotenv.example/v1/signal]",
+		"--tcp-only",
+		"[env: LIGHTHOUSE_TCP_ONLY]",
+		"--tcp-listen-addr <ADDR>",
 		"--insecure",
 		"--turn <URI>",
 	} {

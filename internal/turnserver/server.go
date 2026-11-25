@@ -25,23 +25,25 @@ const (
 	DefaultRealm = "lighthouse"
 )
 
-// ErrInsecureTURNProhibited is returned when plaintext UDP TURN is configured without AllowInsecure.
-var ErrInsecureTURNProhibited = errors.New("turnserver: plaintext UDP TURN requires AllowInsecure=true; use DTLS 1.3 TURNS over UDP")
+// ErrInsecureTURNProhibited is returned when plaintext TURN is configured without AllowInsecure.
+var ErrInsecureTURNProhibited = errors.New("turnserver: plaintext TURN requires AllowInsecure=true; use encrypted TURNS")
 
-// Config configures the integrated TURNS (DTLS 1.3 / UDP primary, optional TLS 1.3 / TCP)
-// and opt-in insecure plaintext UDP TURN server.
+// Config configures the integrated TURNS (DTLS 1.3 / UDP primary, TLS 1.3 / TCP fallback or TCP-only)
+// and opt-in insecure plaintext UDP/TCP TURN server.
 // Because pion/turn/v6 serves unauthenticated RFC 8489 STUN Binding requests alongside
-// authenticated TURN allocations, a single DTLS 1.3 :5349/udp socket handles both stuns: and turns:.
+// authenticated TURN allocations, a single encrypted :5349 listener handles both stuns: and turns:.
 type Config struct {
 	DTLSListenAddr string         // Primary UDP listen address for DTLS 1.3 TURNS/STUNS (default :5349).
 	DTLSPacketConn net.PacketConn // Optional pre-bound UDP PacketConn wrapped with DTLS 1.3.
-	TLSListenAddr  string         // Optional secondary TCP listen address for TLS 1.3 TURNS (?transport=tcp).
+	TLSListenAddr  string         // TCP listen address for TLS 1.3 TURNS (?transport=tcp or TCP-only mode).
 	TLSListener    net.Listener   // Optional pre-bound TCP listener wrapped with TLS 1.3.
 	TLSConfig      *tls.Config    // Required for DTLS 1.3 / TLS 1.3 listeners.
 
-	AllowInsecure bool           // Explicit opt-in required for plaintext UDP TURN.
+	AllowInsecure bool           // Explicit opt-in required for plaintext UDP/TCP TURN.
 	UDPListenAddr string         // Plaintext UDP listen address (requires AllowInsecure).
 	UDPPacketConn net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure).
+	TCPListenAddr string         // Plaintext TCP listen address (requires AllowInsecure).
+	TCPListener   net.Listener   // Optional pre-bound plaintext TCP listener (requires AllowInsecure).
 
 	Realm            string
 	SharedSecret     string            // Enables time-limited HMAC TURN REST credentials.
@@ -55,7 +57,7 @@ type Config struct {
 	LoggerFactory    logging.LoggerFactory
 }
 
-// Server wraps a Pion TURN server serving DTLS 1.3 / UDP TURNS by default.
+// Server wraps a Pion TURN server serving DTLS 1.3 / UDP or TLS 1.3 / TCP TURNS by default.
 type Server struct {
 	srv          *turn.Server
 	dtlsAddr     net.Addr
@@ -63,20 +65,23 @@ type Server struct {
 	ownsDTLSConn bool
 	tlsAddr      net.Addr
 	udpAddr      net.Addr
+	tcpAddr      net.Addr
 	closed       atomic.Bool
 }
 
-// New creates and starts a DTLS 1.3 / UDP TURNS (and optional TLS/TCP or opt-in plaintext UDP) server.
+// New creates and starts a TURNS (DTLS 1.3/UDP or TLS 1.3/TCP) and/or opt-in insecure TURN server.
 func New(cfg Config) (*Server, error) {
 	wantsPlainUDP := cfg.UDPListenAddr != "" || cfg.UDPPacketConn != nil
-	if wantsPlainUDP && !cfg.AllowInsecure {
+	wantsPlainTCP := cfg.TCPListenAddr != "" || cfg.TCPListener != nil
+	if (wantsPlainUDP || wantsPlainTCP) && !cfg.AllowInsecure {
 		return nil, ErrInsecureTURNProhibited
 	}
 
 	wantsTLS := cfg.TLSListenAddr != "" || cfg.TLSListener != nil
-	wantsDTLS := cfg.DTLSListenAddr != "" || cfg.DTLSPacketConn != nil || (cfg.TLSConfig != nil && !wantsPlainUDP && !wantsTLS)
-	if !wantsDTLS && !wantsTLS && !wantsPlainUDP {
-		return nil, errors.New("turnserver: TLSConfig is required for DTLS 1.3 TURNS (or opt in with AllowInsecure for plaintext UDP)")
+	wantsDTLS := cfg.DTLSListenAddr != "" || cfg.DTLSPacketConn != nil ||
+		(cfg.TLSConfig != nil && !wantsPlainUDP && !wantsPlainTCP && !wantsTLS)
+	if !wantsDTLS && !wantsTLS && !wantsPlainUDP && !wantsPlainTCP {
+		return nil, errors.New("turnserver: TLSConfig is required for encrypted TURNS (or opt in with AllowInsecure)")
 	}
 	if (wantsDTLS || wantsTLS) && (cfg.TLSConfig == nil || len(cfg.TLSConfig.Certificates) == 0) {
 		return nil, errors.New("turnserver: TLSConfig with certificate is required for DTLS/TLS TURNS")
@@ -107,6 +112,7 @@ func New(cfg Config) (*Server, error) {
 		ownsDTLSConn bool
 		tlsAddr      net.Addr
 		udpAddr      net.Addr
+		tcpAddr      net.Addr
 		ownedClosers []func() error
 	)
 
@@ -198,6 +204,27 @@ func New(cfg Config) (*Server, error) {
 		})
 	}
 
+	if wantsPlainTCP {
+		tcpLn := cfg.TCPListener
+		if tcpLn == nil {
+			addr := cfg.TCPListenAddr
+			if addr == "" {
+				addr = DefaultInsecureTURNAddr
+			}
+			tcpLn, err = net.Listen("tcp", addr)
+			if err != nil {
+				cleanupOwned()
+				return nil, fmt.Errorf("listen insecure turn tcp %s: %w", addr, err)
+			}
+		}
+		ownedClosers = append(ownedClosers, tcpLn.Close)
+		tcpAddr = tcpLn.Addr()
+		listeners = append(listeners, turn.ListenerConfig{
+			Listener:              tcpLn,
+			RelayAddressGenerator: buildRelayGenerator(cfg, tcpAddr),
+		})
+	}
+
 	srv, err := turn.NewServer(turn.ServerConfig{
 		Realm:             realm,
 		AuthHandler:       authHandler,
@@ -217,6 +244,7 @@ func New(cfg Config) (*Server, error) {
 		ownsDTLSConn: ownsDTLSConn,
 		tlsAddr:      tlsAddr,
 		udpAddr:      udpAddr,
+		tcpAddr:      tcpAddr,
 	}, nil
 }
 
@@ -346,6 +374,11 @@ func (s *Server) TLSAddr() net.Addr {
 // UDPAddr returns the bound plaintext UDP TURN address, or nil if disabled.
 func (s *Server) UDPAddr() net.Addr {
 	return s.udpAddr
+}
+
+// TCPAddr returns the bound plaintext TCP TURN address, or nil if disabled.
+func (s *Server) TCPAddr() net.Addr {
+	return s.tcpAddr
 }
 
 // AllocationCount returns the current number of active TURN relay allocations.

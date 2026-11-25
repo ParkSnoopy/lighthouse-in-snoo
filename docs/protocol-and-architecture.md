@@ -15,6 +15,7 @@ Control-plane signaling runs out of band over `wss://<host>/v1/signal` using TLS
 
 - `stuns:<host>[:<port>]` (default port `5349`): runs STUN Binding over DTLS 1.3 / UDP on the shared ICE UDP socket so NAT mappings discovered over STUNS match direct UDP peer traffic.
 - `turns:<host>[:<port>]` (default port `5349`): prioritizes DTLS 1.3 / UDP (`?transport=udp`) automatically; `?transport=tcp` uses TLS 1.3 / TCP when explicitly requested.
+- Opt-in `--tcp-only` (`TCPOnly: true` / `LIGHTHOUSE_TCP_ONLY=true`): binds zero UDP sockets on hub and peers, serves STUNS/TURNS exclusively over TLS 1.3 / TCP (RFC 8489 stream framing on `:5349/tcp`), rejects `?transport=udp` and UDP candidates, and negotiates end-to-end DTLS 1.3 DataChannels over RFC 6544 / RFC 4571 ICE-TCP (`tcp4`/`tcp6`).
 - Plaintext `stun:` and `turn:` (default port `3478`) are rejected by default on both hub and peer and require explicit opt-in via `--insecure` (`AllowInsecure` / `AllowInsecureICE`).
 
 ## 2. Cryptographic Identity and Trust
@@ -89,8 +90,9 @@ All cryptographic signatures use RFC 8785 JSON Canonicalization Scheme (`interna
 - Default secure schemes: `stuns:` and `turns:` (prioritizing DTLS 1.3 / UDP `:5349/udp` over TLS 1.3 / TCP).
 - Plaintext `stun:` and `turn:` fail closed (`ErrInsecureICEProhibited`) unless `--insecure` / `AllowInsecureICE: true` is set.
 - Peer ICE candidate admission:
-  - Direct-only mode (no `turns:`/`turn:` configured): only UDP `host`, `srflx`, and `prflx` candidates are accepted; `relay` candidates, TCP candidates, `ice-lite`, audio/video media sections, and hub endpoints are rejected.
-  - TURN-enabled mode (`turns:` or `--insecure` `turn:` configured): UDP `relay` candidates are admitted alongside `host`/`srflx`/`prflx` while retaining strict end-to-end DTLS 1.3 (`0xFEFC`) + SHA-256 fingerprint authentication between peers.
+  - Direct-only UDP mode (default, no `turns:`/`turn:` configured): only UDP `host`, `srflx`, and `prflx` candidates are accepted; `relay` candidates, TCP candidates, `ice-lite`, audio/video media sections, and hub endpoints are rejected.
+  - TURN-enabled UDP mode (`turns:` or `--insecure` `turn:` configured): UDP `relay` candidates are admitted alongside `host`/`srflx`/`prflx` while retaining strict end-to-end DTLS 1.3 (`0xFEFC`) + SHA-256 fingerprint authentication between peers.
+  - Opt-in TCP-only mode (`--tcp-only` / `TCPOnly: true`): only TCP (`tcp4`/`tcp6`) ICE-TCP candidates are admitted via `ICETCPMux` (passive) and active TCP dialers; all UDP candidates, `?transport=udp` URIs, and hub endpoints are rejected while retaining strict end-to-end DTLS 1.3 (`0xFEFC`) + SHA-256 fingerprint authentication.
 - Concurrent offers for the same peer pair resolve deterministically: the offer from the lexicographically smaller `peer_id` wins.
 
 ### 4.2 Connection State Machine

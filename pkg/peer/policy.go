@@ -18,6 +18,12 @@ import (
 	"lighthouse-in-snoo/pkg/protocol"
 )
 
+// CandidatePolicy controls ICE transport and candidate admission rules.
+type CandidatePolicy struct {
+	AllowRelay bool // Admit relay candidates when a validated TURN/TURNS server is configured.
+	TCPOnly    bool // Disable UDP candidates completely and require ICE-TCP candidates only.
+}
+
 // RemoteSDPInfo summarizes security-relevant attributes extracted from a verified SDP.
 type RemoteSDPInfo struct {
 	SHA256Fingerprints []string
@@ -26,17 +32,22 @@ type RemoteSDPInfo struct {
 	MaxMessageSize     int
 }
 
-// ValidateICEServerURI validates a STUN/STUNS/TURN/TURNS URI.
+// ValidateICEServerURI validates a STUN/STUNS/TURN/TURNS URI in default UDP-prioritized mode.
 // By default (allowInsecure=false), only encrypted stuns: and turns: schemes are accepted;
 // plaintext stun: and turn: require explicit opt-in (allowInsecure=true).
-// UDP (DTLS/UDP for stuns:/turns:) is always prioritized over TCP unless ?transport=tcp is set.
+// UDP (DTLS/UDP for stuns:/turns:) is prioritized over TCP unless ?transport=tcp is set.
 func ValidateICEServerURI(rawURI string, allowInsecure bool) (*stun.URI, error) {
+	return ValidateICEServerURIWithMode(rawURI, allowInsecure, false)
+}
+
+// ValidateICEServerURIWithMode validates an ICE server URI with explicit security and TCP-only flags.
+// When tcpOnly=true, ?transport=udp is rejected and stuns:/turns: default to TLS 1.3 over TCP.
+func ValidateICEServerURIWithMode(rawURI string, allowInsecure, tcpOnly bool) (*stun.URI, error) {
 	trimmed := strings.TrimSpace(rawURI)
 	if trimmed == "" {
 		return nil, nil
 	}
 
-	// Detect whether an explicit ?transport= query was provided so UDP is prioritized by default.
 	rawParsed, err := url.Parse(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidICEConfig, err)
@@ -50,13 +61,13 @@ func ValidateICEServerURI(rawURI string, allowInsecure bool) (*stun.URI, error) 
 		explicitTransport = strings.ToLower(strings.TrimSpace(q.Get("transport")))
 	}
 
-	// Accept stuns:host[:port]?transport=udp gracefully by normalizing before stun.ParseURI
-	// (pion/stun rejects query params on stuns: per RFC 7064, while RFC 7350 uses DTLS/UDP).
+	// Accept stun:/stuns: with ?transport=udp|tcp gracefully before calling stun.ParseURI
+	// (pion/stun rejects query params on stun:/stuns: per RFC 7064).
 	parseTarget := trimmed
-	if strings.EqualFold(rawParsed.Scheme, "stuns") && rawParsed.RawQuery != "" {
+	if (strings.EqualFold(rawParsed.Scheme, "stuns") || strings.EqualFold(rawParsed.Scheme, "stun")) && rawParsed.RawQuery != "" {
 		q, qErr := url.ParseQuery(rawParsed.RawQuery)
 		if qErr != nil || len(q) > 1 || (explicitTransport != "udp" && explicitTransport != "tcp") {
-			return nil, fmt.Errorf("%w: unsupported stuns query %q", ErrInvalidICEConfig, rawParsed.RawQuery)
+			return nil, fmt.Errorf("%w: unsupported %s query %q", ErrInvalidICEConfig, rawParsed.Scheme, rawParsed.RawQuery)
 		}
 		parseTarget = rawParsed.Scheme + ":" + rawParsed.Opaque
 	}
@@ -70,6 +81,14 @@ func ValidateICEServerURI(rawURI string, allowInsecure bool) (*stun.URI, error) 
 	}
 	if !parsed.IsSecure() && !allowInsecure {
 		return nil, fmt.Errorf("%w: %w: scheme=%s", ErrInvalidICEConfig, ErrInsecureICEProhibited, parsed.Scheme)
+	}
+
+	if tcpOnly {
+		if explicitTransport == "udp" {
+			return nil, fmt.Errorf("%w: transport=udp is prohibited in TCP-only mode", ErrInvalidICEConfig)
+		}
+		parsed.Proto = stun.ProtoTypeTCP
+		return parsed, nil
 	}
 
 	// Always prioritize UDP (DTLS/UDP for stuns:/turns:) unless ?transport=tcp was explicitly chosen.
@@ -92,13 +111,13 @@ func ValidateSTUNServerURI(rawURI string) error {
 
 // ValidateAndInspectRemoteSDP parses a remote SDP prior to installation in WebRTC
 // and enforces data-only media, SHA-256 DTLS fingerprints, non-empty ICE credentials,
-// and direct-only candidate policy (rejecting relay/TCP/hub-endpoint candidates).
+// and direct-only UDP candidate policy (rejecting relay/TCP/hub-endpoint candidates).
 func ValidateAndInspectRemoteSDP(
 	rawSDP string,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
 ) (RemoteSDPInfo, error) {
-	return ValidateAndInspectRemoteSDPWithPolicy(rawSDP, prohibitedEndpoints, prohibitedIPs, false)
+	return ValidateAndInspectRemoteSDPWithCandidatePolicy(rawSDP, prohibitedEndpoints, prohibitedIPs, CandidatePolicy{})
 }
 
 // ValidateAndInspectRemoteSDPWithPolicy validates a remote SDP with configurable relay admission
@@ -108,6 +127,18 @@ func ValidateAndInspectRemoteSDPWithPolicy(
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
 	allowRelay bool,
+) (RemoteSDPInfo, error) {
+	return ValidateAndInspectRemoteSDPWithCandidatePolicy(rawSDP, prohibitedEndpoints, prohibitedIPs, CandidatePolicy{
+		AllowRelay: allowRelay,
+	})
+}
+
+// ValidateAndInspectRemoteSDPWithCandidatePolicy validates a remote SDP against a full CandidatePolicy.
+func ValidateAndInspectRemoteSDPWithCandidatePolicy(
+	rawSDP string,
+	prohibitedEndpoints []net.UDPAddr,
+	prohibitedIPs []net.IP,
+	policy CandidatePolicy,
 ) (RemoteSDPInfo, error) {
 	var parsed sdp.SessionDescription
 	if err := parsed.Unmarshal([]byte(rawSDP)); err != nil {
@@ -155,7 +186,7 @@ func ValidateAndInspectRemoteSDPWithPolicy(
 
 	for _, a := range parsed.Attributes {
 		if strings.EqualFold(a.Key, "candidate") {
-			if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs, allowRelay); err != nil {
+			if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs, policy); err != nil {
 				return RemoteSDPInfo{}, err
 			}
 		}
@@ -185,7 +216,7 @@ func ValidateAndInspectRemoteSDPWithPolicy(
 		}
 		for _, a := range md.Attributes {
 			if strings.EqualFold(a.Key, "candidate") {
-				if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs, allowRelay); err != nil {
+				if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs, policy); err != nil {
 					return RemoteSDPInfo{}, err
 				}
 			}
@@ -207,13 +238,13 @@ func ValidateAndInspectRemoteSDPWithPolicy(
 	}, nil
 }
 
-// ValidateTrickleCandidate inspects a trickled ICE candidate prior to installation (direct-only).
+// ValidateTrickleCandidate inspects a trickled ICE candidate prior to installation (direct UDP only).
 func ValidateTrickleCandidate(
 	body protocol.CandidateBody,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
 ) error {
-	return ValidateTrickleCandidateWithPolicy(body, prohibitedEndpoints, prohibitedIPs, false)
+	return ValidateTrickleCandidateWithCandidatePolicy(body, prohibitedEndpoints, prohibitedIPs, CandidatePolicy{})
 }
 
 // ValidateTrickleCandidateWithPolicy inspects a trickled ICE candidate with configurable relay admission.
@@ -223,18 +254,30 @@ func ValidateTrickleCandidateWithPolicy(
 	prohibitedIPs []net.IP,
 	allowRelay bool,
 ) error {
+	return ValidateTrickleCandidateWithCandidatePolicy(body, prohibitedEndpoints, prohibitedIPs, CandidatePolicy{
+		AllowRelay: allowRelay,
+	})
+}
+
+// ValidateTrickleCandidateWithCandidatePolicy inspects a trickled ICE candidate against CandidatePolicy.
+func ValidateTrickleCandidateWithCandidatePolicy(
+	body protocol.CandidateBody,
+	prohibitedEndpoints []net.UDPAddr,
+	prohibitedIPs []net.IP,
+	policy CandidatePolicy,
+) error {
 	trimmed := strings.TrimSpace(body.Candidate)
 	if trimmed == "" {
 		return ErrProhibitedCandidate
 	}
-	return validateCandidateString(trimmed, prohibitedEndpoints, prohibitedIPs, allowRelay)
+	return validateCandidateString(trimmed, prohibitedEndpoints, prohibitedIPs, policy)
 }
 
 func validateCandidateString(
 	rawCand string,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
-	allowRelay bool,
+	policy CandidatePolicy,
 ) error {
 	spec := strings.TrimSpace(rawCand)
 	spec = strings.TrimPrefix(spec, "a=")
@@ -247,13 +290,17 @@ func validateCandidateString(
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrProhibitedCandidate, err)
 	}
-	if !cand.NetworkType().IsUDP() {
+	if policy.TCPOnly {
+		if !cand.NetworkType().IsTCP() {
+			return fmt.Errorf("%w: UDP network %s prohibited in TCP-only mode", ErrProhibitedCandidate, cand.NetworkType())
+		}
+	} else if !cand.NetworkType().IsUDP() {
 		return fmt.Errorf("%w: non-UDP network %s", ErrProhibitedCandidate, cand.NetworkType())
 	}
 	switch cand.Type() {
 	case ice.CandidateTypeHost, ice.CandidateTypeServerReflexive, ice.CandidateTypePeerReflexive:
 	case ice.CandidateTypeRelay:
-		if !allowRelay {
+		if !policy.AllowRelay {
 			return fmt.Errorf("%w: relay candidate prohibited", ErrProhibitedCandidate)
 		}
 	default:
@@ -268,13 +315,13 @@ func validateCandidateString(
 	return nil
 }
 
-// ValidateSelectedPair validates the nominated local and remote ICE candidates (direct-only).
+// ValidateSelectedPair validates the nominated local and remote ICE candidates (direct UDP only).
 func ValidateSelectedPair(
 	pair *webrtc.ICECandidatePair,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
 ) error {
-	return ValidateSelectedPairWithPolicy(pair, prohibitedEndpoints, prohibitedIPs, false)
+	return ValidateSelectedPairWithCandidatePolicy(pair, prohibitedEndpoints, prohibitedIPs, CandidatePolicy{})
 }
 
 // ValidateSelectedPairWithPolicy validates the nominated candidate pair with configurable relay admission.
@@ -284,13 +331,29 @@ func ValidateSelectedPairWithPolicy(
 	prohibitedIPs []net.IP,
 	allowRelay bool,
 ) error {
+	return ValidateSelectedPairWithCandidatePolicy(pair, prohibitedEndpoints, prohibitedIPs, CandidatePolicy{
+		AllowRelay: allowRelay,
+	})
+}
+
+// ValidateSelectedPairWithCandidatePolicy validates the nominated candidate pair against CandidatePolicy.
+func ValidateSelectedPairWithCandidatePolicy(
+	pair *webrtc.ICECandidatePair,
+	prohibitedEndpoints []net.UDPAddr,
+	prohibitedIPs []net.IP,
+	policy CandidatePolicy,
+) error {
 	if pair == nil || pair.Local == nil || pair.Remote == nil {
 		return ErrUnverifiedPath
 	}
-	if pair.Local.Protocol != webrtc.ICEProtocolUDP || pair.Remote.Protocol != webrtc.ICEProtocolUDP {
+	if policy.TCPOnly {
+		if pair.Local.Protocol != webrtc.ICEProtocolTCP || pair.Remote.Protocol != webrtc.ICEProtocolTCP {
+			return fmt.Errorf("%w: non-TCP selected candidate pair in TCP-only mode", ErrProhibitedCandidate)
+		}
+	} else if pair.Local.Protocol != webrtc.ICEProtocolUDP || pair.Remote.Protocol != webrtc.ICEProtocolUDP {
 		return fmt.Errorf("%w: non-UDP selected candidate pair", ErrProhibitedCandidate)
 	}
-	if !isAllowedWebRTCCandidateType(pair.Local.Typ, allowRelay) || !isAllowedWebRTCCandidateType(pair.Remote.Typ, allowRelay) {
+	if !isAllowedWebRTCCandidateType(pair.Local.Typ, policy.AllowRelay) || !isAllowedWebRTCCandidateType(pair.Remote.Typ, policy.AllowRelay) {
 		return fmt.Errorf(
 			"%w: selected pair (%s, %s)",
 			ErrProhibitedCandidate,

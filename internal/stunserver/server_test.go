@@ -9,7 +9,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"testing"
@@ -301,6 +303,204 @@ func TestSTUNSDTLS13UDPDefaultAndInsecureOptIn(t *testing.T) {
 		st := srv.Stats()
 		if st.BindingResponses != 1 || st.OversizedPackets != 1 || st.MalformedPackets != 1 {
 			t.Fatalf("unexpected insecure STUN stats: %+v", st)
+		}
+	})
+}
+
+func readFramedSTUNOverStream(t *testing.T, conn net.Conn) stun.Message {
+	t.Helper()
+	var hdr [20]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		t.Fatalf("read STUN header over stream: %v", err)
+	}
+	bodyLen := int(binary.BigEndian.Uint16(hdr[2:4]))
+	raw := make([]byte, 20+bodyLen)
+	copy(raw[:20], hdr[:])
+	if bodyLen > 0 {
+		if _, err := io.ReadFull(conn, raw[20:]); err != nil {
+			t.Fatalf("read STUN body over stream: %v", err)
+		}
+	}
+	var msg stun.Message
+	if err := stun.Decode(raw, &msg); err != nil {
+		t.Fatalf("decode STUN message over stream: %v", err)
+	}
+	return msg
+}
+
+func TestSTUNSTLS13TCPOnlyAndInsecureTCP(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Rejects plaintext TCP without AllowInsecure", func(t *testing.T) {
+		t.Parallel()
+		_, err := stunserver.New(stunserver.Config{
+			TCPListenAddr: "127.0.0.1:0",
+		})
+		if !errors.Is(err, stunserver.ErrInsecureSTUNProhibited) {
+			t.Fatalf("expected ErrInsecureSTUNProhibited, got %v", err)
+		}
+	})
+
+	t.Run("TLS 1.3 TCP STUNS binds zero UDP sockets, rejects TLS 1.2 and TURN Allocate", func(t *testing.T) {
+		t.Parallel()
+		srvTLS, roots := makeTestSTUNSCert(t)
+		srv, err := stunserver.New(stunserver.Config{
+			TLSListenAddr: "127.0.0.1:0",
+			TLSConfig:     srvTLS,
+			PerIPRPS:      200,
+			PerIPBurst:    400,
+		})
+		if err != nil {
+			t.Fatalf("start TLS 1.3 TCP stuns server: %v", err)
+		}
+		defer srv.Close()
+
+		if srv.DTLSAddr() != nil || srv.UDPAddr() != nil || srv.TCPAddr() != nil || srv.TLSAddr() == nil {
+			t.Fatalf("expected TLS/TCP only (zero UDP), got dtls=%v udp=%v tcp=%v tls=%v",
+				srv.DTLSAddr(), srv.UDPAddr(), srv.TCPAddr(), srv.TLSAddr())
+		}
+
+		// TLS 1.2 client MUST be rejected.
+		if c12, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", srv.TLSAddr().String(), &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS12,
+			RootCAs:    roots,
+			ServerName: "127.0.0.1",
+		}); err == nil {
+			_ = c12.Close()
+			t.Fatal("expected TLS 1.2 connection to TLS 1.3 STUNS server to fail")
+		}
+
+		// TLS 1.3 client succeeds (even with split writes across TCP stream).
+		c13, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", srv.TLSAddr().String(), &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			MaxVersion: tls.VersionTLS13,
+			RootCAs:    roots,
+			ServerName: "127.0.0.1",
+		})
+		if err != nil {
+			t.Fatalf("TLS 1.3 dial failed: %v", err)
+		}
+		defer c13.Close()
+		_ = c13.SetDeadline(time.Now().Add(3 * time.Second))
+
+		req := stun.MustBuild(stun.TransactionID, stun.BindingRequest, stun.Fingerprint)
+		if _, err := c13.Write(req.Raw[:10]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c13.Write(req.Raw[10:]); err != nil {
+			t.Fatal(err)
+		}
+
+		resp := readFramedSTUNOverStream(t, c13)
+		if resp.Type != stun.BindingSuccess || resp.TransactionID != req.TransactionID {
+			t.Fatalf("got %v, want BindingSuccess", resp.Type)
+		}
+		var xorAddr stun.XORMappedAddress
+		if err := xorAddr.GetFrom(&resp); err != nil {
+			t.Fatalf("GetFrom XORMappedAddress: %v", err)
+		}
+		localTCP := c13.LocalAddr().(*net.TCPAddr)
+		if !xorAddr.IP.Equal(localTCP.IP) || xorAddr.Port != localTCP.Port {
+			t.Fatalf("mapped addr = %s:%d; want %s:%d", xorAddr.IP, xorAddr.Port, localTCP.IP, localTCP.Port)
+		}
+
+		// TURN Allocate over TLS 1.3 STUNS-only server MUST return ClassErrorResponse.
+		allocReq := stun.MustBuild(stun.TransactionID, stun.NewType(stun.MethodAllocate, stun.ClassRequest), stun.Fingerprint)
+		if _, err := c13.Write(allocReq.Raw); err != nil {
+			t.Fatal(err)
+		}
+		errResp := readFramedSTUNOverStream(t, c13)
+		if errResp.Type.Class != stun.ClassErrorResponse {
+			t.Fatalf("expected ClassErrorResponse for TURN Allocate, got %v", errResp.Type)
+		}
+
+		st := srv.Stats()
+		if st.BindingResponses != 1 || st.UnsupportedMethods != 1 {
+			t.Fatalf("unexpected TLS/TCP STUNS stats: %+v", st)
+		}
+	})
+
+	t.Run("TLS 1.3 TCP STUNS IPv6 binding", func(t *testing.T) {
+		t.Parallel()
+		ln6, err := net.Listen("tcp6", "[::1]:0")
+		if err != nil {
+			t.Skipf("IPv6 loopback unavailable: %v", err)
+		}
+		srvTLS, roots := makeTestSTUNSCert(t)
+		srv, err := stunserver.New(stunserver.Config{
+			TLSListener: ln6,
+			TLSConfig:   srvTLS,
+		})
+		if err != nil {
+			_ = ln6.Close()
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		if srv.DTLSAddr() != nil || srv.UDPAddr() != nil || srv.TLSAddr() == nil {
+			t.Fatalf("expected IPv6 TLS/TCP only, got dtls=%v udp=%v tls=%v", srv.DTLSAddr(), srv.UDPAddr(), srv.TLSAddr())
+		}
+
+		c6, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp6", srv.TLSAddr().String(), &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			MaxVersion: tls.VersionTLS13,
+			RootCAs:    roots,
+			ServerName: "::1",
+		})
+		if err != nil {
+			t.Fatalf("IPv6 TLS 1.3 dial failed: %v", err)
+		}
+		defer c6.Close()
+		_ = c6.SetDeadline(time.Now().Add(3 * time.Second))
+
+		req := stun.MustBuild(stun.TransactionID, stun.BindingRequest, stun.Fingerprint)
+		if _, err := c6.Write(req.Raw); err != nil {
+			t.Fatal(err)
+		}
+		resp := readFramedSTUNOverStream(t, c6)
+		if resp.Type != stun.BindingSuccess {
+			t.Fatalf("got %v, want BindingSuccess", resp.Type)
+		}
+		var xorAddr stun.XORMappedAddress
+		if err := xorAddr.GetFrom(&resp); err != nil {
+			t.Fatal(err)
+		}
+		localTCP := c6.LocalAddr().(*net.TCPAddr)
+		if !xorAddr.IP.Equal(localTCP.IP) || xorAddr.Port != localTCP.Port {
+			t.Fatalf("ipv6 tcp mapped = [%s]:%d; want [%s]:%d", xorAddr.IP, xorAddr.Port, localTCP.IP, localTCP.Port)
+		}
+	})
+
+	t.Run("Opt-in AllowInsecure plaintext TCP STUN with zero UDP", func(t *testing.T) {
+		t.Parallel()
+		srv, err := stunserver.New(stunserver.Config{
+			AllowInsecure: true,
+			TCPListenAddr: "127.0.0.1:0",
+		})
+		if err != nil {
+			t.Fatalf("start insecure TCP stun server: %v", err)
+		}
+		defer srv.Close()
+
+		if srv.DTLSAddr() != nil || srv.UDPAddr() != nil || srv.TCPAddr() == nil {
+			t.Fatalf("expected plaintext TCP only, got dtls=%v udp=%v tcp=%v", srv.DTLSAddr(), srv.UDPAddr(), srv.TCPAddr())
+		}
+
+		conn, err := net.DialTimeout("tcp4", srv.TCPAddr().String(), 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+		req := stun.MustBuild(stun.TransactionID, stun.BindingRequest, stun.Fingerprint)
+		if _, err := conn.Write(req.Raw); err != nil {
+			t.Fatal(err)
+		}
+		resp := readFramedSTUNOverStream(t, conn)
+		if resp.Type != stun.BindingSuccess {
+			t.Fatalf("got %v, want BindingSuccess", resp.Type)
 		}
 	})
 }

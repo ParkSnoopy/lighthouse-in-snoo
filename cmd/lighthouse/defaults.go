@@ -7,9 +7,6 @@ import (
 	"strings"
 )
 
-// appVersion is the release version reported by --version (matching VERSION).
-var appVersion = "0.1.0"
-
 // loadDotEnvIfPresent reads optional LIGHTHOUSE_* runtime variables from a local
 // .env file without overriding variables already set in the process environment.
 func loadDotEnvIfPresent(path string) {

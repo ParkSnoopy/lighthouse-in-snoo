@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -754,6 +756,86 @@ func probeSTUNSOverDTLS13(
 	}
 	if resp.Type != stun.BindingSuccess || resp.TransactionID != req.TransactionID {
 		return nil, fmt.Errorf("peer: unexpected STUNS response %v", resp.Type)
+	}
+	var mapped stun.XORMappedAddress
+	if err := mapped.GetFrom(&resp); err != nil {
+		return nil, err
+	}
+	return &mapped, nil
+}
+
+// probeSTUNSOverTLS13TCP performs an RFC 8489 / RFC 7350 STUN Binding probe
+// strictly over TLS 1.3 / TCP (zero UDP sockets), verifying server certificate trust.
+func probeSTUNSOverTLS13TCP(
+	ctx context.Context,
+	uri *stun.URI,
+	tlsCfg *tls.Config,
+) (*stun.XORMappedAddress, error) {
+	if uri == nil {
+		return nil, errors.New("peer: no STUNS/TURNS URI configured")
+	}
+
+	targetAddr := net.JoinHostPort(uri.Host, strconv.Itoa(uri.Port))
+	var dialer net.Dialer
+	rawConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer rawConn.Close()
+
+	tcfg := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+		ServerName: uri.Host,
+	}
+	if tlsCfg != nil {
+		tcfg = tlsCfg.Clone()
+		tcfg.MinVersion = tls.VersionTLS13
+		tcfg.MaxVersion = tls.VersionTLS13
+		tcfg.ServerName = uri.Host
+	}
+
+	tlsConn := tls.Client(rawConn, tcfg)
+	defer tlsConn.Close()
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = tlsConn.SetDeadline(dl)
+	}
+
+	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest, stun.Fingerprint)
+	if _, err := tlsConn.Write(req.Raw); err != nil {
+		return nil, err
+	}
+
+	var hdr [20]byte
+	if _, err := io.ReadFull(tlsConn, hdr[:]); err != nil {
+		return nil, err
+	}
+	const stunMagicCookie uint32 = 0x2112A442
+	if hdr[0]&0xC0 != 0 || binary.BigEndian.Uint32(hdr[4:8]) != stunMagicCookie {
+		return nil, errors.New("peer: malformed STUNS TLS/TCP response header")
+	}
+	bodyLen := int(binary.BigEndian.Uint16(hdr[2:4]))
+	if bodyLen%4 != 0 || bodyLen > 1500 {
+		return nil, fmt.Errorf("peer: invalid STUNS TLS/TCP response length %d", bodyLen)
+	}
+	full := make([]byte, 20+bodyLen)
+	copy(full[:20], hdr[:])
+	if bodyLen > 0 {
+		if _, err := io.ReadFull(tlsConn, full[20:]); err != nil {
+			return nil, err
+		}
+	}
+
+	var resp stun.Message
+	if err := stun.Decode(full, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Type != stun.BindingSuccess || resp.TransactionID != req.TransactionID {
+		return nil, fmt.Errorf("peer: unexpected STUNS TLS/TCP response %v", resp.Type)
 	}
 	var mapped stun.XORMappedAddress
 	if err := mapped.GetFrom(&resp); err != nil {

@@ -120,3 +120,79 @@ func TestSDPAndCandidatePolicyValidation(t *testing.T) {
 		t.Fatalf("expected IPv6 link-local zoned pair to be allowed, got %v", err)
 	}
 }
+
+func TestTCPOnlyPolicyValidation(t *testing.T) {
+	t.Parallel()
+
+	// In TCP-only mode, stuns:/turns: default to TCP and ?transport=udp is rejected.
+	for _, tc := range []struct {
+		uri           string
+		allowInsecure bool
+		wantErr       error
+		wantProto     stun.ProtoType
+	}{
+		{"stuns:hub.example.com:5349", false, nil, stun.ProtoTypeTCP},
+		{"stuns:hub.example.com:5349?transport=tcp", false, nil, stun.ProtoTypeTCP},
+		{"turns:hub.example.com:5349", false, nil, stun.ProtoTypeTCP},
+		{"stuns:hub.example.com:5349?transport=udp", false, peer.ErrInvalidICEConfig, 0},
+		{"turns:hub.example.com:5349?transport=udp", false, peer.ErrInvalidICEConfig, 0},
+		{"stun:hub.example.com:3478", false, peer.ErrInsecureICEProhibited, 0},
+		{"stun:hub.example.com:3478", true, nil, stun.ProtoTypeTCP},
+	} {
+		parsed, err := peer.ValidateICEServerURIWithMode(tc.uri, tc.allowInsecure, true)
+		if tc.wantErr != nil {
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("URI %q (tcpOnly=true): got err=%v, want %v", tc.uri, err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("URI %q (tcpOnly=true): unexpected err=%v", tc.uri, err)
+		}
+		if parsed.Proto != tc.wantProto {
+			t.Fatalf("URI %q (tcpOnly=true): proto=%s, want %s", tc.uri, parsed.Proto, tc.wantProto)
+		}
+	}
+
+	hubEP := []net.UDPAddr{{IP: net.ParseIP("203.0.113.10"), Port: 5349}}
+	hubIP := []net.IP{net.ParseIP("203.0.113.10")}
+	tcpPolicy := peer.CandidatePolicy{TCPOnly: true}
+
+	// TCP host candidates (passive & active) are allowed in TCP-only mode.
+	for _, cand := range []string{
+		"candidate:1 1 TCP 2105524479 192.0.2.10 9 typ host tcptype active",
+		"candidate:2 1 TCP 2105524478 192.0.2.10 42000 typ host tcptype passive",
+	} {
+		if err := peer.ValidateTrickleCandidateWithCandidatePolicy(protocol.CandidateBody{Candidate: cand}, hubEP, hubIP, tcpPolicy); err != nil {
+			t.Fatalf("expected TCP candidate allowed in TCP-only mode, got %v", err)
+		}
+	}
+
+	// UDP candidates and hub TCP endpoints MUST be rejected in TCP-only mode.
+	if err := peer.ValidateTrickleCandidateWithCandidatePolicy(protocol.CandidateBody{
+		Candidate: "candidate:3 1 UDP 2130706431 192.0.2.10 50000 typ host",
+	}, hubEP, hubIP, tcpPolicy); !errors.Is(err, peer.ErrProhibitedCandidate) {
+		t.Fatalf("expected ErrProhibitedCandidate for UDP candidate in TCP-only mode, got %v", err)
+	}
+	if err := peer.ValidateTrickleCandidateWithCandidatePolicy(protocol.CandidateBody{
+		Candidate: "candidate:4 1 TCP 2105524478 203.0.113.10 5349 typ host tcptype passive",
+	}, hubEP, nil, tcpPolicy); !errors.Is(err, peer.ErrProhibitedEndpoint) {
+		t.Fatalf("expected ErrProhibitedEndpoint for hub TCP endpoint, got %v", err)
+	}
+
+	// Selected pair validation enforces TCP-TCP in TCP-only mode and rejects UDP pairs.
+	tcpPair := &webrtc.ICECandidatePair{
+		Local:  &webrtc.ICECandidate{Protocol: webrtc.ICEProtocolTCP, Typ: webrtc.ICECandidateTypeHost, Address: "192.0.2.1", Port: 41000},
+		Remote: &webrtc.ICECandidate{Protocol: webrtc.ICEProtocolTCP, Typ: webrtc.ICECandidateTypeHost, Address: "192.0.2.2", Port: 42000},
+	}
+	if err := peer.ValidateSelectedPairWithCandidatePolicy(tcpPair, hubEP, hubIP, tcpPolicy); err != nil {
+		t.Fatalf("expected TCP pair allowed in TCP-only mode, got %v", err)
+	}
+	udpPair := &webrtc.ICECandidatePair{
+		Local:  &webrtc.ICECandidate{Protocol: webrtc.ICEProtocolUDP, Typ: webrtc.ICECandidateTypeHost, Address: "192.0.2.1", Port: 41000},
+		Remote: &webrtc.ICECandidate{Protocol: webrtc.ICEProtocolUDP, Typ: webrtc.ICECandidateTypeHost, Address: "192.0.2.2", Port: 42000},
+	}
+	if err := peer.ValidateSelectedPairWithCandidatePolicy(udpPair, hubEP, hubIP, tcpPolicy); !errors.Is(err, peer.ErrProhibitedCandidate) {
+		t.Fatalf("expected ErrProhibitedCandidate for UDP selected pair in TCP-only mode, got %v", err)
+	}
+}

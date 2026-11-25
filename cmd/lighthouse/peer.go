@@ -22,33 +22,36 @@ import (
 
 func newPeerCommand() *cli.Command {
 	var (
-		keyPath    string
-		genKey     bool
-		algoStr    string
-		rsaBits    int
-		printID    bool
-		memPath    string
-		policyPath string
-		hubURL     string
-		hubOrigin  string
-		caPath     string
-		stunURI    string
-		turnURI    string
-		turnUser   string
-		turnPass   string
-		insecure   bool
-		targetID   string
-		packetCh   bool
+		keyPath       string
+		genKey        bool
+		algoStr       string
+		rsaBits       int
+		printID       bool
+		memPath       string
+		policyPath    string
+		hubURL        string
+		hubOrigin     string
+		caPath        string
+		stunURI       string
+		turnURI       string
+		turnUser      string
+		turnPass      string
+		tcpOnly       bool
+		tcpListenAddr string
+		insecure      bool
+		targetID      string
+		packetCh      bool
 	)
 
 	cmd := &cli.Command{
 		Name:       "peer",
 		ShortAbout: "Run the DTLS 1.3 WebRTC peer client",
-		LongAbout:  "Authenticate to a Lighthouse hub over TLS 1.3 WSS, use DTLS 1.3 / UDP stuns:/turns: by default (or opt in to plaintext stun:/turn: with --insecure), and establish DTLS 1.3 SCTP DataChannel sessions.",
+		LongAbout:  "Authenticate to a Lighthouse hub over TLS 1.3 WSS, use DTLS 1.3 / UDP stuns:/turns: by default (or --tcp-only to disable UDP and use ICE-TCP + TLS 1.3/TCP STUNS; plaintext stun:/turn: require --insecure), and establish DTLS 1.3 SCTP DataChannel sessions.",
 		Examples: []string{
 			"lighthouse peer --key peer.key --gen-key --print-id",
 			"lighthouse peer --key peer-b.key --membership peer-b.json --policy policy.json --hub wss://hub.example.com/v1/signal --stun stuns:hub.example.com:5349",
 			"lighthouse peer --key peer-a.key --membership peer-a.json --policy policy.json --turn turns:hub.example.com:5349 --turn-user u --turn-pass p --connect <PEER_B_ID>",
+			"lighthouse peer --tcp-only --key peer-a.key --policy policy.json --stun stuns:hub.example.com:5349 --connect <PEER_B_ID>",
 			"lighthouse peer --insecure --key peer-a.key --policy policy.json --stun stun:hub.example.com:3478 --connect <PEER_B_ID>",
 		},
 		Run: func(cctx *cli.Context) error {
@@ -147,6 +150,8 @@ func newPeerCommand() *cli.Command {
 				TURNUsername:        turnUser,
 				TURNCredential:      turnPass,
 				AllowInsecureICE:    insecure,
+				TCPOnly:             tcpOnly,
+				ICETCPListenAddr:    tcpListenAddr,
 				EnablePacketChannel: packetCh,
 				Logger:              logger,
 				OnSession: func(s *peer.Session) {
@@ -333,6 +338,19 @@ func newPeerCommand() *cli.Command {
 		ShortHelp: "Password for TURNS/TURN authentication",
 		LongHelp:  "Password or HMAC credential sent during RFC 8656 TURNS/TURN authentication",
 		EnvVar:    "LIGHTHOUSE_TURN_PASS",
+	})
+	cmd.BoolOpt(&tcpOnly, cli.Option{
+		Long:      "tcp-only",
+		ShortHelp: "Disable UDP; use ICE-TCP and TLS 1.3/TCP STUNS only",
+		LongHelp:  "Opt in to sole-TCP operation: disable all UDP sockets, reject UDP candidates, and use ICE-TCP with TLS 1.3/TCP STUNS",
+		EnvVar:    "LIGHTHOUSE_TCP_ONLY",
+	})
+	cmd.StringOpt(&tcpListenAddr, cli.Option{
+		Long:      "tcp-listen-addr",
+		ValueName: "ADDR",
+		ShortHelp: "Passive ICE-TCP listen address (with --tcp-only)",
+		LongHelp:  "Optional local TCP listen address for passive ICE-TCP candidates when --tcp-only is enabled (default :0)",
+		EnvVar:    "LIGHTHOUSE_TCP_LISTEN_ADDR",
 	})
 	cmd.BoolOpt(&insecure, cli.Option{
 		Long:      "insecure",

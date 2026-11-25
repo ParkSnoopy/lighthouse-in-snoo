@@ -146,3 +146,67 @@ func TestTURNSDTLS13UDPAndInsecureOptIn(t *testing.T) {
 		t.Fatalf("AllocationCount = %d; want 1", srv.AllocationCount())
 	}
 }
+
+func TestTURNSTCPOnlyTLS13AndInsecureTCP(t *testing.T) {
+	t.Parallel()
+
+	// Reject plaintext TCP TURN without AllowInsecure=true.
+	if _, err := turnserver.New(turnserver.Config{
+		TCPListenAddr: "127.0.0.1:0",
+		SharedSecret:  "top-secret",
+	}); !errors.Is(err, turnserver.ErrInsecureTURNProhibited) {
+		t.Fatalf("expected ErrInsecureTURNProhibited, got %v", err)
+	}
+
+	srvTLS, roots := makeTestTURNSCert(t)
+	srv, err := turnserver.New(turnserver.Config{
+		TLSListenAddr:    "127.0.0.1:0",
+		TLSConfig:        srvTLS,
+		SharedSecret:     "turn-tcp-only-secret",
+		Realm:            "lighthouse",
+		RelayBindAddress: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("turnserver.New TLS/TCP only: %v", err)
+	}
+	defer srv.Close()
+
+	if srv.DTLSAddr() != nil || srv.UDPAddr() != nil || srv.TLSAddr() == nil {
+		t.Fatalf("expected zero UDP listeners in TLS/TCP mode, got dtls=%v udp=%v tls=%v",
+			srv.DTLSAddr(), srv.UDPAddr(), srv.TLSAddr())
+	}
+
+	tlsConn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp4", srv.TLSAddr().String(), &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+		RootCAs:    roots,
+		ServerName: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("TLS 1.3 dial to TURNS failed: %v", err)
+	}
+	defer tlsConn.Close()
+
+	user, pass, err := turnserver.GenerateCredentials("turn-tcp-only-secret", "peer-tcp", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := turn.NewClient(&turn.ClientConfig{
+		STUNServerAddr: srv.TLSAddr().String(),
+		Conn:           turn.NewSTUNConn(tlsConn),
+		Username:       user,
+		Password:       pass,
+		Realm:          "lighthouse",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := client.SendBindingRequest()
+	if err != nil || mapped == nil {
+		t.Fatalf("SendBindingRequest over TLS 1.3/TCP TURNS failed: mapped=%v err=%v", mapped, err)
+	}
+}

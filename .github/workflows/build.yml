@@ -38,10 +38,9 @@ jobs:
       - name: Resolve and Verify Version Alignment
         id: version
         run: |
-          FILE_VER="$(tr -d '[:space:]' < VERSION)"
           BIN_VER="$(./bin/lighthouse --version | awk '{print $2}')"
-          if [ "$FILE_VER" != "$BIN_VER" ]; then
-            echo "VERSION ($FILE_VER) != lighthouse --version ($BIN_VER)" >&2
+          if [ -z "$BIN_VER" ]; then
+            echo "failed to resolve version from lighthouse --version" >&2
             exit 1
           fi
           if ! grep -Fq "v${BIN_VER}" README.md; then
@@ -99,8 +98,8 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ needs.verify.outputs.version }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -1,6 +1,6 @@
 # Lighthouse (v0.1.0)
 
-Lighthouse (`v0.1.0`, reported by `lighthouse --version`) coordinates authenticated, end-to-end encrypted WebRTC DataChannel connections through a single-container `linux/amd64` hub. Control-plane signaling runs over TLS 1.3 WSS (`:8443/tcp`), address discovery and optional relay run over **DTLS 1.3 / UDP** `stuns:`/`turns:` (`:5349/udp`) by default, and peer DataChannels run over SCTP protected end to end by DTLS 1.3 over UDP. Plaintext `stun:` and `turn:` require explicit opt-in via `--insecure`.
+Lighthouse (`v0.1.0`, reported by `lighthouse --version`) coordinates authenticated, end-to-end encrypted WebRTC DataChannel connections through a single-container `linux/amd64` hub. Control-plane signaling runs over TLS 1.3 WSS (`:8443/tcp`), address discovery and optional relay run over **DTLS 1.3 / UDP** `stuns:`/`turns:` (`:5349/udp`) by default, and peer DataChannels run over SCTP protected end to end by DTLS 1.3 over UDP. For TCP-only networks, pass `--tcp-only` to disable UDP completely and run TLS 1.3 / TCP STUNS and ICE-TCP. Plaintext `stun:` and `turn:` require explicit opt-in via `--insecure`.
 
 ## Architecture
 
@@ -24,6 +24,7 @@ flowchart TB
 ### Design Guarantees
 
 - **Encrypted UDP-First ICE (`stuns:` / `turns:`)**: Both `lighthouse hub` and `lighthouse peer` enforce encrypted `stuns:` and `turns:` over **DTLS 1.3 / UDP** (`:5349/udp`) by default, prioritizing UDP over TCP. Plaintext `stun:` and `turn:` are rejected unless `--insecure` is explicitly passed.
+- **Opt-In TCP-Only Mode (`--tcp-only`)**: When UDP is unavailable, `--tcp-only` (`LIGHTHOUSE_TCP_ONLY=true`) disables all UDP sockets on both hub and peers, serving STUNS/TURNS over TLS 1.3 / TCP (`:5349/tcp`) and negotiating end-to-end DTLS 1.3 DataChannels over ICE-TCP.
 - **Independent Peer Authentication**: Peers authenticate each other using persistent identity keys (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) verified against local pinned keys or offline-authority-signed membership records, independent of hub assertions.
 - **End-to-End DTLS 1.3 Only**: Peer DataChannels enforce DTLS 1.3 (`0xFEFC`) with ephemeral ECDHE forward secrecy, AEAD record protection, replay window enforcement, and identity-authenticated SHA-256 certificate fingerprints. The hub never instantiates a WebRTC `PeerConnection` or terminates peer DTLS sessions.
 - **Fail-Closed Policy Enforcement**: Direct UDP `host`/`srflx`/`prflx` candidates are used by default; `relay` candidates are rejected unless a validated `turns:` (or `--insecure` `turn:`) server is configured.
@@ -44,7 +45,7 @@ flowchart TB
 
 ### 1. Build Binary
 
-Build directly with Go or `Makefile` (only `VERSION` is embedded at build time; all `LIGHTHOUSE_*` environment variables and optional local `.env` entries are read exclusively at runtime):
+Build directly with Go or `Makefile` (`cmd/lighthouse/version.go` is the single source of truth for the release version; all `LIGHTHOUSE_*` environment variables and optional local `.env` entries are read exclusively at runtime):
 
 ```bash
 # Static linux/amd64 build
@@ -154,6 +155,13 @@ Use authenticated DTLS 1.3 / UDP `turns:` relay when peers sit behind restrictiv
   --connect <PEER_B_ID>
 ```
 
+For sole-TCP environments where UDP is blocked, enable `--tcp-only` on both hub and peers (disables all UDP sockets):
+
+```bash
+./bin/lighthouse hub --tcp-only --stuns-addr :5349 --policy config/policy.json --tls-cert tls.crt --tls-key tls.key
+./bin/lighthouse peer --tcp-only --key peer-a.key --policy config/policy.json --stun stuns:hub.example.com:5349 --connect <PEER_B_ID>
+```
+
 Plaintext `stun:` and `turn:` URIs require explicit `--insecure`:
 
 ```bash
@@ -167,9 +175,10 @@ Plaintext `stun:` and `turn:` URIs require explicit `--insecure`:
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
 | `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for TLS 1.3 `/healthz` and WSS `/v1/signal` |
-| `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | UDP listen address for DTLS 1.3 STUNS (and TURNS when credentials are set) |
-| `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext UDP STUN/TURN address; requires `--insecure` (`:3478` when `--insecure` is set) |
-| `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Opt in to unencrypted UDP `stun:`/`turn:` listener on `--stun-addr` |
+| `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | Listen address for encrypted STUNS/TURNS (DTLS 1.3/UDP default; TLS 1.3/TCP with `--tcp-only`) |
+| `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext STUN/TURN address; requires `--insecure` (`:3478` when `--insecure` is set) |
+| `--tcp-only` | `LIGHTHOUSE_TCP_ONLY` | `false` | Disable UDP completely; serve STUNS/TURNS over TLS 1.3 / TCP only |
+| `--insecure` | `LIGHTHOUSE_INSECURE` | `false` | Opt in to unencrypted `stun:`/`turn:` listener on `--stun-addr` |
 | `--turn-secret` | `LIGHTHOUSE_TURN_SECRET` | *(disabled)* | Shared secret enabling authenticated DTLS 1.3 TURNS (HMAC TURN REST credentials) |
 | `--turn-users` | `LIGHTHOUSE_TURN_USERS` | *(disabled)* | Static `user=pass[,user=pass]` credentials enabling authenticated DTLS 1.3 TURNS |
 | `--turn-realm` | `LIGHTHOUSE_TURN_REALM` | `lighthouse` | RFC 8656 TURN authentication realm |

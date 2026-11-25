@@ -64,9 +64,11 @@ type Config struct {
 	TURNCredential      string                    // Password/credential for turns:/turn: server.
 	ICEServers          []ICEServerConfig         // Optional additional STUNS/TURNS servers.
 	AllowInsecureICE    bool                      // Explicit opt-in required to allow plaintext stun:/turn: URIs.
-	AllowRelay          bool                      // Automatically enabled when a validated turns:/turn: server is configured.
+	TCPOnly             bool                      // Explicit opt-in to fully disable UDP and use ICE-TCP + TLS 1.3/TCP STUNS only.
+	ICETCPListenAddr    string                    // Optional TCP listen address for passive ICE-TCP candidates when TCPOnly=true (default ":0").
+	AllowRelay          bool                      // Automatically enabled when a validated turns:/turn: server is configured (UDP mode).
 	ICETransportPolicy  webrtc.ICETransportPolicy // Optional ICE transport policy (default ICETransportPolicyAll).
-	NetworkTypes        []webrtc.NetworkType      // Defaults to [UDP4, UDP6].
+	NetworkTypes        []webrtc.NetworkType      // Defaults to [UDP4, UDP6] (or [TCP4, TCP6] when TCPOnly=true).
 	IncludeLoopback     bool
 	VNet                transport.Net // Optional virtual network stack (pion/transport/v5/vnet).
 	PionLoggerFactory   logging.LoggerFactory
@@ -118,6 +120,8 @@ type Client struct {
 	dtlsUDPTargets      map[string]string
 	tlsTCPTargets       map[string]string
 	allowRelay          bool
+	tcpMux              webrtc.ICETCPMux
+	tcpAddr             net.Addr
 	prohibitedEndpoints []net.UDPAddr
 	prohibitedIPs       []net.IP
 
@@ -153,14 +157,28 @@ func NewClient(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	allowRelay := cfg.AllowRelay || hasTURN
-	for _, nt := range cfg.NetworkTypes {
-		if nt != webrtc.NetworkTypeUDP4 && nt != webrtc.NetworkTypeUDP6 {
-			return nil, fmt.Errorf("%w: non-UDP network type %s", ErrInvalidICEConfig, nt.String())
+	allowRelay := (cfg.AllowRelay || hasTURN) && !cfg.TCPOnly
+	if cfg.TCPOnly {
+		if cfg.ICETransportPolicy == webrtc.ICETransportPolicyRelay {
+			return nil, fmt.Errorf("%w: relay-only policy is unsupported in TCP-only mode", ErrInvalidICEConfig)
 		}
-	}
-	if len(cfg.NetworkTypes) == 0 {
-		cfg.NetworkTypes = []webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6}
+		for _, nt := range cfg.NetworkTypes {
+			if nt != webrtc.NetworkTypeTCP4 && nt != webrtc.NetworkTypeTCP6 {
+				return nil, fmt.Errorf("%w: UDP network type %s prohibited when TCPOnly=true", ErrInvalidICEConfig, nt.String())
+			}
+		}
+		if len(cfg.NetworkTypes) == 0 {
+			cfg.NetworkTypes = []webrtc.NetworkType{webrtc.NetworkTypeTCP4, webrtc.NetworkTypeTCP6}
+		}
+	} else {
+		for _, nt := range cfg.NetworkTypes {
+			if nt != webrtc.NetworkTypeUDP4 && nt != webrtc.NetworkTypeUDP6 {
+				return nil, fmt.Errorf("%w: non-UDP network type %s", ErrInvalidICEConfig, nt.String())
+			}
+		}
+		if len(cfg.NetworkTypes) == 0 {
+			cfg.NetworkTypes = []webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6}
+		}
 	}
 	if cfg.OfferToConnectedTimeout <= 0 {
 		cfg.OfferToConnectedTimeout = 30 * time.Second
@@ -206,6 +224,25 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
+	var (
+		tcpMux  webrtc.ICETCPMux
+		tcpAddr net.Addr
+	)
+	if cfg.TCPOnly {
+		tcpLn, listenErr := listenICETCP(cfg)
+		if listenErr != nil {
+			return nil, fmt.Errorf("peer: listen ICE-TCP: %w", listenErr)
+		}
+		tcpAddr = tcpLn.Addr()
+		lf := cfg.PionLoggerFactory
+		if lf == nil {
+			dlf := logging.NewDefaultLoggerFactory()
+			dlf.DefaultLogLevel = logging.LogLevelError
+			lf = dlf
+		}
+		tcpMux = webrtc.NewICETCPMux(lf.NewLogger("ice-tcp"), tcpLn, 8)
+	}
+
 	prohibitedEPs, prohibitedIPs := deriveProhibitedHubTargets(cfg, resolvedICE, allowRelay)
 
 	c := &Client{
@@ -218,6 +255,8 @@ func NewClient(cfg Config) (*Client, error) {
 		dtlsUDPTargets:      dtlsTargets,
 		tlsTCPTargets:       tlsTCPTargets,
 		allowRelay:          allowRelay,
+		tcpMux:              tcpMux,
+		tcpAddr:             tcpAddr,
 		prohibitedEndpoints: prohibitedEPs,
 		prohibitedIPs:       prohibitedIPs,
 		vnet:                cfg.VNet,
@@ -265,7 +304,7 @@ func compileICEServers(cfg Config) (
 		if strings.TrimSpace(entry.URI) == "" {
 			continue
 		}
-		parsed, vErr := ValidateICEServerURI(entry.URI, cfg.AllowInsecureICE)
+		parsed, vErr := ValidateICEServerURIWithMode(entry.URI, cfg.AllowInsecureICE, cfg.TCPOnly)
 		if vErr != nil {
 			return nil, nil, nil, nil, false, vErr
 		}
@@ -286,6 +325,15 @@ func compileICEServers(cfg Config) (
 			Username:   entry.Username,
 			Credential: entry.Credential,
 		})
+
+		if cfg.TCPOnly {
+			// In TCP-only mode, zero UDP sockets are created; ICE-TCP runs directly over TCP
+			// and STUNS/TURNS probes use TLS 1.3 over TCP via ProbeSTUNS.
+			if parsed.IsSecure() {
+				tlsTCPTargets[hostPort] = parsed.Host
+			}
+			continue
+		}
 
 		var srv webrtc.ICEServer
 		switch {
@@ -416,9 +464,51 @@ func gatherLocalHostIPs() []net.IP {
 	return out
 }
 
-// PeerID returns this client's persistent Ed25519 peer_id.
+// PeerID returns this client's persistent peer_id.
 func (c *Client) PeerID() string {
 	return c.cfg.KeyPair.PeerID
+}
+
+// ICETCPAddr returns the bound passive ICE-TCP listen address when TCPOnly=true, or nil otherwise.
+func (c *Client) ICETCPAddr() net.Addr {
+	return c.tcpAddr
+}
+
+func (c *Client) candidatePolicy() CandidatePolicy {
+	return CandidatePolicy{
+		AllowRelay: c.allowRelay && !c.cfg.TCPOnly,
+		TCPOnly:    c.cfg.TCPOnly,
+	}
+}
+
+func listenICETCP(cfg Config) (net.Listener, error) {
+	var hasTCP4, hasTCP6 bool
+	for _, nt := range cfg.NetworkTypes {
+		if nt == webrtc.NetworkTypeTCP4 {
+			hasTCP4 = true
+		} else if nt == webrtc.NetworkTypeTCP6 {
+			hasTCP6 = true
+		}
+	}
+	addr := strings.TrimSpace(cfg.ICETCPListenAddr)
+	switch {
+	case addr != "" && hasTCP4 && !hasTCP6:
+		return net.Listen("tcp4", addr)
+	case addr != "" && hasTCP6 && !hasTCP4:
+		return net.Listen("tcp6", addr)
+	case addr != "":
+		return net.Listen("tcp", addr)
+	case hasTCP4 && !hasTCP6:
+		return net.Listen("tcp4", "0.0.0.0:0")
+	case hasTCP6 && !hasTCP4:
+		return net.Listen("tcp6", "[::]:0")
+	default:
+		ln, err := net.Listen("tcp", ":0")
+		if err != nil {
+			return net.Listen("tcp4", "0.0.0.0:0")
+		}
+		return ln, nil
+	}
 }
 
 // RejectedSignalCount returns how many invalid/replayed/tampered signaling envelopes were rejected.
@@ -635,8 +725,13 @@ func (c *Client) Close() error {
 		_ = conn.Close(websocket.StatusNormalClosure, "shutdown")
 	}
 
+	var tcpErr error
+	if c.tcpMux != nil {
+		tcpErr = c.tcpMux.Close()
+	}
+
 	c.wg.Wait()
-	return nil
+	return tcpErr
 }
 
 func (c *Client) sendWS(ctx context.Context, raw []byte) error {
@@ -1057,18 +1152,37 @@ func (c *Client) removeSession(sess *Session, markClosed bool) {
 	}
 }
 
-// ProbeSTUNS verifies reachability and server certificate trust of the configured DTLS 1.3 / UDP
-// STUNS (or TURNS) server by executing a STUN Binding request over DTLS 1.3 / UDP.
+// ProbeSTUNS verifies reachability and server certificate trust of the configured encrypted
+// STUNS (or TURNS) server over DTLS 1.3 / UDP by default, or TLS 1.3 / TCP when TCPOnly is set.
 func (c *Client) ProbeSTUNS(ctx context.Context) (*stun.XORMappedAddress, error) {
 	var target *stun.URI
 	for _, srv := range c.resolvedICE {
-		if srv.URI != nil && srv.URI.IsSecure() && srv.URI.Proto == stun.ProtoTypeUDP {
+		if srv.URI == nil || !srv.URI.IsSecure() {
+			continue
+		}
+		if c.cfg.TCPOnly {
+			if srv.URI.Proto == stun.ProtoTypeTCP {
+				target = srv.URI
+				break
+			}
+			continue
+		}
+		if srv.URI.Proto == stun.ProtoTypeUDP {
 			target = srv.URI
 			break
 		}
+		if target == nil {
+			target = srv.URI
+		}
 	}
 	if target == nil {
+		if c.cfg.TCPOnly {
+			return nil, errors.New("peer: no TLS/TCP stuns: or turns: server configured")
+		}
 		return nil, errors.New("peer: no DTLS/UDP stuns: or turns: server configured")
+	}
+	if c.cfg.TCPOnly || target.Proto == stun.ProtoTypeTCP {
+		return probeSTUNSOverTLS13TCP(ctx, target, c.cfg.TLSConfig)
 	}
 	c.mu.Lock()
 	vnet := c.vnet
@@ -1119,7 +1233,9 @@ func (c *Client) buildWebRTCAPI() (*webrtc.API, error) {
 	c.mu.Lock()
 	vnet := c.vnet
 	c.mu.Unlock()
-	if len(c.dtlsUDPTargets) > 0 {
+	if c.cfg.TCPOnly {
+		se.SetICETCPMux(c.tcpMux)
+	} else if len(c.dtlsUDPTargets) > 0 {
 		dtlsNet, err := newDTLS13TransportNet(vnet, c.dtlsUDPTargets, c.cfg.TLSConfig, c.cfg.PionLoggerFactory)
 		if err != nil {
 			return nil, err
@@ -1129,7 +1245,7 @@ func (c *Client) buildWebRTCAPI() (*webrtc.API, error) {
 		se.SetNet(vnet)
 	}
 
-	if len(c.tlsTCPTargets) > 0 {
+	if !c.cfg.TCPOnly && len(c.tlsTCPTargets) > 0 {
 		se.SetICEProxyDialer(&turnTCPProxyDialer{
 			tlsHosts: c.tlsTCPTargets,
 			tlsCfg:   c.cfg.TLSConfig,
@@ -1767,7 +1883,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
-		info, err := ValidateAndInspectRemoteSDPWithPolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay)
+		info, err := ValidateAndInspectRemoteSDPWithCandidatePolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy())
 		if err != nil {
 			if errors.Is(err, ErrProhibitedCandidate) || errors.Is(err, ErrProhibitedEndpoint) {
 				s.client.prohibitedRejected.Add(1)
@@ -1826,7 +1942,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
-		info, err := ValidateAndInspectRemoteSDPWithPolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay)
+		info, err := ValidateAndInspectRemoteSDPWithCandidatePolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy())
 		if err != nil {
 			if errors.Is(err, ErrProhibitedCandidate) || errors.Is(err, ErrProhibitedEndpoint) {
 				s.client.prohibitedRejected.Add(1)
@@ -1860,7 +1976,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 			return err
 		}
 		// Section 5.1 & T08: Reject prohibited candidates BEFORE buffering or installing into WebRTC!
-		if err := ValidateTrickleCandidateWithPolicy(body, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay); err != nil {
+		if err := ValidateTrickleCandidateWithCandidatePolicy(body, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy()); err != nil {
 			s.client.prohibitedRejected.Add(1)
 			return err
 		}
@@ -1973,8 +2089,12 @@ func (s *Session) onLocalICECandidate(gen uint32, pc *webrtc.PeerConnection, can
 		return
 	}
 
-	// Never emit prohibited relay or non-UDP candidates locally either.
-	if !isAllowedWebRTCCandidateType(cand.Typ, s.client.allowRelay) || cand.Protocol != webrtc.ICEProtocolUDP {
+	// Never emit prohibited relay or wrong-transport candidates locally either.
+	wantProto := webrtc.ICEProtocolUDP
+	if s.client.cfg.TCPOnly {
+		wantProto = webrtc.ICEProtocolTCP
+	}
+	if !isAllowedWebRTCCandidateType(cand.Typ, s.client.candidatePolicy().AllowRelay) || cand.Protocol != wantProto {
 		return
 	}
 	initJSON := cand.ToJSON()
@@ -2073,7 +2193,7 @@ func (s *Session) sendSignedEnvelope(ctx context.Context, gen uint32, msgType st
 }
 
 func (s *Session) onSelectedPairChange(gen uint32, pc *webrtc.PeerConnection, pair *webrtc.ICECandidatePair) {
-	if err := ValidateSelectedPairWithPolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay); err != nil {
+	if err := ValidateSelectedPairWithCandidatePolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy()); err != nil {
 		// Section 5.1: Immediately suspend traffic and close on prohibited/unverifiable path!
 		s.pathVerified.Store(false)
 		s.dataCh.setPathAllowed(false)
@@ -2163,7 +2283,7 @@ func (s *Session) markDataChannelOpen(gen uint32, pc *webrtc.PeerConnection) {
 func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 	// Double-check live selected candidate pair right before enabling user payloads.
 	pair, err := pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
-	if err != nil || ValidateSelectedPairWithPolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay) != nil {
+	if err != nil || ValidateSelectedPairWithCandidatePolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.candidatePolicy()) != nil {
 		return
 	}
 

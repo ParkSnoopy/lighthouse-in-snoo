@@ -22,6 +22,7 @@ func newHubCommand() *cli.Command {
 		httpsAddr        string
 		stunsAddr        string
 		stunAddr         string
+		tcpOnly          bool
 		insecure         bool
 		turnTLSAddr      string
 		turnSecret       string
@@ -41,18 +42,19 @@ func newHubCommand() *cli.Command {
 
 	cmd := &cli.Command{
 		Name:       "hub",
-		ShortAbout: "Run the HTTPS/WSS signaling and DTLS 1.3 STUNS/TURNS server",
-		LongAbout:  "Run the Lighthouse server exposing TLS 1.3 HTTPS/WSS signaling (/healthz, /v1/signal) and DTLS 1.3 over UDP STUNS/TURNS (:5349/udp). Plaintext UDP STUN/TURN requires --insecure. Send SIGHUP to reload policy and revocations.",
+		ShortAbout: "Run the HTTPS/WSS signaling and STUNS/TURNS server",
+		LongAbout:  "Run the Lighthouse server exposing TLS 1.3 HTTPS/WSS signaling (/healthz, /v1/signal) and DTLS 1.3 over UDP STUNS/TURNS (:5349/udp). Pass --tcp-only to disable UDP and serve STUNS/TURNS over TLS 1.3/TCP only. Plaintext STUN/TURN requires --insecure. Send SIGHUP to reload policy and revocations.",
 		Examples: []string{
 			"lighthouse hub --https-addr :8443 --stuns-addr :5349 --hub-origin wss://hub.example.com",
 			"lighthouse hub --stuns-addr :5349 --turn-secret <SECRET> --turn-public-ip 203.0.113.10",
+			"lighthouse hub --tcp-only --stuns-addr :5349 --policy /etc/lighthouse/policy.json",
 			"lighthouse hub --insecure --stun-addr :3478 --policy /etc/lighthouse/policy.json",
 		},
 		Run: func(ctx *cli.Context) error {
 			logger := slog.New(slog.NewJSONHandler(ctx.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			if stunAddr != "" && !insecure {
-				fmt.Fprintln(ctx.Stderr, "error: plaintext '--stun-addr' requires '--insecure' (use '--stuns-addr' for DTLS 1.3 over UDP)\n\nFor more information, try '--help'.")
+				fmt.Fprintln(ctx.Stderr, "error: plaintext '--stun-addr' requires '--insecure' (use '--stuns-addr' for encrypted STUNS)\n\nFor more information, try '--help'.")
 				return &cli.ExitError{Code: 2, Err: stunserver.ErrInsecureSTUNProhibited}
 			}
 			if insecure && stunAddr == "" {
@@ -89,6 +91,7 @@ func newHubCommand() *cli.Command {
 
 			srv, err := hub.New(hub.Config{
 				HTTPSListenAddr:    httpsAddr,
+				TCPOnly:            tcpOnly,
 				AllowInsecure:      insecure,
 				EnableSTUN:         true,
 				STUNSListenAddr:    stunsAddr,
@@ -119,6 +122,8 @@ func newHubCommand() *cli.Command {
 				"https_addr", srv.HTTPSAddr().String(),
 				"stuns_addr", fmt.Sprint(srv.STUNSAddr()),
 				"stun_udp_addr", fmt.Sprint(srv.STUNUDPAddr()),
+				"stun_tcp_addr", fmt.Sprint(srv.STUNTCPAddr()),
+				"tcp_only", tcpOnly,
 				"turn_active", srv.TURNActive(),
 				"insecure", insecure,
 				"hub_origin", srv.HubOrigin(),
@@ -176,10 +181,16 @@ func newHubCommand() *cli.Command {
 		LongHelp:  "Plaintext UDP listen address for unencrypted stun:/turn: traffic; rejected unless --insecure is set (defaults to :3478 with --insecure)",
 		EnvVar:    "LIGHTHOUSE_STUN_ADDR",
 	})
+	cmd.BoolOpt(&tcpOnly, cli.Option{
+		Long:      "tcp-only",
+		ShortHelp: "Disable UDP; serve STUNS/TURNS over TLS 1.3/TCP only",
+		LongHelp:  "Opt in to sole-TCP mode: bind zero UDP sockets and serve STUNS/TURNS over TLS 1.3/TCP on --stuns-addr",
+		EnvVar:    "LIGHTHOUSE_TCP_ONLY",
+	})
 	cmd.BoolOpt(&insecure, cli.Option{
 		Long:      "insecure",
-		ShortHelp: "Enable plaintext UDP stun:/turn: listener",
-		LongHelp:  "Opt in to unencrypted UDP STUN/TURN on --stun-addr alongside DTLS 1.3 STUNS/TURNS",
+		ShortHelp: "Enable plaintext stun:/turn: listener",
+		LongHelp:  "Opt in to unencrypted STUN/TURN on --stun-addr alongside encrypted STUNS/TURNS",
 		EnvVar:    "LIGHTHOUSE_INSECURE",
 	})
 	cmd.StringOpt(&turnSecret, cli.Option{
