@@ -128,7 +128,7 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 	a.Settings().SetTheme(rawblock.NewTheme())
 
 	w := a.NewWindow("LIGHTHOUSE")
-	w.Resize(fyne.NewSize(1080, 800))
+	w.Resize(fyne.NewSize(1120, 820))
 
 	c := &Controller{
 		app:    a,
@@ -341,9 +341,9 @@ func (c *Controller) buildUI() {
 		rawblock.InsetBox(rawblock.Sp3, 0, 0, 0, c.tabContent))
 	rightCard := rawblock.NewCard(rightBody, rawblock.CardDefault)
 
-	// --- Asymmetric Root Layout (42% / 58%, Sp4 gutters, white surface base) ---
+	// --- Asymmetric Root Layout (40% / 60%, Sp4 gutters, white surface base) ---
 	mainArea := rawblock.InsetBox(rawblock.Sp4, rawblock.Sp4, rawblock.Sp4, rawblock.Sp4,
-		rawblock.AsymmetricSplit(0.42, rawblock.Sp4, leftCard, rightCard))
+		rawblock.AsymmetricSplit(0.40, rawblock.Sp4, leftCard, rightCard))
 	rootBG := canvas.NewRectangle(rawblock.ColorSurfaceBase)
 	rootBG.CornerRadius = rawblock.RadiusNone
 	root := container.NewStack(rootBG, container.NewBorder(masthead, nil, nil, nil, mainArea))
@@ -761,7 +761,7 @@ func (c *Controller) refreshLists() {
 				pid := dp.PeerID
 				meta := rawblock.GapVBox(rawblock.Sp1,
 					rawblock.NewMono(dp.VirtualIP.String(), rawblock.ColorBlack),
-					rawblock.NewSmall(fmt.Sprintf("%s  //  %s", truncateLabel(nonEmptyLabel(dp.DisplayName), 18), shortID8(pid)), rawblock.ColorContentSecondary),
+					rawblock.NewSmall(fmt.Sprintf("%s  //  %s", truncateLabel(nonEmptyLabel(dp.DisplayName), 14), shortID8(pid)), rawblock.ColorContentSecondary),
 				)
 				connBtn := rawblock.NewButton("CONNECT", rawblock.ButtonPrimary, rawblock.ButtonSmall, func() { go c.connectPeerAction(pid) })
 				blockBtn := rawblock.NewButton("BLACKLIST", rawblock.ButtonDestructive, rawblock.ButtonSmall, func() { go c.blacklistPeerAction(pid) })

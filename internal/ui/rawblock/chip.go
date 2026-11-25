@@ -20,8 +20,8 @@ const (
 	ChipError                   // #FF0000
 )
 
-// Chip implements both RawBlock Filter Chips (2px black border, 4px/12px pad, 10px uppercase,
-// 1px tracking, black/white active inversion) and Status Chips (2px colored border, 11px semibold
+// Chip implements both RawBlock Filter Chips (2px black border, 4px/12px pad, 14px uppercase,
+// 1px tracking, black/white active inversion) and Status Chips (2px colored border, 14px semibold
 // uppercase, 1px tracking, 2px/10px pad).
 type Chip struct {
 	widget.BaseWidget

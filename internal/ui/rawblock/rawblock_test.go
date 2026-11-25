@@ -50,6 +50,32 @@ func TestThemeTokensZeroRadiusZeroShadowAndEmbeddedFonts(t *testing.T) {
 		t.Fatal("RawBlock foreground must stay #000000 regardless of OS variant")
 	}
 
+	// Every text size token and theme text size MUST enforce the 14px minimum floor.
+	for _, sz := range []float32{
+		rawblock.TextMin,
+		rawblock.TextH1,
+		rawblock.TextH2,
+		rawblock.TextH3,
+		rawblock.TextH4,
+		rawblock.TextBody,
+		rawblock.TextMono,
+		rawblock.TextSmall,
+		rawblock.TextTooltip,
+		rawblock.TextTiny,
+		rawblock.TextStatusChip,
+		rawblock.TextFilterChip,
+		th.Size(theme.SizeNameText),
+		th.Size(theme.SizeNameCaptionText),
+		th.Size(theme.SizeNameHeadingText),
+		th.Size(theme.SizeNameSubHeadingText),
+		rawblock.NewTiny("caption", rawblock.ColorBlack).TextSize,
+		rawblock.NewTrackedText("CLAMP", 8, rawblock.StyleBody, rawblock.ColorBlack, 1).TextSize,
+	} {
+		if sz < 14 {
+			t.Fatalf("font size %v violates 14px minimum", sz)
+		}
+	}
+
 	// Verify all 5 embedded SIL-OFL font styles resolve non-empty TrueType data.
 	for _, st := range []fyne.TextStyle{
 		rawblock.StyleBody,
@@ -121,6 +147,9 @@ func TestButtonsVariantsSizesHoverActiveAndDisabled(t *testing.T) {
 
 	// Secondary, Ghost, Destructive + Small/Large sizes.
 	sec := rawblock.NewButton("cancel", rawblock.ButtonSecondary, rawblock.ButtonSmall, nil)
+	if sec.TextSize() < rawblock.TextMin {
+		t.Fatalf("small button text size = %v; want >= %v", sec.TextSize(), rawblock.TextMin)
+	}
 	if sec.MinSize().Height < 32 {
 		t.Fatalf("small button height = %v; want >= 32", sec.MinSize().Height)
 	}

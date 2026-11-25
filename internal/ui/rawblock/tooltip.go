@@ -12,7 +12,7 @@ import (
 const tooltipMaxWidth float32 = 260
 
 // Tooltip implements RawBlock's inverted tooltip block:
-//   - Black (#000000) fill, white (#FFFFFF) 13px Space Mono text
+//   - Black (#000000) fill, white (#FFFFFF) 14px Space Mono text
 //   - Square (0px radius), no border, no shadow, no arrow
 //   - 8px/12px padding, 260px max width
 type Tooltip struct {

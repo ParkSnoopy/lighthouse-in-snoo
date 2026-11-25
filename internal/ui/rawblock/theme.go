@@ -74,6 +74,7 @@ const (
 	BorderThick float32 = 3
 	BorderHeavy float32 = 5
 
+	TextMin        float32 = 14
 	TextH1         float32 = 64
 	TextH2         float32 = 48
 	TextH3         float32 = 32
@@ -81,10 +82,10 @@ const (
 	TextBody       float32 = 16
 	TextMono       float32 = 15
 	TextSmall      float32 = 14
-	TextTooltip    float32 = 13
-	TextTiny       float32 = 12
-	TextStatusChip float32 = 11
-	TextFilterChip float32 = 10
+	TextTooltip    float32 = TextMin
+	TextTiny       float32 = TextMin
+	TextStatusChip float32 = TextMin
+	TextFilterChip float32 = TextMin
 
 	LineHeightH1    float32 = 1.0
 	LineHeightH2    float32 = 1.05
@@ -328,7 +329,7 @@ func NewSmall(text string, c color.Color) *canvas.Text {
 	return newStyledText(text, TextSmall, StyleBody, c)
 }
 
-// NewTiny creates a Work Sans 12px regular text object.
+// NewTiny creates a Work Sans caption/helper text object (clamped to TextMin = 14px).
 func NewTiny(text string, c color.Color) *canvas.Text {
 	return newStyledText(text, TextTiny, StyleBody, c)
 }
@@ -348,7 +349,7 @@ func newStyledText(text string, size float32, style fyne.TextStyle, c color.Colo
 		c = ColorBlack
 	}
 	t := canvas.NewText(text, c)
-	t.TextSize = size
+	t.TextSize = max(size, TextMin)
 	t.TextStyle = style
 	return t
 }
@@ -376,14 +377,14 @@ type TrackedText struct {
 	Alignment fyne.TextAlign
 }
 
-// NewTrackedText constructs a pixel-tracked text primitive.
+// NewTrackedText constructs a pixel-tracked text primitive (clamped to TextMin = 14px).
 func NewTrackedText(text string, size float32, style fyne.TextStyle, c color.Color, tracking float32) *TrackedText {
 	if c == nil {
 		c = ColorBlack
 	}
 	tt := &TrackedText{
 		Text:      text,
-		TextSize:  size,
+		TextSize:  max(size, TextMin),
 		TextStyle: style,
 		Color:     c,
 		Tracking:  tracking,

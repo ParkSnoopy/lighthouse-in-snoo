@@ -70,7 +70,7 @@ func (e *rawEntry) MouseOut() {
 //   - Default: 3px black border; Hover: #E8E8E8 bg; Focus: 5px black border
 //   - Error: 3px #FF0000 border; Disabled: 3px #CCCCCC border + #F5F5F5 bg (no double inner border)
 //   - Label: Archivo Black 14px uppercase (4px margin-bottom)
-//   - Helper/Error text: Work Sans 12px (4px margin-top)
+//   - Helper/Error text: Work Sans 14px (4px margin-top)
 type Input struct {
 	widget.BaseWidget
 

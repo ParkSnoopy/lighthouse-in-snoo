@@ -147,12 +147,18 @@ func (b *Button) MouseUp(_ *desktop.MouseEvent) {
 func (b *Button) metrics() (padV, padH, textSize, minH float32) {
 	switch b.BtnSize {
 	case ButtonSmall:
-		return 6, 16, 12, 32
+		return 6, 16, TextMin, 34
 	case ButtonLarge:
 		return 16, 40, 18, 56
 	default:
-		return 10, 24, 14, 44
+		return 10, 24, TextMin, 44
 	}
+}
+
+// TextSize returns the button's resolved font size (always >= TextMin).
+func (b *Button) TextSize() float32 {
+	_, _, textSize, _ := b.metrics()
+	return textSize
 }
 
 // StyleColors returns the current resolved (fill, foreground, border, borderWidth) for rendering and verification.
