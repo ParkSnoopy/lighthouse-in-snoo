@@ -48,7 +48,7 @@ CGO_ENABLED=0 go build -o bin/lighthouse ./cmd/lighthouse
 
 ### 2. Provision Offline Authority, Peer Keys, and Policy
 
-All CLI options accept `--flag`, `-flag`, and short aliases (`-h` prints compact help; `--help` or `help <subcommand>` prints verbose help with defaults, environment variables, and examples).
+Full-word options use `--` (e.g., `--policy`, `--help`); single-character short flags use `-` and may be combined (e.g., `-gik peer.key`). Use `-h` for compact help and `--help` or `help <subcommand>` for verbose help.
 
 Generate an offline authority key and two peer keys:
 
@@ -130,7 +130,7 @@ Dial from the initiator peer:
 
 ## Hub Configuration
 
-`lighthouse hub` accepts flags (with `--` or `-`) or environment variables:
+`lighthouse hub` accepts CLI options or environment variables:
 
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |

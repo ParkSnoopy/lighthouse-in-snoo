@@ -14,7 +14,7 @@ func newRootCommand() *cli.Command {
 		Name:       "lighthouse",
 		Version:    appVersion,
 		ShortAbout: "Direct P2P WebRTC Lighthouse hub, peer client, and admin CLI",
-		LongAbout:  "Direct P2P WebRTC Lighthouse hub, peer client, and policy administration tool.\nAll options accept both '--flag' and '-flag' syntax as well as short aliases.",
+		LongAbout:  "Direct P2P WebRTC Lighthouse hub, peer client, and policy administration tool.",
 		Examples: []string{
 			"lighthouse hub --policy /etc/lighthouse/policy.json --tls-cert tls.crt --tls-key tls.key",
 			"lighthouse peer --key peer.key --policy policy.json --hub wss://hub.example.com/v1/signal --stun stun:hub.example.com:3478",

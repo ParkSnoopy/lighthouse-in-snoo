@@ -2000,6 +2000,7 @@ func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 	}
 	s.restarting = false
 	firstConnect := !s.notifiedApp
+	isInitiator := s.isInitiator
 	s.notifiedApp = true
 	s.pathVerified.Store(true)
 	prevState := s.state
@@ -2021,7 +2022,7 @@ func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 			fn(StateConnected)
 		}
 	}
-	if firstConnect && !s.isInitiator && s.client.cfg.OnSession != nil {
+	if firstConnect && !isInitiator && s.client.cfg.OnSession != nil {
 		go s.client.cfg.OnSession(s)
 	}
 }

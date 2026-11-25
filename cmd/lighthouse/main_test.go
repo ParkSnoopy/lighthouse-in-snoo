@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestUnifiedBinaryClapHelpAndFlagForms(t *testing.T) {
+func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
@@ -35,7 +35,7 @@ func TestUnifiedBinaryClapHelpAndFlagForms(t *testing.T) {
 		t.Fatalf("lighthouse -V failed: err=%v out=%q", err, string(verOut))
 	}
 
-	// Nested verbose help via both "help hub" and "hub --help" and "admin issue-membership --help".
+	// Nested verbose help via both "help hub" and "admin issue-membership --help".
 	hubHelp, err := exec.Command(binPath, "help", "hub").CombinedOutput()
 	if err != nil {
 		t.Fatalf("lighthouse help hub failed: %v\n%s", err, string(hubHelp))
@@ -54,22 +54,22 @@ func TestUnifiedBinaryClapHelpAndFlagForms(t *testing.T) {
 		t.Fatalf("unexpected issue-membership usage:\n%s", string(issueHelp))
 	}
 
-	// Verify BOTH --long, -long, and -short flag forms interoperate across admin and peer subcommands.
+	// Verify double-dash long flags and concatenated single-dash short flags (-gik <path>).
 	keyPath := filepath.Join(tmpDir, "peer.key")
-	genOut, err := exec.Command(binPath, "admin", "keygen", "--out", keyPath).CombinedOutput()
+	clusterOut, err := exec.Command(binPath, "peer", "-gik", keyPath).CombinedOutput()
 	if err != nil {
-		t.Fatalf("admin keygen --out failed: %v\n%s", err, string(genOut))
+		t.Fatalf("lighthouse peer -gik failed: %v\n%s", err, string(clusterOut))
 	}
 	var genInfo map[string]string
-	if err := json.Unmarshal(genOut, &genInfo); err != nil {
-		t.Fatalf("parse keygen output: %v", err)
+	if err := json.Unmarshal(clusterOut, &genInfo); err != nil {
+		t.Fatalf("parse -gik output: %v", err)
 	}
 
 	for _, args := range [][]string{
 		{"peer", "--key", keyPath, "--print-id"},
-		{"peer", "-key", keyPath, "-print-id"},
-		{"peer", "-k", keyPath, "--print-id=true"},
-		{"peer", "--key=" + keyPath, "-print-id"},
+		{"peer", "-ik", keyPath},
+		{"peer", "--key=" + keyPath, "-i"},
+		{"peer", "-k" + keyPath, "--print-id=true"},
 	} {
 		out, err := exec.Command(binPath, args...).CombinedOutput()
 		if err != nil {
@@ -84,7 +84,24 @@ func TestUnifiedBinaryClapHelpAndFlagForms(t *testing.T) {
 		}
 	}
 
-	// Verify clap-like typo suggestion and exit code 2 on invalid option.
+	// Verify single-dash full-word flags (-help, -https-addr) are rejected with exit code 2.
+	for _, badArgs := range [][]string{
+		{"-help"},
+		{"hub", "-help"},
+		{"hub", "-https-addr", ":8443"},
+		{"peer", "-gen-key"},
+	} {
+		cmd := exec.Command(binPath, badArgs...)
+		out, err := cmd.CombinedOutput()
+		if err == nil || cmd.ProcessState.ExitCode() != 2 {
+			t.Fatalf("expected exit code 2 for %v, got err=%v code=%d out=%s", badArgs, err, cmd.ProcessState.ExitCode(), string(out))
+		}
+		if !strings.Contains(string(out), "use two dashes") {
+			t.Fatalf("expected double-dash tip for %v, got:\n%s", badArgs, string(out))
+		}
+	}
+
+	// Verify clap-like typo suggestion on unknown double-dash option.
 	badCmd := exec.Command(binPath, "hub", "--polcy", "x")
 	badOut, badErr := badCmd.CombinedOutput()
 	if badErr == nil || badCmd.ProcessState.ExitCode() != 2 {

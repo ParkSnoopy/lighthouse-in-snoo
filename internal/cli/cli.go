@@ -157,13 +157,13 @@ func (c *Command) exec(args []string, stdout, stderr io.Writer) error {
 
 		first := args[0]
 		switch first {
-		case "-h", "--h":
+		case "-h":
 			RenderHelp(stdout, c, false)
 			return nil
-		case "--help", "-help":
+		case "--help":
 			RenderHelp(stdout, c, true)
 			return nil
-		case "-V", "--V", "--version", "-version":
+		case "-V", "--version":
 			if c.Version != "" {
 				fmt.Fprintf(stdout, "%s %s\n", c.Name, c.Version)
 				return nil
@@ -184,7 +184,8 @@ func (c *Command) exec(args []string, stdout, stderr io.Writer) error {
 
 		if strings.HasPrefix(first, "-") {
 			msg := fmt.Sprintf("unexpected argument '%s' found", first)
-			c.printUsageError(stderr, msg, "")
+			tip := c.suggestRootFlagTip(first)
+			c.printUsageError(stderr, msg, tip)
 			return &ExitError{Code: 2, Err: errors.New(msg)}
 		}
 
@@ -292,75 +293,79 @@ func (c *Command) parseLeafArgs(args []string, stderr io.Writer) ([]string, help
 			continue
 		}
 
-		// Strip either "--" or "-" prefix so every option works identically with both!
-		raw := strings.TrimPrefix(tok, "--")
-		if len(raw) == len(tok) {
-			raw = strings.TrimPrefix(tok, "-")
-		}
-
-		name := raw
-		hasEq := false
-		eqVal := ""
-		if eqIdx := strings.IndexByte(raw, '='); eqIdx >= 0 {
-			name = raw[:eqIdx]
-			eqVal = raw[eqIdx+1:]
-			hasEq = true
-		}
-
-		// Built-in help & version flags.
-		if !hasEq {
-			switch name {
-			case "help":
-				return nil, helpLong, false, nil
-			case "h":
-				return nil, helpShort, false, nil
-			case "version", "V":
-				if c.hasVersion() {
-					return nil, helpNone, true, nil
-				}
+		// Double-dash ("--..."): strictly full-word long options only.
+		if strings.HasPrefix(tok, "--") {
+			raw := strings.TrimPrefix(tok, "--")
+			name := raw
+			hasEq := false
+			eqVal := ""
+			if eqIdx := strings.IndexByte(raw, '='); eqIdx >= 0 {
+				name = raw[:eqIdx]
+				eqVal = raw[eqIdx+1:]
+				hasEq = true
 			}
-		}
 
-		// 1. Exact long name match (works for both --flag and -flag).
-		opt := c.findByLong(name)
-		// 2. Exact single-rune short alias match (works for -s and --s).
-		if opt == nil && len([]rune(name)) == 1 {
-			opt = c.findByShort([]rune(name)[0])
-		}
-		// 3. Single-dash attached short value (e.g. -pfile.json) or bundled short booleans (-gu).
-		if opt == nil && !strings.HasPrefix(tok, "--") && len([]rune(name)) > 1 {
-			runes := []rune(name)
-			if firstOpt := c.findByShort(runes[0]); firstOpt != nil {
-				if firstOpt.Kind != KindBool && !hasEq {
-					opt = firstOpt
-					hasEq = true
-					eqVal = string(runes[1:])
-				} else if !hasEq && c.allShortBools(runes) {
-					for _, r := range runes {
-						bOpt := c.findByShort(r)
-						_ = bOpt.applyValue("true")
-						bOpt.isSet = true
+			if !hasEq {
+				switch name {
+				case "help":
+					return nil, helpLong, false, nil
+				case "version":
+					if c.hasVersion() {
+						return nil, helpNone, true, nil
 					}
-					continue
 				}
 			}
-		}
 
-		if opt == nil {
-			msg := fmt.Sprintf("unexpected argument '%s' found", tok)
-			tip := ""
-			if suggestion := suggestOption(name, c.Options); suggestion != "" {
-				tip = fmt.Sprintf("a similar argument exists: '--%s'", suggestion)
+			opt := c.findByLong(name)
+			if opt == nil {
+				msg := fmt.Sprintf("unexpected argument '%s' found", tok)
+				tip := ""
+				if len([]rune(name)) == 1 {
+					r := []rune(name)[0]
+					if r == 'h' {
+						tip = "a similar argument exists: '-h' or '--help'"
+					} else if r == 'V' && c.hasVersion() {
+						tip = "a similar argument exists: '-V' or '--version'"
+					} else if sOpt := c.findByShort(r); sOpt != nil {
+						tip = fmt.Sprintf("a similar argument exists: '-%c' or '--%s'", r, sOpt.Long)
+					}
+				}
+				if tip == "" {
+					if suggestion := suggestOption(name, c.Options); suggestion != "" {
+						tip = fmt.Sprintf("a similar argument exists: '--%s'", suggestion)
+					}
+				}
+				c.printUsageError(stderr, msg, tip)
+				return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
 			}
-			c.printUsageError(stderr, msg, tip)
-			return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
-		}
 
-		if opt.Kind == KindBool {
-			val := "true"
+			if opt.Kind == KindBool {
+				val := "true"
+				if hasEq {
+					val = eqVal
+				}
+				if err := opt.applyValue(val); err != nil {
+					msg := fmt.Sprintf("invalid value '%s' for '%s': %v", val, opt.displayRef(), err)
+					c.printUsageError(stderr, msg, "")
+					return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+				}
+				opt.isSet = true
+				continue
+			}
+
+			var val string
 			if hasEq {
 				val = eqVal
+			} else {
+				if i+1 >= len(args) {
+					msg := fmt.Sprintf("a value is required for '%s' but none was supplied", opt.displayRef())
+					c.printUsageError(stderr, msg, "")
+					return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+				}
+				i++
+				val = args[i]
 			}
+
 			if err := opt.applyValue(val); err != nil {
 				msg := fmt.Sprintf("invalid value '%s' for '%s': %v", val, opt.displayRef(), err)
 				c.printUsageError(stderr, msg, "")
@@ -370,25 +375,109 @@ func (c *Command) parseLeafArgs(args []string, stderr io.Writer) ([]string, help
 			continue
 		}
 
-		var val string
-		if hasEq {
-			val = eqVal
-		} else {
-			if i+1 >= len(args) {
-				msg := fmt.Sprintf("a value is required for '%s' but none was supplied", opt.displayRef())
+		// Single-dash ("-..."): strictly single-char short flags with POSIX/clap clustering (e.g. -alh).
+		cluster := strings.TrimPrefix(tok, "-")
+		runes := []rune(cluster)
+
+		// Detect mistaken single-dash long flag (e.g. -help, -policy) when it cannot parse as a valid short cluster.
+		helpInCluster := false
+		versionInCluster := false
+		for idx := 0; idx < len(runes); idx++ {
+			r := runes[idx]
+			if r == 'h' {
+				if idx+1 < len(runes) && runes[idx+1] == '=' {
+					msg := fmt.Sprintf("unexpected argument '%s' found", tok)
+					c.printUsageError(stderr, msg, "")
+					return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+				}
+				helpInCluster = true
+				continue
+			}
+			if r == 'V' && c.hasVersion() {
+				if idx+1 < len(runes) && runes[idx+1] == '=' {
+					msg := fmt.Sprintf("unexpected argument '%s' found", tok)
+					c.printUsageError(stderr, msg, "")
+					return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+				}
+				versionInCluster = true
+				continue
+			}
+
+			opt := c.findByShort(r)
+			if opt == nil {
+				msg := fmt.Sprintf("unexpected argument '-%c' found", r)
+				tip := ""
+				// If the user typed a full-word flag with a single dash (e.g. -help, -policy), suggest '--...'.
+				word := cluster
+				if eqIdx := strings.IndexByte(word, '='); eqIdx >= 0 {
+					word = word[:eqIdx]
+				}
+				if word == "help" {
+					msg = fmt.Sprintf("unexpected argument '%s' found", tok)
+					tip = "to pass '--help' as a long flag, use two dashes: '--help'"
+				} else if word == "version" && c.hasVersion() {
+					msg = fmt.Sprintf("unexpected argument '%s' found", tok)
+					tip = "to pass '--version' as a long flag, use two dashes: '--version'"
+				} else if c.findByLong(word) != nil {
+					msg = fmt.Sprintf("unexpected argument '%s' found", tok)
+					tip = fmt.Sprintf("to pass '--%s' as a long flag, use two dashes: '--%s'", word, word)
+				} else if suggestion := suggestOption(word, c.Options); suggestion != "" && len(runes) > 1 {
+					tip = fmt.Sprintf("a similar argument exists: '--%s'", suggestion)
+				}
+				c.printUsageError(stderr, msg, tip)
+				return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+			}
+
+			if opt.Kind == KindBool {
+				if idx+1 < len(runes) && runes[idx+1] == '=' {
+					val := string(runes[idx+2:])
+					if err := opt.applyValue(val); err != nil {
+						msg := fmt.Sprintf("invalid value '%s' for '%s': %v", val, opt.displayRef(), err)
+						c.printUsageError(stderr, msg, "")
+						return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+					}
+					opt.isSet = true
+					break
+				}
+				if err := opt.applyValue("true"); err != nil {
+					return nil, helpNone, false, &ExitError{Code: 2, Err: err}
+				}
+				opt.isSet = true
+				continue
+			}
+
+			// Value-taking short flag: remainder of cluster (after optional '=') or next argv token is its value.
+			var val string
+			if idx+1 < len(runes) {
+				if runes[idx+1] == '=' {
+					val = string(runes[idx+2:])
+				} else {
+					val = string(runes[idx+1:])
+				}
+			} else {
+				if i+1 >= len(args) {
+					msg := fmt.Sprintf("a value is required for '%s' but none was supplied", opt.displayRef())
+					c.printUsageError(stderr, msg, "")
+					return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+				}
+				i++
+				val = args[i]
+			}
+			if err := opt.applyValue(val); err != nil {
+				msg := fmt.Sprintf("invalid value '%s' for '%s': %v", val, opt.displayRef(), err)
 				c.printUsageError(stderr, msg, "")
 				return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
 			}
-			i++
-			val = args[i]
+			opt.isSet = true
+			break
 		}
 
-		if err := opt.applyValue(val); err != nil {
-			msg := fmt.Sprintf("invalid value '%s' for '%s': %v", val, opt.displayRef(), err)
-			c.printUsageError(stderr, msg, "")
-			return nil, helpNone, false, &ExitError{Code: 2, Err: errors.New(msg)}
+		if helpInCluster {
+			return nil, helpShort, false, nil
 		}
-		opt.isSet = true
+		if versionInCluster {
+			return nil, helpNone, true, nil
+		}
 	}
 
 	// Enforce required flags.
@@ -504,14 +593,22 @@ func (c *Command) findByShort(r rune) *Option {
 	return nil
 }
 
-func (c *Command) allShortBools(runes []rune) bool {
-	for _, r := range runes {
-		opt := c.findByShort(r)
-		if opt == nil || opt.Kind != KindBool {
-			return false
+func (c *Command) suggestRootFlagTip(tok string) string {
+	switch tok {
+	case "-help":
+		return "to pass '--help' as a long flag, use two dashes: '--help'"
+	case "--h":
+		return "a similar argument exists: '-h' or '--help'"
+	case "-version":
+		if c.Version != "" {
+			return "to pass '--version' as a long flag, use two dashes: '--version'"
+		}
+	case "--V":
+		if c.Version != "" {
+			return "a similar argument exists: '-V' or '--version'"
 		}
 	}
-	return true
+	return ""
 }
 
 func (c *Command) printUsageError(w io.Writer, msg, tip string) {

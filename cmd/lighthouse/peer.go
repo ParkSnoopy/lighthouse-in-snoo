@@ -222,6 +222,7 @@ func newPeerCommand() *cli.Command {
 	})
 	cmd.BoolOpt(&printID, cli.Option{
 		Long:      "print-id",
+		Short:     'i',
 		ShortHelp: "Print peer_id and public_key JSON then exit",
 		LongHelp:  "Output this identity's base64url peer_id and public_key as JSON without connecting",
 	})
