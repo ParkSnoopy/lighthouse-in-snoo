@@ -7,13 +7,13 @@ Verify static compilation (`CGO_ENABLED=0`), hub dependency isolation, and `go v
 ```bash
 CGO_ENABLED=0 go build ./...
 go vet ./...
-go list -deps ./cmd/lighthouse | grep -E 'github\.com/pion/(webrtc|turn)' && exit 1 || true
+go list -deps ./internal/hub ./internal/stunserver | grep -E 'github\.com/pion/(webrtc|turn)' && exit 1 || true
 ```
 
 ### Verifiable Build Invariants
 
-- `cmd/lighthouse`, `cmd/lighthouse-peer`, and `cmd/lighthouse-admin` compile into static Go binaries with `CGO_ENABLED=0`.
-- `go list -deps ./cmd/lighthouse` contains neither `github.com/pion/webrtc` nor `github.com/pion/turn`, proving structurally that the hub executable cannot instantiate a `PeerConnection` or TURN relay.
+- `cmd/lighthouse` compiles into a single static Go binary (`CGO_ENABLED=0`) containing the `hub`, `peer`, and `admin` subcommands.
+- `go list -deps ./internal/hub ./internal/stunserver` contains neither `github.com/pion/webrtc` nor `github.com/pion/turn`, proving structurally that the hub control-plane and STUN packages cannot instantiate a `PeerConnection` or TURN relay.
 
 ## 2. Full Automated Verification Suite
 
@@ -29,7 +29,7 @@ Each acceptance requirement in `test/acceptance` exercises two independently aut
 
 | ID | Test Function | Reproducible Command | Verifiable Invariants |
 | --- | --- | --- | --- |
-| `ARCH` | `TestArchitectureAndControlPlaneInvariants` | `go test -race -v ./test/acceptance -run TestArchitectureAndControlPlaneInvariants` | Hub binary excludes `pion/webrtc` and `pion/turn`; `GET /healthz` exposes only `{"status":"ok"}`; TLS 1.2 WSS clients fail handshake. |
+| `ARCH` | `TestArchitectureAndControlPlaneInvariants` | `go test -race -v ./test/acceptance -run TestArchitectureAndControlPlaneInvariants` | Hub control-plane packages (`internal/hub`, `internal/stunserver`) exclude `pion/webrtc` and `pion/turn`; `GET /healthz` exposes only `{"status":"ok"}`; TLS 1.2 WSS clients fail handshake. |
 | `T01` | `TestT01_SameLANDirectHostConnectivity` | `go test -race -v ./test/acceptance -run TestT01_SameLANDirectHostConnectivity` | Direct `host`–`host` UDP pair selected; `DTLSVersion == "FEFC"` (DTLS 1.3); `data/v1` and `packet/v1` deliver payloads; `> 16 KiB` messages return `ErrMessageTooLarge`; logs omit SDP, ICE passwords, keys, candidates, and payloads. |
 | `T02` | `TestT02_PublicIPv4AndIPv6Connectivity` | `go test -race -v ./test/acceptance -run TestT02_PublicIPv4AndIPv6Connectivity` | Separate `IPv4` (`udp4`) and `IPv6` (`udp6`) runs establish direct connectivity and negotiate DTLS 1.3 (`FEFC`). |
 | `T03` | `TestT03_CompatibleNATsSeparateNetworks` | `go test -race -v ./test/acceptance -run TestT03_CompatibleNATsSeparateNetworks` | Peers behind separate `192.168.10.0/24` and `192.168.20.0/24` cone NATs discover `srflx` mappings via Hub STUN (`203.0.113.10:3478`) and establish a non-relayed `srflx`/`prflx` pair over DTLS 1.3. |

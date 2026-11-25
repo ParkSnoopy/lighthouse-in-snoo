@@ -16,3 +16,4 @@ EXPOSE 8443/tcp
 EXPOSE 3478/udp
 
 ENTRYPOINT ["/usr/local/bin/lighthouse"]
+CMD ["hub"]

@@ -12,8 +12,8 @@ flowchart TB
         R[("Trust Policy & Ephemeral Presence")]
         H --- R
     end
-    A["Peer A (lighthouse-peer / pkg/peer)"]
-    B["Peer B (lighthouse-peer / pkg/peer)"]
+    A["Peer A (lighthouse peer / pkg/peer)"]
+    B["Peer B (lighthouse peer / pkg/peer)"]
     A -. "TLS 1.3 WSS + Ed25519 JCS Envelopes" .-> H
     B -. "TLS 1.3 WSS + Ed25519 JCS Envelopes" .-> H
     A -. "UDP STUN Binding" .-> T
@@ -23,7 +23,7 @@ flowchart TB
 
 ### Design Guarantees
 
-- **Control-Plane Separation**: `cmd/lighthouse` implements peer challenge-response registration, presence leases, authorized lookup, signed signaling forwarding, and UDP STUN Binding. It contains no WebRTC `PeerConnection`, TURN relay, or payload forwarding path.
+- **Control-Plane Separation**: `lighthouse hub` (`internal/hub` and `internal/stunserver`) implements peer challenge-response registration, presence leases, authorized lookup, signed signaling forwarding, and UDP STUN Binding without importing WebRTC `PeerConnection` or TURN packages.
 - **Independent Peer Authentication**: Peers authenticate each other using persistent Ed25519 identities verified against local pinned keys or offline-authority-signed membership records, independent of hub assertions.
 - **DTLS 1.3 Only**: Peer transport enforces DTLS 1.3 (`0xFEFC`) with ephemeral ECDHE forward secrecy, AEAD record protection, replay window enforcement, and Ed25519-authenticated SHA-256 certificate fingerprints.
 - **Direct-Only Fail-Closed ICE**: Only UDP `host`, `srflx`, and `prflx` candidates are permitted. `relay` candidates, TURN servers, TCP candidates, and hub service endpoints are rejected before installation and on selected-pair transitions.
@@ -32,21 +32,18 @@ flowchart TB
 
 | Component | Path | Purpose |
 | --- | --- | --- |
-| `lighthouse` | `cmd/lighthouse` | HTTPS/WSS signaling hub (`:8443/tcp`) and UDP STUN responder (`:3478/udp`) |
-| `lighthouse-peer` | `cmd/lighthouse-peer` | Native CLI client for authenticated direct DataChannel sessions |
-| `lighthouse-admin` | `cmd/lighthouse-admin` | Offline key generation, membership signing, and SQLite policy management |
+| `lighthouse` | `cmd/lighthouse` | Single binary providing `hub` (server), `peer` (client), and `admin` subcommands |
+| `internal/hub` | `internal/hub` | HTTPS/WSS signaling (`:8443/tcp`) and UDP STUN (`:3478/udp`) control plane |
 | `pkg/identity` | `pkg/identity` | Ed25519 keys, `peer_id` derivation, offline authority certificates, ACLs |
 | `pkg/protocol` | `pkg/protocol` | Strict JSON/RFC 8785 JCS control-plane schema and signed envelopes |
 | `pkg/peer` | `pkg/peer` | Go SDK for direct-only WebRTC sessions, backpressure, and ICE restarts |
 
 ## Quick Start
 
-### 1. Build Binaries
+### 1. Build Binary
 
 ```bash
 CGO_ENABLED=0 go build -o bin/lighthouse ./cmd/lighthouse
-CGO_ENABLED=0 go build -o bin/lighthouse-peer ./cmd/lighthouse-peer
-CGO_ENABLED=0 go build -o bin/lighthouse-admin ./cmd/lighthouse-admin
 ```
 
 ### 2. Provision Offline Authority, Peer Keys, and Policy
@@ -54,22 +51,22 @@ CGO_ENABLED=0 go build -o bin/lighthouse-admin ./cmd/lighthouse-admin
 Generate an offline authority key and two peer keys:
 
 ```bash
-./bin/lighthouse-admin keygen -out config/authority.key
-./bin/lighthouse-admin keygen -out peer-a.key
-./bin/lighthouse-admin keygen -out peer-b.key
+./bin/lighthouse admin keygen -out config/authority.key
+./bin/lighthouse admin keygen -out peer-a.key
+./bin/lighthouse admin keygen -out peer-b.key
 ```
 
 Issue offline-authority-signed membership records for each peer:
 
 ```bash
-./bin/lighthouse-admin issue-membership \
+./bin/lighthouse admin issue-membership \
   -authority config/authority.key \
   -peer-pub <PEER_A_PUBLIC_KEY> \
   -allow <PEER_B_ID> \
   -ttl 720h \
   -out peer-a-membership.json
 
-./bin/lighthouse-admin issue-membership \
+./bin/lighthouse admin issue-membership \
   -authority config/authority.key \
   -peer-pub <PEER_B_PUBLIC_KEY> \
   -allow <PEER_A_ID> \
@@ -102,14 +99,14 @@ Place `tls.crt`, `tls.key`, and `policy.json` in `./config`, then build and run 
 docker compose up -d --build
 ```
 
-Reload updated ACL or revocation policies without restarting the process by sending `SIGHUP` to `lighthouse`.
+Or run the server directly with `./bin/lighthouse hub`. Reload updated ACL or revocation policies without restarting the process by sending `SIGHUP` to `lighthouse`.
 
 ### 4. Connect Two Peers
 
 Start the responder peer:
 
 ```bash
-./bin/lighthouse-peer \
+./bin/lighthouse peer \
   -key peer-b.key \
   -membership peer-b-membership.json \
   -policy config/policy.json \
@@ -120,7 +117,7 @@ Start the responder peer:
 Dial from the initiator peer:
 
 ```bash
-./bin/lighthouse-peer \
+./bin/lighthouse peer \
   -key peer-a.key \
   -membership peer-a-membership.json \
   -policy config/policy.json \
@@ -131,7 +128,7 @@ Dial from the initiator peer:
 
 ## Hub Configuration
 
-`lighthouse` accepts flags or environment variables:
+`lighthouse hub` accepts flags or environment variables:
 
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |

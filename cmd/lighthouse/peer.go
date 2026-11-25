@@ -19,21 +19,22 @@ import (
 	"lighthouse-in-snoo/pkg/peer"
 )
 
-func main() {
+func runPeer(args []string) {
+	fs := flag.NewFlagSet("peer", flag.ExitOnError)
 	var (
-		keyPath    = flag.String("key", "peer-key.json", "Ed25519 identity key file path")
-		genKey     = flag.Bool("gen-key", false, "Generate identity key if missing")
-		printID    = flag.Bool("print-id", false, "Print peer_id and public_key JSON then exit")
-		memPath    = flag.String("membership", "", "Optional signed MembershipRecord JSON path")
-		policyPath = flag.String("policy", "", "Local trust & ACL policy JSON path")
-		hubURL     = flag.String("hub", "wss://localhost:8443/v1/signal", "Hub WSS signaling endpoint")
-		hubOrigin  = flag.String("hub-origin", "", "Optional canonical hub origin override")
-		caPath     = flag.String("ca", "", "Optional PEM Root CA bundle for Hub TLS 1.3 verification")
-		stunURI    = flag.String("stun", "stun:127.0.0.1:3478", "UDP STUN URI (stun:host:port)")
-		targetID   = flag.String("connect", "", "Optional remote peer_id to dial immediately")
-		packetCh   = flag.Bool("packet-channel", false, "Enable optional unordered packet/v1 DataChannel")
+		keyPath    = fs.String("key", "peer-key.json", "Ed25519 identity key file path")
+		genKey     = fs.Bool("gen-key", false, "Generate identity key if missing")
+		printID    = fs.Bool("print-id", false, "Print peer_id and public_key JSON then exit")
+		memPath    = fs.String("membership", "", "Optional signed MembershipRecord JSON path")
+		policyPath = fs.String("policy", "", "Local trust & ACL policy JSON path")
+		hubURL     = fs.String("hub", "wss://localhost:8443/v1/signal", "Hub WSS signaling endpoint")
+		hubOrigin  = fs.String("hub-origin", "", "Optional canonical hub origin override")
+		caPath     = fs.String("ca", "", "Optional PEM Root CA bundle for Hub TLS 1.3 verification")
+		stunURI    = fs.String("stun", "stun:127.0.0.1:3478", "UDP STUN URI (stun:host:port)")
+		targetID   = fs.String("connect", "", "Optional remote peer_id to dial immediately")
+		packetCh   = fs.Bool("packet-channel", false, "Enable optional unordered packet/v1 DataChannel")
 	)
-	flag.Parse()
+	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -165,7 +166,6 @@ func main() {
 		"rtt_sec", diag.RTTSeconds,
 	)
 
-	// Pump received messages to stdout and stdin lines to data/v1.
 	go func() {
 		for msg := range sess.Messages() {
 			_, _ = os.Stdout.Write(append(msg, '\n'))

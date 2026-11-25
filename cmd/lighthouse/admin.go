@@ -13,29 +13,29 @@ import (
 	"lighthouse-in-snoo/pkg/identity"
 )
 
-func main() {
-	if len(os.Args) < 2 {
-		usage()
+func runAdmin(args []string) {
+	if len(args) < 1 {
+		adminUsage()
 		os.Exit(2)
 	}
 
-	switch os.Args[1] {
+	switch args[0] {
 	case "keygen":
-		cmdKeygen(os.Args[2:])
+		cmdKeygen(args[1:])
 	case "issue-membership":
-		cmdIssueMembership(os.Args[2:])
-	case "sqlite-revoke":
-		cmdSQLiteRevoke(os.Args[2:])
+		cmdIssueMembership(args[1:])
 	case "sqlite-acl":
-		cmdSQLiteACL(os.Args[2:])
+		cmdSQLiteACL(args[1:])
+	case "sqlite-revoke":
+		cmdSQLiteRevoke(args[1:])
 	default:
-		usage()
+		adminUsage()
 		os.Exit(2)
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: lighthouse-admin <keygen|issue-membership|sqlite-acl|sqlite-revoke> [flags]")
+func adminUsage() {
+	fmt.Fprintln(os.Stderr, "Usage: lighthouse admin <keygen|issue-membership|sqlite-acl|sqlite-revoke> [flags]")
 }
 
 func cmdKeygen(args []string) {
@@ -146,9 +146,4 @@ func cmdSQLiteRevoke(args []string) {
 	if err := st.RevokePeer(context.Background(), *peerID); err != nil {
 		fatal(err)
 	}
-}
-
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, err)
-	os.Exit(1)
 }

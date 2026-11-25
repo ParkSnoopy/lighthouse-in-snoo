@@ -30,17 +30,17 @@ import (
 func TestArchitectureAndControlPlaneInvariants(t *testing.T) {
 	t.Parallel()
 
-	// Verify cmd/lighthouse has ZERO dependency on pion/webrtc or pion/turn (Section 2.1, ARCH-03).
-	out, err := exec.Command("go", "list", "-deps", "lighthouse-in-snoo/cmd/lighthouse").CombinedOutput()
+	// Verify internal/hub and internal/stunserver have ZERO dependency on pion/webrtc or pion/turn (Section 2.1, ARCH-03).
+	out, err := exec.Command("go", "list", "-deps", "lighthouse-in-snoo/internal/hub", "lighthouse-in-snoo/internal/stunserver").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list -deps failed: %v\n%s", err, string(out))
 	}
 	deps := string(out)
 	if strings.Contains(deps, "github.com/pion/webrtc") {
-		t.Fatalf("ARCH-03 violation: hub binary depends on pion/webrtc:\n%s", deps)
+		t.Fatalf("ARCH-03 violation: hub control plane depends on pion/webrtc:\n%s", deps)
 	}
 	if strings.Contains(deps, "github.com/pion/turn") {
-		t.Fatalf("ARCH-03 violation: hub binary depends on pion/turn:\n%s", deps)
+		t.Fatalf("ARCH-03 violation: hub control plane depends on pion/turn:\n%s", deps)
 	}
 
 	ids := newTestMeshIdentities(t)
