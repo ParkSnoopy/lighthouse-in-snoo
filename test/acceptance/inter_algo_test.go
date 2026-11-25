@@ -240,12 +240,12 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			wsURL := "wss://" + boundAddr + "/v1/signal"
 
 			srv, err := hub.New(hub.Config{
-				HTTPSListener:  rawLn,
-				TLSConfig:      pki.serverTLS,
-				HubOrigin:      "wss://" + boundAddr,
-				EnableSTUN:     true,
-				STUNListenAddr: "127.0.0.1:0",
-				Policy:         policy,
+				HTTPSListener:   rawLn,
+				TLSConfig:       pki.serverTLS,
+				HubOrigin:       "wss://" + boundAddr,
+				EnableSTUN:      true,
+				STUNSListenAddr: "127.0.0.1:0",
+				Policy:          policy,
 			})
 			if err != nil {
 				_ = rawLn.Close()
@@ -253,7 +253,7 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			}
 			defer srv.Close()
 
-			stunURI := "stun:" + srv.STUNAddr().String()
+			stunURI := "stuns:" + srv.STUNSAddr().String()
 			sessBCh := make(chan *peer.Session, 1)
 
 			clientA, err := peer.NewClient(peer.Config{
@@ -299,6 +299,9 @@ func TestInterKeyAlgorithmSigningTLS13AndDTLS13Matrix(t *testing.T) {
 			}
 			if err := clientB.Register(ctx); err != nil {
 				t.Fatalf("Register B (%s): %v", tc.peerBID, err)
+			}
+			if _, err := clientA.ProbeSTUNS(ctx); err != nil {
+				t.Fatalf("ProbeSTUNS (%s CA -> %s leaf): %v", tc.hubCA, tc.hubLeaf, err)
 			}
 
 			sessA, err := clientA.Connect(ctx, peerB.PeerID)

@@ -197,10 +197,10 @@ func newTestMeshIdentities(t *testing.T) testMeshIdentities {
 	}
 }
 
-func startTestHub(t *testing.T, network, listenAddr, stunListenAddr string, policy identity.PolicyConfig, stunConn net.PacketConn) (*hub.Server, testCA, *safeLogBuffer, string, string) {
+func startTestHub(t *testing.T, network, listenAddr, stunsListenAddr string, policy identity.PolicyConfig, stunsConn net.PacketConn, extraIPs ...net.IP) (*hub.Server, testCA, *safeLogBuffer, string, string) {
 	t.Helper()
 
-	pki := generateTestPKI(t)
+	pki := generateTestPKI(t, extraIPs...)
 	logBuf := &safeLogBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -212,14 +212,14 @@ func startTestHub(t *testing.T, network, listenAddr, stunListenAddr string, poli
 	wsURL := "wss://" + boundAddr + "/v1/signal"
 
 	srv, err := hub.New(hub.Config{
-		HTTPSListener:  rawLn,
-		TLSConfig:      pki.serverTLS,
-		HubOrigin:      "wss://" + boundAddr,
-		EnableSTUN:     stunConn != nil || stunListenAddr != "",
-		STUNListenAddr: stunListenAddr,
-		STUNPacketConn: stunConn,
-		Policy:         policy,
-		Logger:         logger,
+		HTTPSListener:   rawLn,
+		TLSConfig:       pki.serverTLS,
+		HubOrigin:       "wss://" + boundAddr,
+		EnableSTUN:      stunsConn != nil || stunsListenAddr != "",
+		STUNSListenAddr: stunsListenAddr,
+		STUNSPacketConn: stunsConn,
+		Policy:          policy,
+		Logger:          logger,
 	})
 	if err != nil {
 		_ = rawLn.Close()
@@ -229,9 +229,9 @@ func startTestHub(t *testing.T, network, listenAddr, stunListenAddr string, poli
 		_ = srv.Close()
 	})
 
-	var stunURI string
-	if srv.STUNAddr() != nil {
-		stunURI = "stun:" + srv.STUNAddr().String()
+	var stunsURI string
+	if srv.STUNSAddr() != nil {
+		stunsURI = "stuns:" + srv.STUNSAddr().String()
 	}
-	return srv, pki, logBuf, wsURL, stunURI
+	return srv, pki, logBuf, wsURL, stunsURI
 }

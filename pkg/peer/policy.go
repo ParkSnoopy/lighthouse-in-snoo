@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -25,32 +26,88 @@ type RemoteSDPInfo struct {
 	MaxMessageSize     int
 }
 
-// ValidateSTUNServerURI enforces Section 5.1: only UDP stun: URIs are permitted;
-// turn:, turns:, stuns:, TCP transports, or embedded credentials are prohibited.
-func ValidateSTUNServerURI(rawURI string) error {
-	if rawURI == "" {
-		return nil
+// ValidateICEServerURI validates a STUN/STUNS/TURN/TURNS URI.
+// By default (allowInsecure=false), only encrypted stuns: and turns: schemes are accepted;
+// plaintext stun: and turn: require explicit opt-in (allowInsecure=true).
+// UDP (DTLS/UDP for stuns:/turns:) is always prioritized over TCP unless ?transport=tcp is set.
+func ValidateICEServerURI(rawURI string, allowInsecure bool) (*stun.URI, error) {
+	trimmed := strings.TrimSpace(rawURI)
+	if trimmed == "" {
+		return nil, nil
 	}
-	parsed, err := stun.ParseURI(rawURI)
+
+	// Detect whether an explicit ?transport= query was provided so UDP is prioritized by default.
+	rawParsed, err := url.Parse(trimmed)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidICEConfig, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidICEConfig, err)
 	}
-	if parsed.Scheme != stun.SchemeTypeSTUN || parsed.Proto != stun.ProtoTypeUDP {
-		return fmt.Errorf("%w: scheme=%s proto=%s", ErrInvalidICEConfig, parsed.Scheme, parsed.Proto)
+	explicitTransport := ""
+	if rawParsed.RawQuery != "" {
+		q, qErr := url.ParseQuery(rawParsed.RawQuery)
+		if qErr != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidICEConfig, qErr)
+		}
+		explicitTransport = strings.ToLower(strings.TrimSpace(q.Get("transport")))
+	}
+
+	// Accept stuns:host[:port]?transport=udp gracefully by normalizing before stun.ParseURI
+	// (pion/stun rejects query params on stuns: per RFC 7064, while RFC 7350 uses DTLS/UDP).
+	parseTarget := trimmed
+	if strings.EqualFold(rawParsed.Scheme, "stuns") && rawParsed.RawQuery != "" {
+		q, qErr := url.ParseQuery(rawParsed.RawQuery)
+		if qErr != nil || len(q) > 1 || (explicitTransport != "udp" && explicitTransport != "tcp") {
+			return nil, fmt.Errorf("%w: unsupported stuns query %q", ErrInvalidICEConfig, rawParsed.RawQuery)
+		}
+		parseTarget = rawParsed.Scheme + ":" + rawParsed.Opaque
+	}
+
+	parsed, err := stun.ParseURI(parseTarget)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidICEConfig, err)
 	}
 	if parsed.Host == "" || parsed.Port <= 0 || parsed.Port > 65535 {
-		return fmt.Errorf("%w: invalid STUN host/port", ErrInvalidICEConfig)
+		return nil, fmt.Errorf("%w: invalid ICE server host/port", ErrInvalidICEConfig)
 	}
-	return nil
+	if !parsed.IsSecure() && !allowInsecure {
+		return nil, fmt.Errorf("%w: %w: scheme=%s", ErrInvalidICEConfig, ErrInsecureICEProhibited, parsed.Scheme)
+	}
+
+	// Always prioritize UDP (DTLS/UDP for stuns:/turns:) unless ?transport=tcp was explicitly chosen.
+	switch explicitTransport {
+	case "tcp":
+		parsed.Proto = stun.ProtoTypeTCP
+	case "udp", "":
+		parsed.Proto = stun.ProtoTypeUDP
+	}
+
+	return parsed, nil
+}
+
+// ValidateSTUNServerURI enforces secure-by-default ICE URIs (stuns: / turns: only).
+// Plaintext stun: / turn: URIs require ValidateICEServerURI(rawURI, true).
+func ValidateSTUNServerURI(rawURI string) error {
+	_, err := ValidateICEServerURI(rawURI, false)
+	return err
 }
 
 // ValidateAndInspectRemoteSDP parses a remote SDP prior to installation in WebRTC
 // and enforces data-only media, SHA-256 DTLS fingerprints, non-empty ICE credentials,
-// and the direct-only candidate policy (rejecting relay/TCP/hub-endpoint candidates).
+// and direct-only candidate policy (rejecting relay/TCP/hub-endpoint candidates).
 func ValidateAndInspectRemoteSDP(
 	rawSDP string,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
+) (RemoteSDPInfo, error) {
+	return ValidateAndInspectRemoteSDPWithPolicy(rawSDP, prohibitedEndpoints, prohibitedIPs, false)
+}
+
+// ValidateAndInspectRemoteSDPWithPolicy validates a remote SDP with configurable relay admission
+// (allowRelay=true only when a validated TURN/TURNS server is configured).
+func ValidateAndInspectRemoteSDPWithPolicy(
+	rawSDP string,
+	prohibitedEndpoints []net.UDPAddr,
+	prohibitedIPs []net.IP,
+	allowRelay bool,
 ) (RemoteSDPInfo, error) {
 	var parsed sdp.SessionDescription
 	if err := parsed.Unmarshal([]byte(rawSDP)); err != nil {
@@ -96,10 +153,9 @@ func ValidateAndInspectRemoteSDP(
 
 	maxMsgSize := MaxApplicationMessageBytes
 
-	// Check session-level candidates if any.
 	for _, a := range parsed.Attributes {
 		if strings.EqualFold(a.Key, "candidate") {
-			if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs); err != nil {
+			if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs, allowRelay); err != nil {
 				return RemoteSDPInfo{}, err
 			}
 		}
@@ -119,8 +175,7 @@ func ValidateAndInspectRemoteSDP(
 		if v, ok := md.Attribute("ice-pwd"); ok && pwd == "" {
 			pwd = v
 		}
-		if v, ok := md.Attribute(" ice-lite"); ok || hasAttr(md.Attributes, "ice-lite") || hasAttr(parsed.Attributes, "ice-lite") {
-			_ = v
+		if hasAttr(md.Attributes, "ice-lite") || hasAttr(parsed.Attributes, "ice-lite") {
 			return RemoteSDPInfo{}, fmt.Errorf("%w: ice-lite prohibited; full ICE required", ErrInvalidRemoteSDP)
 		}
 		if v, ok := md.Attribute("max-message-size"); ok {
@@ -130,7 +185,7 @@ func ValidateAndInspectRemoteSDP(
 		}
 		for _, a := range md.Attributes {
 			if strings.EqualFold(a.Key, "candidate") {
-				if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs); err != nil {
+				if err := validateCandidateString(a.Value, prohibitedEndpoints, prohibitedIPs, allowRelay); err != nil {
 					return RemoteSDPInfo{}, err
 				}
 			}
@@ -152,23 +207,34 @@ func ValidateAndInspectRemoteSDP(
 	}, nil
 }
 
-// ValidateTrickleCandidate inspects a trickled ICE candidate prior to installation.
+// ValidateTrickleCandidate inspects a trickled ICE candidate prior to installation (direct-only).
 func ValidateTrickleCandidate(
 	body protocol.CandidateBody,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
 ) error {
+	return ValidateTrickleCandidateWithPolicy(body, prohibitedEndpoints, prohibitedIPs, false)
+}
+
+// ValidateTrickleCandidateWithPolicy inspects a trickled ICE candidate with configurable relay admission.
+func ValidateTrickleCandidateWithPolicy(
+	body protocol.CandidateBody,
+	prohibitedEndpoints []net.UDPAddr,
+	prohibitedIPs []net.IP,
+	allowRelay bool,
+) error {
 	trimmed := strings.TrimSpace(body.Candidate)
 	if trimmed == "" {
 		return ErrProhibitedCandidate
 	}
-	return validateCandidateString(trimmed, prohibitedEndpoints, prohibitedIPs)
+	return validateCandidateString(trimmed, prohibitedEndpoints, prohibitedIPs, allowRelay)
 }
 
 func validateCandidateString(
 	rawCand string,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
+	allowRelay bool,
 ) error {
 	spec := strings.TrimSpace(rawCand)
 	spec = strings.TrimPrefix(spec, "a=")
@@ -187,7 +253,9 @@ func validateCandidateString(
 	switch cand.Type() {
 	case ice.CandidateTypeHost, ice.CandidateTypeServerReflexive, ice.CandidateTypePeerReflexive:
 	case ice.CandidateTypeRelay:
-		return fmt.Errorf("%w: relay candidate prohibited", ErrProhibitedCandidate)
+		if !allowRelay {
+			return fmt.Errorf("%w: relay candidate prohibited", ErrProhibitedCandidate)
+		}
 	default:
 		return fmt.Errorf("%w: unsupported candidate type %s", ErrProhibitedCandidate, cand.Type())
 	}
@@ -200,11 +268,21 @@ func validateCandidateString(
 	return nil
 }
 
-// ValidateSelectedPair validates the nominated local and remote ICE candidates (Section 5.1).
+// ValidateSelectedPair validates the nominated local and remote ICE candidates (direct-only).
 func ValidateSelectedPair(
 	pair *webrtc.ICECandidatePair,
 	prohibitedEndpoints []net.UDPAddr,
 	prohibitedIPs []net.IP,
+) error {
+	return ValidateSelectedPairWithPolicy(pair, prohibitedEndpoints, prohibitedIPs, false)
+}
+
+// ValidateSelectedPairWithPolicy validates the nominated candidate pair with configurable relay admission.
+func ValidateSelectedPairWithPolicy(
+	pair *webrtc.ICECandidatePair,
+	prohibitedEndpoints []net.UDPAddr,
+	prohibitedIPs []net.IP,
+	allowRelay bool,
 ) error {
 	if pair == nil || pair.Local == nil || pair.Remote == nil {
 		return ErrUnverifiedPath
@@ -212,7 +290,7 @@ func ValidateSelectedPair(
 	if pair.Local.Protocol != webrtc.ICEProtocolUDP || pair.Remote.Protocol != webrtc.ICEProtocolUDP {
 		return fmt.Errorf("%w: non-UDP selected candidate pair", ErrProhibitedCandidate)
 	}
-	if !isAllowedWebRTCCandidateType(pair.Local.Typ) || !isAllowedWebRTCCandidateType(pair.Remote.Typ) {
+	if !isAllowedWebRTCCandidateType(pair.Local.Typ, allowRelay) || !isAllowedWebRTCCandidateType(pair.Remote.Typ, allowRelay) {
 		return fmt.Errorf(
 			"%w: selected pair (%s, %s)",
 			ErrProhibitedCandidate,
@@ -237,10 +315,12 @@ func parseCandidateIP(raw string) net.IP {
 	return nil
 }
 
-func isAllowedWebRTCCandidateType(t webrtc.ICECandidateType) bool {
+func isAllowedWebRTCCandidateType(t webrtc.ICECandidateType, allowRelay bool) bool {
 	switch t {
 	case webrtc.ICECandidateTypeHost, webrtc.ICECandidateTypeSrflx, webrtc.ICECandidateTypePrflx:
 		return true
+	case webrtc.ICECandidateTypeRelay:
+		return allowRelay
 	default:
 		return false
 	}
@@ -269,7 +349,7 @@ func checkProhibitedDestination(
 }
 
 // VerifyRemoteCertSHA256 parses the DER-encoded peer certificate from DTLS and confirms
-// its SHA-256 digest matches an Ed25519-authenticated fingerprint from the remote SDP.
+// its SHA-256 digest matches an identity-authenticated fingerprint from the remote SDP.
 func VerifyRemoteCertSHA256(rawDER []byte, expectedFingerprints []string) (string, error) {
 	if len(rawDER) == 0 || len(expectedFingerprints) == 0 {
 		return "", ErrFingerprintMismatch

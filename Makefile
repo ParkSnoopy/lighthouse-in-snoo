@@ -3,7 +3,7 @@ export
 
 VERSION ?= $(shell tr -d '[:space:]' < VERSION)
 LIGHTHOUSE_STUN_DOMAIN ?=
-LIGHTHOUSE_STUN_PORT ?= 3478
+LIGHTHOUSE_STUN_PORT ?= 5349
 LIGHTHOUSE_HUB_ORIGIN ?=
 LIGHTHOUSE_IMAGE ?= lighthouse:$(VERSION)
 
@@ -16,7 +16,7 @@ LDFLAGS := -s -w \
 .PHONY: build test vet version docker-build
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/lighthouse ./cmd/lighthouse
+	CGO_ENABLED=0 GOARCH=amd64 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/lighthouse ./cmd/lighthouse
 
 test:
 	go test -race -count=1 ./...
@@ -29,6 +29,7 @@ version:
 
 docker-build:
 	docker build \
+		--platform linux/amd64 \
 		--build-arg VERSION="$(VERSION)" \
 		--build-arg LIGHTHOUSE_STUN_DOMAIN="$(LIGHTHOUSE_STUN_DOMAIN)" \
 		--build-arg LIGHTHOUSE_STUN_PORT="$(LIGHTHOUSE_STUN_PORT)" \

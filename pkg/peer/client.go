@@ -32,7 +32,22 @@ import (
 	"lighthouse-in-snoo/pkg/protocol"
 )
 
-// Config configures an authenticated direct-only WebRTC peer client.
+// ICEServerConfig describes a STUNS/TURNS (or opt-in insecure STUN/TURN) server.
+type ICEServerConfig struct {
+	URI        string // stuns:host:5349, turns:host:5349[?transport=udp|tcp], or (with AllowInsecureICE) stun:/turn:.
+	Username   string // Required for turns: and turn: URIs.
+	Credential string // Required for turns: and turn: URIs.
+}
+
+type resolvedICEServer struct {
+	URI        *stun.URI
+	Username   string
+	Credential string
+}
+
+// Config configures an authenticated WebRTC peer client.
+// By default only encrypted stuns: and turns: (DTLS 1.3 / UDP prioritized) are permitted;
+// plaintext stun: and turn: require explicit opt-in via AllowInsecureICE.
 type Config struct {
 	KeyPair    *identity.KeyPair
 	Membership *identity.MembershipRecord
@@ -43,13 +58,20 @@ type Config struct {
 	TLSConfig     *tls.Config
 	HTTPTransport http.RoundTripper // Optional custom transport (e.g. for custom dialer in tests).
 
-	STUNServerURI       string               // Single UDP stun:host:port URI (Section 5.1).
-	NetworkTypes        []webrtc.NetworkType // Defaults to [UDP4, UDP6].
+	STUNServerURI       string                    // STUNS/TURNS URI (stuns: or turns: by default; stun:/turn: require AllowInsecureICE).
+	TURNServerURI       string                    // Optional TURNS/TURN URI (turns: prioritized over DTLS 1.3/UDP).
+	TURNUsername        string                    // Username for turns:/turn: server.
+	TURNCredential      string                    // Password/credential for turns:/turn: server.
+	ICEServers          []ICEServerConfig         // Optional additional STUNS/TURNS servers.
+	AllowInsecureICE    bool                      // Explicit opt-in required to allow plaintext stun:/turn: URIs.
+	AllowRelay          bool                      // Automatically enabled when a validated turns:/turn: server is configured.
+	ICETransportPolicy  webrtc.ICETransportPolicy // Optional ICE transport policy (default ICETransportPolicyAll).
+	NetworkTypes        []webrtc.NetworkType      // Defaults to [UDP4, UDP6].
 	IncludeLoopback     bool
 	VNet                transport.Net // Optional virtual network stack (pion/transport/v5/vnet).
 	PionLoggerFactory   logging.LoggerFactory
 	ProhibitedEndpoints []net.UDPAddr // Additional endpoints forbidden as data destinations.
-	BlockHubHostIP      *bool         // Defaults to true when Hub IP is non-loopback and non-local.
+	BlockHubHostIP      *bool         // Defaults to true when Hub IP is non-loopback and non-local (disabled when relay enabled).
 
 	EnablePacketChannel     bool // Negotiate optional unordered packet/v1 DataChannel (Section 7).
 	MaxQueueBytes           int
@@ -83,14 +105,19 @@ type lookupWaiter struct {
 	err error
 }
 
-// Client manages a peer's Ed25519 identity, authenticated WSS control-plane session,
-// independent trust verification, and direct-only WebRTC PeerConnections.
+// Client manages a peer's identity, authenticated WSS control-plane session,
+// independent trust verification, DTLS 1.3 STUNS/TURNS transport, and WebRTC PeerConnections.
 type Client struct {
 	cfg       Config
 	hubOrigin string
 	trust     *identity.TrustVerifier
 	log       *slog.Logger
 
+	resolvedICE         []resolvedICEServer
+	webrtcICEServers    []webrtc.ICEServer
+	dtlsUDPTargets      map[string]string
+	tlsTCPTargets       map[string]string
+	allowRelay          bool
 	prohibitedEndpoints []net.UDPAddr
 	prohibitedIPs       []net.IP
 
@@ -122,9 +149,11 @@ func NewClient(cfg Config) (*Client, error) {
 	if err := identity.ValidatePeerID(cfg.KeyPair.PeerID); err != nil {
 		return nil, err
 	}
-	if err := ValidateSTUNServerURI(cfg.STUNServerURI); err != nil {
+	resolvedICE, webrtcICE, dtlsTargets, tlsTCPTargets, hasTURN, err := compileICEServers(cfg)
+	if err != nil {
 		return nil, err
 	}
+	allowRelay := cfg.AllowRelay || hasTURN
 	for _, nt := range cfg.NetworkTypes {
 		if nt != webrtc.NetworkTypeUDP4 && nt != webrtc.NetworkTypeUDP6 {
 			return nil, fmt.Errorf("%w: non-UDP network type %s", ErrInvalidICEConfig, nt.String())
@@ -177,13 +206,18 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
-	prohibitedEPs, prohibitedIPs := deriveProhibitedHubTargets(cfg)
+	prohibitedEPs, prohibitedIPs := deriveProhibitedHubTargets(cfg, resolvedICE, allowRelay)
 
 	c := &Client{
 		cfg:                 cfg,
 		hubOrigin:           origin,
 		trust:               trust,
 		log:                 cfg.Logger,
+		resolvedICE:         resolvedICE,
+		webrtcICEServers:    webrtcICE,
+		dtlsUDPTargets:      dtlsTargets,
+		tlsTCPTargets:       tlsTCPTargets,
+		allowRelay:          allowRelay,
 		prohibitedEndpoints: prohibitedEPs,
 		prohibitedIPs:       prohibitedIPs,
 		vnet:                cfg.VNet,
@@ -199,7 +233,109 @@ func NewClient(cfg Config) (*Client, error) {
 	return c, nil
 }
 
-func deriveProhibitedHubTargets(cfg Config) ([]net.UDPAddr, []net.IP) {
+func compileICEServers(cfg Config) (
+	resolved []resolvedICEServer,
+	webrtcServers []webrtc.ICEServer,
+	dtlsUDPTargets map[string]string,
+	tlsTCPTargets map[string]string,
+	hasTURN bool,
+	err error,
+) {
+	dtlsUDPTargets = make(map[string]string)
+	tlsTCPTargets = make(map[string]string)
+
+	var entries []ICEServerConfig
+	if strings.TrimSpace(cfg.STUNServerURI) != "" {
+		entries = append(entries, ICEServerConfig{
+			URI:        cfg.STUNServerURI,
+			Username:   cfg.TURNUsername,
+			Credential: cfg.TURNCredential,
+		})
+	}
+	if strings.TrimSpace(cfg.TURNServerURI) != "" {
+		entries = append(entries, ICEServerConfig{
+			URI:        cfg.TURNServerURI,
+			Username:   cfg.TURNUsername,
+			Credential: cfg.TURNCredential,
+		})
+	}
+	entries = append(entries, cfg.ICEServers...)
+
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.URI) == "" {
+			continue
+		}
+		parsed, vErr := ValidateICEServerURI(entry.URI, cfg.AllowInsecureICE)
+		if vErr != nil {
+			return nil, nil, nil, nil, false, vErr
+		}
+		if parsed == nil {
+			continue
+		}
+		isTURN := parsed.Scheme == stun.SchemeTypeTURN || parsed.Scheme == stun.SchemeTypeTURNS
+		if isTURN {
+			if strings.TrimSpace(entry.Username) == "" || entry.Credential == "" {
+				return nil, nil, nil, nil, false, fmt.Errorf("%w: TURN/TURNS URI %q requires username and credential", ErrInvalidICEConfig, entry.URI)
+			}
+			hasTURN = true
+		}
+
+		hostPort := net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port))
+		resolved = append(resolved, resolvedICEServer{
+			URI:        parsed,
+			Username:   entry.Username,
+			Credential: entry.Credential,
+		})
+
+		var srv webrtc.ICEServer
+		switch {
+		case parsed.Scheme == stun.SchemeTypeSTUNS && parsed.Proto == stun.ProtoTypeUDP:
+			// Route through dtls13TransportNet (strict DTLS 1.3 over UDP on the shared ICE socket).
+			dtlsUDPTargets[hostPort] = parsed.Host
+			srv = webrtc.ICEServer{URLs: []string{"stun:" + hostPort}}
+
+		case parsed.Scheme == stun.SchemeTypeTURNS && parsed.Proto == stun.ProtoTypeUDP:
+			// Route through dtls13TransportNet (strict DTLS 1.3 over UDP with RootCAs + ServerName).
+			dtlsUDPTargets[hostPort] = parsed.Host
+			srv = webrtc.ICEServer{
+				URLs:           []string{"turn:" + hostPort + "?transport=udp"},
+				Username:       entry.Username,
+				Credential:     entry.Credential,
+				CredentialType: webrtc.ICECredentialTypePassword,
+			}
+
+		case parsed.Scheme == stun.SchemeTypeTURNS && parsed.Proto == stun.ProtoTypeTCP:
+			// Optional explicit ?transport=tcp fallback routed through TLS 1.3 proxy dialer.
+			tlsTCPTargets[hostPort] = parsed.Host
+			srv = webrtc.ICEServer{
+				URLs:           []string{"turns:" + hostPort + "?transport=tcp"},
+				Username:       entry.Username,
+				Credential:     entry.Credential,
+				CredentialType: webrtc.ICECredentialTypePassword,
+			}
+
+		case parsed.Scheme == stun.SchemeTypeSTUNS && parsed.Proto == stun.ProtoTypeTCP:
+			srv = webrtc.ICEServer{URLs: []string{parsed.String()}}
+
+		case isTURN:
+			// Opt-in plaintext turn: (only reachable when AllowInsecureICE == true).
+			srv = webrtc.ICEServer{
+				URLs:           []string{parsed.String()},
+				Username:       entry.Username,
+				Credential:     entry.Credential,
+				CredentialType: webrtc.ICECredentialTypePassword,
+			}
+
+		default:
+			// Opt-in plaintext stun: (only reachable when AllowInsecureICE == true).
+			srv = webrtc.ICEServer{URLs: []string{parsed.String()}}
+		}
+		webrtcServers = append(webrtcServers, srv)
+	}
+	return resolved, webrtcServers, dtlsUDPTargets, tlsTCPTargets, hasTURN, nil
+}
+
+func deriveProhibitedHubTargets(cfg Config, servers []resolvedICEServer, allowRelay bool) ([]net.UDPAddr, []net.IP) {
 	endpoints := append([]net.UDPAddr(nil), cfg.ProhibitedEndpoints...)
 	var ips []net.IP
 
@@ -221,7 +357,7 @@ func deriveProhibitedHubTargets(cfg Config) ([]net.UDPAddr, []net.IP) {
 			if port > 0 {
 				endpoints = append(endpoints, net.UDPAddr{IP: ip, Port: port})
 			}
-			blockIP := !isLocal(ip)
+			blockIP := !isLocal(ip) && !allowRelay
 			if cfg.BlockHubHostIP != nil {
 				blockIP = *cfg.BlockHubHostIP
 			}
@@ -238,7 +374,7 @@ func deriveProhibitedHubTargets(cfg Config) ([]net.UDPAddr, []net.IP) {
 			if port > 0 {
 				endpoints = append(endpoints, net.UDPAddr{IP: ip, Port: port})
 			}
-			blockIP := !isLocal(ip)
+			blockIP := !isLocal(ip) && !allowRelay
 			if cfg.BlockHubHostIP != nil {
 				blockIP = *cfg.BlockHubHostIP
 			}
@@ -257,9 +393,9 @@ func deriveProhibitedHubTargets(cfg Config) ([]net.UDPAddr, []net.IP) {
 		}
 		addEndpoint(u.Hostname(), port)
 	}
-	if cfg.STUNServerURI != "" {
-		if su, err := stun.ParseURI(cfg.STUNServerURI); err == nil {
-			addEndpoint(su.Host, su.Port)
+	for _, srv := range servers {
+		if srv.URI != nil {
+			addEndpoint(srv.URI.Host, srv.URI.Port)
 		}
 	}
 
@@ -921,6 +1057,25 @@ func (c *Client) removeSession(sess *Session, markClosed bool) {
 	}
 }
 
+// ProbeSTUNS verifies reachability and server certificate trust of the configured DTLS 1.3 / UDP
+// STUNS (or TURNS) server by executing a STUN Binding request over DTLS 1.3 / UDP.
+func (c *Client) ProbeSTUNS(ctx context.Context) (*stun.XORMappedAddress, error) {
+	var target *stun.URI
+	for _, srv := range c.resolvedICE {
+		if srv.URI != nil && srv.URI.IsSecure() && srv.URI.Proto == stun.ProtoTypeUDP {
+			target = srv.URI
+			break
+		}
+	}
+	if target == nil {
+		return nil, errors.New("peer: no DTLS/UDP stuns: or turns: server configured")
+	}
+	c.mu.Lock()
+	vnet := c.vnet
+	c.mu.Unlock()
+	return probeSTUNSOverDTLS13(ctx, target, vnet, c.cfg.TLSConfig, c.cfg.PionLoggerFactory)
+}
+
 func (c *Client) buildWebRTCAPI() (*webrtc.API, error) {
 	se := webrtc.SettingEngine{}
 
@@ -964,8 +1119,21 @@ func (c *Client) buildWebRTCAPI() (*webrtc.API, error) {
 	c.mu.Lock()
 	vnet := c.vnet
 	c.mu.Unlock()
-	if vnet != nil {
+	if len(c.dtlsUDPTargets) > 0 {
+		dtlsNet, err := newDTLS13TransportNet(vnet, c.dtlsUDPTargets, c.cfg.TLSConfig, c.cfg.PionLoggerFactory)
+		if err != nil {
+			return nil, err
+		}
+		se.SetNet(dtlsNet)
+	} else if vnet != nil {
 		se.SetNet(vnet)
+	}
+
+	if len(c.tlsTCPTargets) > 0 {
+		se.SetICEProxyDialer(&turnTCPProxyDialer{
+			tlsHosts: c.tlsTCPTargets,
+			tlsCfg:   c.cfg.TLSConfig,
+		})
 	}
 
 	// Filter remote IPs if any non-local Hub host IPs are prohibited.
@@ -1294,6 +1462,7 @@ func (s *Session) resetGenerationLocked(gen uint32) *webrtc.PeerConnection {
 	oldPC := s.pc
 	s.pc = nil
 	s.generation = gen
+	s.restarting = false
 	s.localSeq = 0
 	s.localICEUfrag = ""
 	s.localDescSent = false
@@ -1322,12 +1491,9 @@ func (s *Session) newPeerConnectionLocked(gen uint32, offerer bool) (*webrtc.Pee
 	if err != nil {
 		return nil, err
 	}
-	var iceServers []webrtc.ICEServer
-	if s.client.cfg.STUNServerURI != "" {
-		iceServers = []webrtc.ICEServer{{URLs: []string{s.client.cfg.STUNServerURI}}}
-	}
 	pcCfg := webrtc.Configuration{
-		ICEServers: iceServers,
+		ICEServers:         slices.Clone(s.client.webrtcICEServers),
+		ICETransportPolicy: s.client.cfg.ICETransportPolicy,
 	}
 	if s.client.cfg.DTLSCertAlgorithm != "" {
 		cert, certErr := generateEphemeralDTLSCertificate(s.client.cfg.DTLSCertAlgorithm, s.client.cfg.DTLSRSABits)
@@ -1601,7 +1767,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
-		info, err := ValidateAndInspectRemoteSDP(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs)
+		info, err := ValidateAndInspectRemoteSDPWithPolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay)
 		if err != nil {
 			if errors.Is(err, ErrProhibitedCandidate) || errors.Is(err, ErrProhibitedEndpoint) {
 				s.client.prohibitedRejected.Add(1)
@@ -1660,7 +1826,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 		if err := jcs.UnmarshalStrict(env.Body, &body); err != nil {
 			return err
 		}
-		info, err := ValidateAndInspectRemoteSDP(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs)
+		info, err := ValidateAndInspectRemoteSDPWithPolicy(body.SDP, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay)
 		if err != nil {
 			if errors.Is(err, ErrProhibitedCandidate) || errors.Is(err, ErrProhibitedEndpoint) {
 				s.client.prohibitedRejected.Add(1)
@@ -1694,7 +1860,7 @@ func (s *Session) applyOrderedEnvelope(env *protocol.SignalEnvelope) error {
 			return err
 		}
 		// Section 5.1 & T08: Reject prohibited candidates BEFORE buffering or installing into WebRTC!
-		if err := ValidateTrickleCandidate(body, s.client.prohibitedEndpoints, s.client.prohibitedIPs); err != nil {
+		if err := ValidateTrickleCandidateWithPolicy(body, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay); err != nil {
 			s.client.prohibitedRejected.Add(1)
 			return err
 		}
@@ -1807,8 +1973,8 @@ func (s *Session) onLocalICECandidate(gen uint32, pc *webrtc.PeerConnection, can
 		return
 	}
 
-	// Never emit relay or non-UDP candidates locally either.
-	if !isAllowedWebRTCCandidateType(cand.Typ) || cand.Protocol != webrtc.ICEProtocolUDP {
+	// Never emit prohibited relay or non-UDP candidates locally either.
+	if !isAllowedWebRTCCandidateType(cand.Typ, s.client.allowRelay) || cand.Protocol != webrtc.ICEProtocolUDP {
 		return
 	}
 	initJSON := cand.ToJSON()
@@ -1907,7 +2073,7 @@ func (s *Session) sendSignedEnvelope(ctx context.Context, gen uint32, msgType st
 }
 
 func (s *Session) onSelectedPairChange(gen uint32, pc *webrtc.PeerConnection, pair *webrtc.ICECandidatePair) {
-	if err := ValidateSelectedPair(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs); err != nil {
+	if err := ValidateSelectedPairWithPolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay); err != nil {
 		// Section 5.1: Immediately suspend traffic and close on prohibited/unverifiable path!
 		s.pathVerified.Store(false)
 		s.dataCh.setPathAllowed(false)
@@ -1997,7 +2163,7 @@ func (s *Session) markDataChannelOpen(gen uint32, pc *webrtc.PeerConnection) {
 func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 	// Double-check live selected candidate pair right before enabling user payloads.
 	pair, err := pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
-	if err != nil || ValidateSelectedPair(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs) != nil {
+	if err != nil || ValidateSelectedPairWithPolicy(pair, s.client.prohibitedEndpoints, s.client.prohibitedIPs, s.client.allowRelay) != nil {
 		return
 	}
 
@@ -2006,11 +2172,10 @@ func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 		s.mu.Unlock()
 		return
 	}
-	if s.state == StateFailed || s.state == StateDisconnected {
+	if s.state == StateFailed || s.state == StateDisconnected || s.restarting {
 		s.mu.Unlock()
 		return
 	}
-	s.restarting = false
 	firstConnect := !s.notifiedApp
 	isInitiator := s.isInitiator
 	s.notifiedApp = true
@@ -2041,13 +2206,19 @@ func (s *Session) tryPromoteToConnected(gen uint32, pc *webrtc.PeerConnection) {
 
 // RestartICE manually triggers a bounded signed ICE restart on an established session.
 func (s *Session) RestartICE(ctx context.Context) error {
+	s.mu.Lock()
+	startGen := s.generation
+	s.mu.Unlock()
 	s.triggerNetworkChange()
 	budget := s.client.cfg.OfferToConnectedTimeout + s.client.cfg.ICERestartBackoff*time.Duration(1<<max(0, s.client.cfg.MaxICERestarts))
 	deadline, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	for {
-		st := s.State()
-		if st == StateConnected && s.IsPathVerified() {
+		s.mu.Lock()
+		st := s.state
+		curGen := s.generation
+		s.mu.Unlock()
+		if curGen > startGen && st == StateConnected && s.IsPathVerified() {
 			return nil
 		}
 		if st == StateFailed || st == StateDisconnected {

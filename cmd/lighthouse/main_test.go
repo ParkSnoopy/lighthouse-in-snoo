@@ -41,7 +41,16 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lighthouse help hub failed: %v\n%s", err, string(hubHelp))
 	}
-	for _, want := range []string{"Usage: lighthouse hub [OPTIONS]", "--https-addr <ADDR>", "[env: LIGHTHOUSE_HTTPS_ADDR]", "[default: :8443]"} {
+	for _, want := range []string{
+		"Usage: lighthouse hub [OPTIONS]",
+		"--https-addr <ADDR>",
+		"[env: LIGHTHOUSE_HTTPS_ADDR]",
+		"[default: :8443]",
+		"--stuns-addr <ADDR>",
+		"[default: :5349]",
+		"--insecure",
+		"--turn-secret <SECRET>",
+	} {
 		if !strings.Contains(string(hubHelp), want) {
 			t.Fatalf("hub help missing %q:\n%s", want, string(hubHelp))
 		}
@@ -100,6 +109,30 @@ func TestUnifiedBinaryClapHelpAndPOSIXFlags(t *testing.T) {
 		if !strings.Contains(string(out), "use two dashes") {
 			t.Fatalf("expected double-dash tip for %v, got:\n%s", badArgs, string(out))
 		}
+	}
+
+	// Verify hub rejects plaintext --stun-addr without --insecure (exit code 2).
+	hubInsecureCmd := exec.Command(binPath, "hub", "--stun-addr", ":3478")
+	hubInsecureOut, hubInsecureErr := hubInsecureCmd.CombinedOutput()
+	if hubInsecureErr == nil || hubInsecureCmd.ProcessState.ExitCode() != 2 {
+		t.Fatalf("expected exit code 2 for hub --stun-addr without --insecure, got err=%v code=%d out=%s", hubInsecureErr, hubInsecureCmd.ProcessState.ExitCode(), string(hubInsecureOut))
+	}
+	if !strings.Contains(string(hubInsecureOut), "--insecure") {
+		t.Fatalf("expected --insecure hint in hub error:\n%s", string(hubInsecureOut))
+	}
+
+	// Verify peer rejects plaintext stun: URI without --insecure (exit code 2).
+	polPath := filepath.Join(tmpDir, "policy.json")
+	if err := os.WriteFile(polPath, []byte(`{"v":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	peerInsecureCmd := exec.Command(binPath, "peer", "--key", keyPath, "--policy", polPath, "--stun", "stun:127.0.0.1:3478")
+	peerInsecureOut, peerInsecureErr := peerInsecureCmd.CombinedOutput()
+	if peerInsecureErr == nil || peerInsecureCmd.ProcessState.ExitCode() != 2 {
+		t.Fatalf("expected exit code 2 for peer --stun stun:... without --insecure, got err=%v code=%d out=%s", peerInsecureErr, peerInsecureCmd.ProcessState.ExitCode(), string(peerInsecureOut))
+	}
+	if !strings.Contains(string(peerInsecureOut), "--insecure") {
+		t.Fatalf("expected --insecure hint in peer error:\n%s", string(peerInsecureOut))
 	}
 
 	// Verify clap-like typo suggestion on unknown double-dash option.
@@ -194,7 +227,7 @@ func TestVersionAlignmentAndBuildTimeSTUNDomainDefaults(t *testing.T) {
 	// Build a binary with compile-time VERSION + LIGHTHOUSE_STUN_DOMAIN injected via -ldflags.
 	tmpDir := t.TempDir()
 	bakedBin := filepath.Join(tmpDir, "lighthouse-baked")
-	ldflags := "-X main.appVersion=9.8.7 -X main.defaultSTUNDomain=stun.baked.example -X main.defaultSTUNPort=3479 -X main.defaultHubOrigin=wss://hub.baked.example"
+	ldflags := "-X main.appVersion=9.8.7 -X main.defaultSTUNDomain=stun.baked.example -X main.defaultSTUNPort=5350 -X main.defaultHubOrigin=wss://hub.baked.example"
 	if out, err := exec.Command("go", "build", "-ldflags", ldflags, "-o", bakedBin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build with ldflags failed: %v\n%s", err, string(out))
 	}
@@ -208,20 +241,25 @@ func TestVersionAlignmentAndBuildTimeSTUNDomainDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("baked peer --help failed: %v\n%s", err, string(peerHelp))
 	}
-	for _, want := range []string{"[default: stun:stun.baked.example:3479]", "[default: wss://hub.baked.example/v1/signal]"} {
+	for _, want := range []string{
+		"[default: stuns:stun.baked.example:5350]",
+		"[default: wss://hub.baked.example/v1/signal]",
+		"--insecure",
+		"--turn <URI>",
+	} {
 		if !strings.Contains(string(peerHelp), want) {
 			t.Fatalf("baked peer --help missing %q:\n%s", want, string(peerHelp))
 		}
 	}
 
-	// Verify runtime ENV LIGHTHOUSE_STUN_DOMAIN overrides compile-time default.
+	// Verify runtime ENV LIGHTHOUSE_STUN_DOMAIN overrides compile-time default with stuns:.
 	envCmd := exec.Command(bakedBin, "peer", "--help")
-	envCmd.Env = append(os.Environ(), "LIGHTHOUSE_STUN_DOMAIN=stun.env.example", "LIGHTHOUSE_STUN_PORT=3480")
+	envCmd.Env = append(os.Environ(), "LIGHTHOUSE_STUN_DOMAIN=stun.env.example", "LIGHTHOUSE_STUN_PORT=5351")
 	envHelp, err := envCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("env peer --help failed: %v\n%s", err, string(envHelp))
 	}
-	if !strings.Contains(string(envHelp), "[default: stun:stun.env.example:3480]") {
-		t.Fatalf("runtime env STUN override not reflected in help:\n%s", string(envHelp))
+	if !strings.Contains(string(envHelp), "[default: stuns:stun.env.example:5351]") {
+		t.Fatalf("runtime env STUNS override not reflected in help:\n%s", string(envHelp))
 	}
 }

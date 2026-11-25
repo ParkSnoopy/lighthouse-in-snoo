@@ -1,54 +1,56 @@
 # Lighthouse (v0.1.0)
 
-Lighthouse (`v0.1.0`, reported by `lighthouse --version`) coordinates authenticated, end-to-end encrypted, direct peer-to-peer WebRTC DataChannel connections through a single-container control-plane hub. Application payloads travel exclusively between participating peers over SCTP protected by DTLS 1.3 above ICE-negotiated UDP paths.
+Lighthouse (`v0.1.0`, reported by `lighthouse --version`) coordinates authenticated, end-to-end encrypted WebRTC DataChannel connections through a single-container `linux/amd64` hub. Control-plane signaling runs over TLS 1.3 WSS (`:8443/tcp`), address discovery and optional relay run over **DTLS 1.3 / UDP** `stuns:`/`turns:` (`:5349/udp`) by default, and peer DataChannels run over SCTP protected end to end by DTLS 1.3 over UDP. Plaintext `stun:` and `turn:` require explicit opt-in via `--insecure`.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph S["Single Container (lighthouse)"]
-        H["HTTPS / WSS Signaling (:8443/tcp)"]
-        T["RFC 8489 UDP STUN (:3478/udp)"]
+    subgraph S["Single Container (lighthouse, linux/amd64)"]
+        H["HTTPS / WSS Signaling (:8443/tcp, TLS 1.3)"]
+        T["STUNS / TURNS (:5349/udp, DTLS 1.3)"]
         R[("Trust Policy & Ephemeral Presence")]
         H --- R
     end
     A["Peer A (lighthouse peer / pkg/peer)"]
     B["Peer B (lighthouse peer / pkg/peer)"]
-    A -. "TLS 1.3 WSS + Ed25519 JCS Envelopes" .-> H
-    B -. "TLS 1.3 WSS + Ed25519 JCS Envelopes" .-> H
-    A -. "UDP STUN Binding" .-> T
-    B -. "UDP STUN Binding" .-> T
-    A <-->|"Direct SCTP / DTLS 1.3 / UDP"| B
+    A -. "TLS 1.3 WSS + Signed JCS Envelopes" .-> H
+    B -. "TLS 1.3 WSS + Signed JCS Envelopes" .-> H
+    A -. "DTLS 1.3 / UDP STUNS or TURNS" .-> T
+    B -. "DTLS 1.3 / UDP STUNS or TURNS" .-> T
+    A <-->|"End-to-End SCTP / DTLS 1.3 / UDP"| B
 ```
 
 ### Design Guarantees
 
-- **Control-Plane Separation**: `lighthouse hub` (`internal/hub` and `internal/stunserver`) implements peer challenge-response registration, presence leases, authorized lookup, signed signaling forwarding, and UDP STUN Binding without importing WebRTC `PeerConnection` or TURN packages.
-- **Independent Peer Authentication**: Peers authenticate each other using persistent Ed25519 identities verified against local pinned keys or offline-authority-signed membership records, independent of hub assertions.
-- **DTLS 1.3 Only**: Peer transport enforces DTLS 1.3 (`0xFEFC`) with ephemeral ECDHE forward secrecy, AEAD record protection, replay window enforcement, and Ed25519-authenticated SHA-256 certificate fingerprints.
-- **Direct-Only Fail-Closed ICE**: Only UDP `host`, `srflx`, and `prflx` candidates are permitted. `relay` candidates, TURN servers, TCP candidates, and hub service endpoints are rejected before installation and on selected-pair transitions.
+- **Encrypted UDP-First ICE (`stuns:` / `turns:`)**: Both `lighthouse hub` and `lighthouse peer` enforce encrypted `stuns:` and `turns:` over **DTLS 1.3 / UDP** (`:5349/udp`) by default, prioritizing UDP over TCP. Plaintext `stun:` and `turn:` are rejected unless `--insecure` is explicitly passed.
+- **Independent Peer Authentication**: Peers authenticate each other using persistent identity keys (`ed25519`, `ed448`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) verified against local pinned keys or offline-authority-signed membership records, independent of hub assertions.
+- **End-to-End DTLS 1.3 Only**: Peer DataChannels enforce DTLS 1.3 (`0xFEFC`) with ephemeral ECDHE forward secrecy, AEAD record protection, replay window enforcement, and identity-authenticated SHA-256 certificate fingerprints. The hub never instantiates a WebRTC `PeerConnection` or terminates peer DTLS sessions.
+- **Fail-Closed Policy Enforcement**: Direct UDP `host`/`srflx`/`prflx` candidates are used by default; `relay` candidates are rejected unless a validated `turns:` (or `--insecure` `turn:`) server is configured.
 
 ## Components
 
 | Component | Path | Purpose |
 | --- | --- | --- |
 | `lighthouse` | `cmd/lighthouse` | Single binary providing `hub` (server), `peer` (client), and `admin` subcommands |
-| `internal/hub` | `internal/hub` | HTTPS/WSS signaling (`:8443/tcp`) and UDP STUN (`:3478/udp`) control plane |
-| `pkg/identity` | `pkg/identity` | Ed25519 keys, `peer_id` derivation, offline authority certificates, ACLs |
+| `internal/hub` | `internal/hub` | TLS 1.3 HTTPS/WSS signaling (`:8443/tcp`) and DTLS 1.3 STUNS/TURNS coordination |
+| `internal/stunserver` | `internal/stunserver` | DTLS 1.3 / UDP STUNS Binding responder (`:5349/udp`) with opt-in insecure UDP STUN |
+| `internal/turnserver` | `internal/turnserver` | Authenticated DTLS 1.3 / UDP TURNS server (`:5349/udp`) with opt-in insecure UDP TURN |
+| `pkg/identity` | `pkg/identity` | Multi-algorithm keys, `peer_id` derivation, offline authority memberships, ACLs |
 | `pkg/protocol` | `pkg/protocol` | Strict JSON/RFC 8785 JCS control-plane schema and signed envelopes |
-| `pkg/peer` | `pkg/peer` | Go SDK for direct-only WebRTC sessions, backpressure, and ICE restarts |
+| `pkg/peer` | `pkg/peer` | Go SDK for DTLS 1.3 STUNS/TURNS ICE, WebRTC sessions, backpressure, and ICE restarts |
 
 ## Quick Start
 
-### 1. Build Binary (with Optional `.env` / ENV Default STUN Domain)
+### 1. Build Binary (with Optional `.env` / ENV Default STUNS Domain)
 
-Build directly with Go or via `Makefile` / `.env` (copy `.env.example` to `.env`) to bake a default STUN domain, port, hub origin, and version (`VERSION` / `lighthouse --version`) into the binary:
+Build directly with Go or via `Makefile` / `.env` (copy `.env.example` to `.env`) to bake a default STUNS domain, port (`5349`), hub origin, and version (`VERSION` / `lighthouse --version`) into the binary:
 
 ```bash
-# Plain static build
-CGO_ENABLED=0 go build -o bin/lighthouse ./cmd/lighthouse
+# Plain static linux/amd64 build
+CGO_ENABLED=0 GOARCH=amd64 go build -o bin/lighthouse ./cmd/lighthouse
 
-# Build with default STUN domain via ENV or .env
+# Build with default STUNS domain via ENV or .env
 LIGHTHOUSE_STUN_DOMAIN=stun.example.com LIGHTHOUSE_HUB_ORIGIN=wss://hub.example.com make build
 ```
 
@@ -99,23 +101,23 @@ Create `config/policy.json` (provisioned to the hub and each peer):
 }
 ```
 
-### 3. Deploy the Hub with Docker / GHCR
+### 3. Deploy the Hub with Docker / GHCR (`linux/amd64`)
 
-Pull the versioned hub container published to GitHub Container Registry by `.github/workflows/build.yml` (tagged to match `lighthouse --version`, e.g., `0.1.0` / `v0.1.0`), or build locally with Docker Compose:
+Pull the `linux/amd64` hub container published to GitHub Container Registry by `.github/workflows/build.yml` (tagged to match `lighthouse --version`, e.g., `0.1.0` / `v0.1.0`), or build locally with Docker Compose:
 
 ```bash
-# Pull published hub image matching lighthouse --version (v0.1.0)
+# Pull published linux/amd64 hub image matching lighthouse --version (v0.1.0)
 docker pull ghcr.io/<owner>/<repo>:v0.1.0
 
 # Or build and run locally (reads optional .env for LIGHTHOUSE_STUN_DOMAIN / VERSION)
 docker compose up -d --build
 ```
 
-Or run the server directly with `./bin/lighthouse hub`. Reload updated ACL or revocation policies without restarting the process by sending `SIGHUP` to `lighthouse`.
+Or run the server directly with `./bin/lighthouse hub`. Reload updated ACL or revocation policies without restarting by sending `SIGHUP` to `lighthouse`.
 
 ### 4. Connect Two Peers
 
-Start the responder peer:
+Start the responder peer (uses DTLS 1.3 / UDP `stuns:` by default):
 
 ```bash
 ./bin/lighthouse peer \
@@ -123,7 +125,7 @@ Start the responder peer:
   --membership peer-b-membership.json \
   --policy config/policy.json \
   --hub wss://hub.example.com/v1/signal \
-  --stun stun:hub.example.com:3478
+  --stun stuns:hub.example.com:5349
 ```
 
 Dial from the initiator peer:
@@ -134,8 +136,28 @@ Dial from the initiator peer:
   --membership peer-a-membership.json \
   --policy config/policy.json \
   --hub wss://hub.example.com/v1/signal \
-  --stun stun:hub.example.com:3478 \
+  --stun stuns:hub.example.com:5349 \
   --connect <PEER_B_ID>
+```
+
+Use authenticated DTLS 1.3 / UDP `turns:` relay when peers sit behind restrictive NATs:
+
+```bash
+./bin/lighthouse peer \
+  --key peer-a.key \
+  --membership peer-a-membership.json \
+  --policy config/policy.json \
+  --hub wss://hub.example.com/v1/signal \
+  --turn turns:hub.example.com:5349 \
+  --turn-user <USER> \
+  --turn-pass <PASS> \
+  --connect <PEER_B_ID>
+```
+
+Plaintext `stun:` and `turn:` URIs require explicit `--insecure`:
+
+```bash
+./bin/lighthouse peer --insecure --key peer-a.key --policy config/policy.json --stun stun:hub.example.com:3478 --connect <PEER_B_ID>
 ```
 
 ## Hub Configuration
@@ -144,11 +166,18 @@ Dial from the initiator peer:
 
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
-| `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS `/healthz` and WSS `/v1/signal` |
-| `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | `:3478` | UDP listen address for RFC 8489 STUN Binding |
+| `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for TLS 1.3 `/healthz` and WSS `/v1/signal` |
+| `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | UDP listen address for DTLS 1.3 STUNS (and TURNS when credentials are set) |
+| `--stun-addr` | `LIGHTHOUSE_STUN_ADDR` | *(disabled)* | Plaintext UDP STUN/TURN address; requires `--insecure` (`:3478` when `--insecure` is set) |
+| `--insecure` | — | `false` | Opt in to unencrypted UDP `stun:`/`turn:` listener on `--stun-addr` |
+| `--turn-secret` | `LIGHTHOUSE_TURN_SECRET` | *(disabled)* | Shared secret enabling authenticated DTLS 1.3 TURNS (HMAC TURN REST credentials) |
+| `--turn-users` | `LIGHTHOUSE_TURN_USERS` | *(disabled)* | Static `user=pass[,user=pass]` credentials enabling authenticated DTLS 1.3 TURNS |
+| `--turn-realm` | `LIGHTHOUSE_TURN_REALM` | `lighthouse` | RFC 8656 TURN authentication realm |
+| `--turn-public-ip` | `LIGHTHOUSE_TURN_PUBLIC_IP` | *(auto)* | Static public IP advertised in TURN UDP relay allocations |
+| `--turn-tls-addr` | `LIGHTHOUSE_TURN_TLS_ADDR` | *(disabled)* | Optional TLS 1.3 / TCP TURNS fallback listener (`?transport=tcp`) |
 | `--hub-origin` | `LIGHTHOUSE_HUB_ORIGIN` | `wss://localhost:8443` | Canonical WSS origin bound into registration challenge proofs |
-| `--tls-cert` | `LIGHTHOUSE_TLS_CERT` | `/etc/lighthouse/tls.crt` | Server TLS certificate PEM |
-| `--tls-key` | `LIGHTHOUSE_TLS_KEY` | `/etc/lighthouse/tls.key` | Server TLS private key PEM |
+| `--tls-cert` | `LIGHTHOUSE_TLS_CERT` | `/etc/lighthouse/tls.crt` | Server certificate PEM (TLS 1.3 WSS + DTLS 1.3 STUNS/TURNS) |
+| `--tls-key` | `LIGHTHOUSE_TLS_KEY` | `/etc/lighthouse/tls.key` | Server private key PEM |
 | `-p, --policy` | `LIGHTHOUSE_POLICY` | `/etc/lighthouse/policy.json` | Trust, membership, ACL, and revocation policy file |
 | `--sqlite` | `LIGHTHOUSE_SQLITE` | *(disabled)* | Optional SQLite database path for persistent administrative policy |
 | `--presence-heartbeat` | — | `20s` | Advertised peer presence heartbeat interval |

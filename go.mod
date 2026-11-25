@@ -11,6 +11,7 @@ require (
 	github.com/pion/sdp/v3 v3.0.20
 	github.com/pion/stun/v5 v5.0.0-rc.3
 	github.com/pion/transport/v5 v5.1.5
+	github.com/pion/turn/v6 v6.0.0-rc.1
 	github.com/pion/webrtc/v5 v5.0.0-rc.4
 	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.63.0
@@ -29,7 +30,6 @@ require (
 	github.com/pion/rtp v1.10.6 // indirect
 	github.com/pion/sctp v1.12.1 // indirect
 	github.com/pion/srtp/v3 v3.1.3 // indirect
-	github.com/pion/turn/v6 v6.0.0-rc.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.54.0 // indirect

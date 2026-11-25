@@ -10,7 +10,7 @@ import (
 var (
 	appVersion        = "0.1.0"
 	defaultSTUNDomain = ""
-	defaultSTUNPort   = "3478"
+	defaultSTUNPort   = "5349"
 	defaultHubOrigin  = ""
 )
 
@@ -23,7 +23,7 @@ func resolvedDefaultSTUNURI() string {
 		port = strings.TrimSpace(defaultSTUNPort)
 	}
 	if port == "" {
-		port = "3478"
+		port = "5349"
 	}
 	if domain := strings.TrimSpace(os.Getenv("LIGHTHOUSE_STUN_DOMAIN")); domain != "" {
 		return formatSTUNURI(domain, port)
@@ -31,7 +31,11 @@ func resolvedDefaultSTUNURI() string {
 	if domain := strings.TrimSpace(defaultSTUNDomain); domain != "" {
 		return formatSTUNURI(domain, port)
 	}
-	return "stun:127.0.0.1:" + port
+	return "stuns:127.0.0.1:" + port
+}
+
+func resolvedDefaultTURNURI() string {
+	return strings.TrimSpace(os.Getenv("LIGHTHOUSE_TURN_URI"))
 }
 
 func resolvedDefaultHubOrigin() string {
@@ -59,23 +63,37 @@ func resolvedDefaultHubURL() string {
 
 func formatSTUNURI(domain, defaultPort string) string {
 	d := strings.TrimSpace(domain)
-	if strings.Contains(d, "://") || strings.HasPrefix(strings.ToLower(d), "stun:") {
+	lower := strings.ToLower(d)
+	if strings.Contains(d, "://") ||
+		strings.HasPrefix(lower, "stuns:") ||
+		strings.HasPrefix(lower, "turns:") ||
+		strings.HasPrefix(lower, "stun:") ||
+		strings.HasPrefix(lower, "turn:") {
 		return d
 	}
 	// If already host:port or [ipv6]:port, preserve explicit port.
 	if _, _, err := net.SplitHostPort(d); err == nil {
-		return "stun:" + d
+		return "stuns:" + d
 	}
 	// Bare IPv6 address without brackets.
 	if ip := net.ParseIP(d); ip != nil && ip.To4() == nil {
-		return "stun:[" + d + "]:" + defaultPort
+		return "stuns:[" + d + "]:" + defaultPort
 	}
-	return "stun:" + net.JoinHostPort(strings.Trim(d, "[]"), defaultPort)
+	return "stuns:" + net.JoinHostPort(strings.Trim(d, "[]"), defaultPort)
 }
 
 func stripSTUNHost(domain string) string {
 	d := strings.TrimSpace(domain)
-	d = strings.TrimPrefix(d, "stun:")
+	lower := strings.ToLower(d)
+	for _, prefix := range []string{"stuns:", "turns:", "stun:", "turn:"} {
+		if strings.HasPrefix(lower, prefix) {
+			d = d[len(prefix):]
+			break
+		}
+	}
+	if qIdx := strings.IndexByte(d, '?'); qIdx >= 0 {
+		d = d[:qIdx]
+	}
 	if host, _, err := net.SplitHostPort(d); err == nil {
 		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
 			return "[" + host + "]"

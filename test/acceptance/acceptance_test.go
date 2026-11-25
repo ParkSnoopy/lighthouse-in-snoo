@@ -30,17 +30,21 @@ import (
 func TestArchitectureAndControlPlaneInvariants(t *testing.T) {
 	t.Parallel()
 
-	// Verify internal/hub and internal/stunserver have ZERO dependency on pion/webrtc or pion/turn (Section 2.1, ARCH-03).
-	out, err := exec.Command("go", "list", "-deps", "lighthouse-in-snoo/internal/hub", "lighthouse-in-snoo/internal/stunserver").CombinedOutput()
+	// Verify internal/hub has ZERO dependency on pion/webrtc (never terminates PeerConnection),
+	// and internal/stunserver has ZERO dependency on pion/webrtc or pion/turn.
+	outHub, err := exec.Command("go", "list", "-deps", "lighthouse-in-snoo/internal/hub").CombinedOutput()
 	if err != nil {
-		t.Fatalf("go list -deps failed: %v\n%s", err, string(out))
+		t.Fatalf("go list -deps internal/hub failed: %v\n%s", err, string(outHub))
 	}
-	deps := string(out)
-	if strings.Contains(deps, "github.com/pion/webrtc") {
-		t.Fatalf("ARCH-03 violation: hub control plane depends on pion/webrtc:\n%s", deps)
+	if strings.Contains(string(outHub), "github.com/pion/webrtc") {
+		t.Fatalf("ARCH violation: hub control plane depends on pion/webrtc:\n%s", string(outHub))
 	}
-	if strings.Contains(deps, "github.com/pion/turn") {
-		t.Fatalf("ARCH-03 violation: hub control plane depends on pion/turn:\n%s", deps)
+	outSTUN, err := exec.Command("go", "list", "-deps", "lighthouse-in-snoo/internal/stunserver").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list -deps internal/stunserver failed: %v\n%s", err, string(outSTUN))
+	}
+	if strings.Contains(string(outSTUN), "github.com/pion/webrtc") || strings.Contains(string(outSTUN), "github.com/pion/turn") {
+		t.Fatalf("ARCH violation: stunserver depends on pion/webrtc or pion/turn:\n%s", string(outSTUN))
 	}
 
 	ids := newTestMeshIdentities(t)
@@ -130,6 +134,9 @@ func TestT01_SameLANDirectHostConnectivity(t *testing.T) {
 	}
 	if err := clientB.Register(ctx); err != nil {
 		t.Fatalf("Register B: %v", err)
+	}
+	if mapped, err := clientA.ProbeSTUNS(ctx); err != nil || mapped == nil {
+		t.Fatalf("ProbeSTUNS DTLS 1.3 / UDP failed: mapped=%v err=%v", mapped, err)
 	}
 
 	sessA, err := clientA.Connect(ctx, ids.peerB.PeerID)
@@ -585,14 +592,25 @@ func TestT08_RelayAndHubEndpointCandidatesRejected(t *testing.T) {
 	ids := newTestMeshIdentities(t)
 	srv, pki, _, wsURL, stunURI := startTestHub(t, "tcp4", "127.0.0.1:0", "127.0.0.1:0", ids.policy, nil)
 
-	// 1. TURN server URL in peer config MUST be rejected immediately.
+	// 1. Plaintext stun:/turn: URIs MUST be rejected unless AllowInsecureICE=true.
+	for _, badURI := range []string{"stun:127.0.0.1:3478", "turn:127.0.0.1:3478"} {
+		if _, err := peer.NewClient(peer.Config{
+			KeyPair:       ids.peerA,
+			Policy:        ids.policy,
+			SignalingURL:  wsURL,
+			STUNServerURI: badURI,
+		}); !errors.Is(err, peer.ErrInsecureICEProhibited) || !errors.Is(err, peer.ErrInvalidICEConfig) {
+			t.Fatalf("T08: expected ErrInsecureICEProhibited for %q, got %v", badURI, err)
+		}
+	}
+	// turns: without credentials MUST fail validation.
 	if _, err := peer.NewClient(peer.Config{
 		KeyPair:       ids.peerA,
 		Policy:        ids.policy,
 		SignalingURL:  wsURL,
-		STUNServerURI: "turn:127.0.0.1:3478",
+		TURNServerURI: "turns:127.0.0.1:5349",
 	}); !errors.Is(err, peer.ErrInvalidICEConfig) {
-		t.Fatalf("T08: expected ErrInvalidICEConfig for turn: URI, got %v", err)
+		t.Fatalf("T08: expected ErrInvalidICEConfig for turns: without credentials, got %v", err)
 	}
 
 	clientA, err := peer.NewClient(peer.Config{

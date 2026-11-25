@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pion/stun/v5"
 	"github.com/pion/webrtc/v5"
 
 	"lighthouse-in-snoo/pkg/peer"
@@ -15,19 +16,42 @@ import (
 func TestSDPAndCandidatePolicyValidation(t *testing.T) {
 	t.Parallel()
 
-	// Reject TURN, turns, stuns, and TCP STUN URIs.
-	for _, badURI := range []string{
+	// By default (allowInsecure=false), plaintext stun: and turn: MUST be rejected.
+	for _, insecureURI := range []string{
+		"stun:hub.example.com:3478",
 		"turn:hub.example.com:3478",
-		"turns:hub.example.com:5349",
-		"stuns:hub.example.com:5349",
-		"stun:hub.example.com:3478?transport=tcp",
+		"turn:hub.example.com:3478?transport=udp",
+		"turn:hub.example.com:3478?transport=tcp",
 	} {
-		if err := peer.ValidateSTUNServerURI(badURI); !errors.Is(err, peer.ErrInvalidICEConfig) {
-			t.Fatalf("expected ErrInvalidICEConfig for %q, got %v", badURI, err)
+		if err := peer.ValidateSTUNServerURI(insecureURI); !errors.Is(err, peer.ErrInsecureICEProhibited) || !errors.Is(err, peer.ErrInvalidICEConfig) {
+			t.Fatalf("expected ErrInsecureICEProhibited for %q, got %v", insecureURI, err)
+		}
+		if _, err := peer.ValidateICEServerURI(insecureURI, true); err != nil {
+			t.Fatalf("expected %q to succeed with allowInsecure=true, got %v", insecureURI, err)
 		}
 	}
-	if err := peer.ValidateSTUNServerURI("stun:hub.example.com:3478"); err != nil {
-		t.Fatalf("valid stun URI rejected: %v", err)
+
+	// Secure stuns: and turns: are permitted by default and prioritize UDP (DTLS/UDP) over TCP.
+	for _, tc := range []struct {
+		uri       string
+		wantProto stun.ProtoType
+		wantPort  int
+	}{
+		{"stuns:hub.example.com", stun.ProtoTypeUDP, 5349},
+		{"stuns:hub.example.com:5349", stun.ProtoTypeUDP, 5349},
+		{"stuns:hub.example.com:5349?transport=udp", stun.ProtoTypeUDP, 5349},
+		{"turns:hub.example.com", stun.ProtoTypeUDP, 5349},
+		{"turns:hub.example.com:5349", stun.ProtoTypeUDP, 5349},
+		{"turns:hub.example.com:5349?transport=udp", stun.ProtoTypeUDP, 5349},
+		{"turns:hub.example.com:5349?transport=tcp", stun.ProtoTypeTCP, 5349},
+	} {
+		parsed, err := peer.ValidateICEServerURI(tc.uri, false)
+		if err != nil {
+			t.Fatalf("valid secure URI %q rejected: %v", tc.uri, err)
+		}
+		if parsed.Proto != tc.wantProto || parsed.Port != tc.wantPort {
+			t.Fatalf("URI %q -> proto=%s port=%d; want proto=%s port=%d", tc.uri, parsed.Proto, parsed.Port, tc.wantProto, tc.wantPort)
+		}
 	}
 
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
@@ -41,7 +65,7 @@ func TestSDPAndCandidatePolicyValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hubEP := []net.UDPAddr{{IP: net.ParseIP("203.0.113.10"), Port: 3478}}
+	hubEP := []net.UDPAddr{{IP: net.ParseIP("203.0.113.10"), Port: 5349}}
 	hubIP := []net.IP{net.ParseIP("203.0.113.10")}
 
 	info, err := peer.ValidateAndInspectRemoteSDP(offer.SDP, hubEP, hubIP)
@@ -74,6 +98,17 @@ func TestSDPAndCandidatePolicyValidation(t *testing.T) {
 		Candidate: "candidate:1 1 UDP 2130706431 203.0.113.10 50000 typ host",
 	}, hubEP, hubIP); !errors.Is(err, peer.ErrProhibitedEndpoint) {
 		t.Fatalf("expected ErrProhibitedEndpoint for Hub IP candidate, got %v", err)
+	}
+
+	// Relay candidates are rejected in direct-only mode and allowed when TURNS/TURN is enabled.
+	relayCand := protocol.CandidateBody{
+		Candidate: "candidate:2 1 UDP 16777295 198.51.100.77 50000 typ relay raddr 192.0.2.2 rport 40001",
+	}
+	if err := peer.ValidateTrickleCandidateWithPolicy(relayCand, hubEP, hubIP, false); !errors.Is(err, peer.ErrProhibitedCandidate) {
+		t.Fatalf("expected ErrProhibitedCandidate for relay when allowRelay=false, got %v", err)
+	}
+	if err := peer.ValidateTrickleCandidateWithPolicy(relayCand, hubEP, nil, true); err != nil {
+		t.Fatalf("expected UDP relay candidate allowed when allowRelay=true, got %v", err)
 	}
 
 	// Accept IPv6 link-local selected pair with interface zone suffix.

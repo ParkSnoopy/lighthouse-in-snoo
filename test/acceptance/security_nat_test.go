@@ -90,14 +90,14 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 	}
 	defer wan.Stop()
 
-	stunConn, err := stunNet.ListenPacket("udp4", "203.0.113.10:3478")
+	stunConn, err := stunNet.ListenPacket("udp4", "203.0.113.10:5349")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer stunConn.Close()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn)
+	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
 
 	sessBCh := make(chan *peer.Session, 1)
 	clientA, err := peer.NewClient(peer.Config{
@@ -106,7 +106,7 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
-		STUNServerURI:     "stun:203.0.113.10:3478",
+		STUNServerURI:     "stuns:203.0.113.10:5349",
 		NetworkTypes:      []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:   false,
 		VNet:              netA,
@@ -123,7 +123,7 @@ func TestT03_CompatibleNATsSeparateNetworks(t *testing.T) {
 		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
-		STUNServerURI:     "stun:203.0.113.10:3478",
+		STUNServerURI:     "stuns:203.0.113.10:5349",
 		NetworkTypes:      []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:   false,
 		VNet:              netB,
@@ -219,11 +219,11 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 	_ = wan.Start()
 	defer wan.Stop()
 
-	stunConn, _ := stunNet.ListenPacket("udp4", "203.0.113.10:3478")
+	stunConn, _ := stunNet.ListenPacket("udp4", "203.0.113.10:5349")
 	defer stunConn.Close()
 
 	ids := newTestMeshIdentities(t)
-	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn)
+	_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
 
 	clientA, _ := peer.NewClient(peer.Config{
 		KeyPair:                 ids.peerA,
@@ -231,7 +231,7 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 		Policy:                  ids.policy,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
-		STUNServerURI:           "stun:203.0.113.10:3478",
+		STUNServerURI:           "stuns:203.0.113.10:5349",
 		NetworkTypes:            []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:         false,
 		VNet:                    netA,
@@ -246,7 +246,7 @@ func TestT04_RestrictiveNATsFailClosed(t *testing.T) {
 		Policy:                  ids.policy,
 		SignalingURL:            wsURL,
 		TLSConfig:               pki.clientTLS,
-		STUNServerURI:           "stun:203.0.113.10:3478",
+		STUNServerURI:           "stuns:203.0.113.10:5349",
 		NetworkTypes:            []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:         false,
 		VNet:                    netB,
@@ -325,11 +325,11 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	_ = wan.Start()
 	defer wan.Stop()
 
-	stunConn, _ := stunNet.ListenPacket("udp4", "203.0.113.10:3478")
+	stunConn, _ := stunNet.ListenPacket("udp4", "203.0.113.10:5349")
 	defer stunConn.Close()
 
 	ids := newTestMeshIdentities(t)
-	srv, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn)
+	srv, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
 
 	sessBCh := make(chan *peer.Session, 1)
 	clientA, _ := peer.NewClient(peer.Config{
@@ -338,7 +338,7 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
-		STUNServerURI:     "stun:203.0.113.10:3478",
+		STUNServerURI:     "stuns:203.0.113.10:5349",
 		NetworkTypes:      []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:   false,
 		VNet:              netA,
@@ -352,7 +352,7 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 		Policy:            ids.policy,
 		SignalingURL:      wsURL,
 		TLSConfig:         pki.clientTLS,
-		STUNServerURI:     "stun:203.0.113.10:3478",
+		STUNServerURI:     "stuns:203.0.113.10:5349",
 		NetworkTypes:      []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 		IncludeLoopback:   false,
 		VNet:              netB,
@@ -373,6 +373,7 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	sessB := <-sessBCh
 
 	hubStatsBefore := srv.Stats()
+	hubUDPBefore := hubUDPBytes.Load()
 
 	// Transfer 512 KiB (32 chunks x 16 KiB) with SHA-256 verification.
 	const numChunks = 32
@@ -412,6 +413,7 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	}
 
 	hubStatsAfter := srv.Stats()
+	hubUDPDelta := hubUDPBytes.Load() - hubUDPBefore
 	if hubStatsAfter.SignalsForwarded != hubStatsBefore.SignalsForwarded {
 		t.Fatalf("T09: expected 0 signaling messages forwarded during data transfer, got delta %d",
 			hubStatsAfter.SignalsForwarded-hubStatsBefore.SignalsForwarded)
@@ -419,14 +421,14 @@ func TestT09_LargeBinaryTransferPacketCapture(t *testing.T) {
 	if directPeerBytes.Load() < uint64(len(totalPayload)) {
 		t.Fatalf("T09: expected >= %d direct peer UDP bytes, captured %d", len(totalPayload), directPeerBytes.Load())
 	}
-	if hubMaxPacket.Load() > 128 {
-		t.Fatalf("T09: Hub UDP saw non-STUN packet size %d bytes", hubMaxPacket.Load())
+	if hubUDPDelta > 4096 {
+		t.Fatalf("T09: unexpected Hub UDP volume during direct data transfer: delta=%d bytes", hubUDPDelta)
 	}
 	if otherBytes.Load() != 0 {
 		t.Fatalf("T09: unexpected third-party packets captured: %d bytes", otherBytes.Load())
 	}
-	t.Logf("T09 Packet Capture Verified: DirectPeerUDPBytes=%d HubSTUNBytes=%d HubMaxPacket=%d HubSignalsDelta=0",
-		directPeerBytes.Load(), hubUDPBytes.Load(), hubMaxPacket.Load())
+	t.Logf("T09 Packet Capture Verified: DirectPeerUDPBytes=%d HubSTUNSBytes=%d HubUDPDelta=%d HubSignalsDelta=0",
+		directPeerBytes.Load(), hubUDPBytes.Load(), hubUDPDelta)
 }
 
 // TestT11_NetworkChangeAndNATExpiryICERestart verifies T11:
@@ -464,11 +466,11 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 		_ = wan.Start()
 		defer wan.Stop()
 
-		stunConn, _ := stunNet.ListenPacket("udp4", "203.0.113.10:3478")
+		stunConn, _ := stunNet.ListenPacket("udp4", "203.0.113.10:5349")
 		defer stunConn.Close()
 
 		ids := newTestMeshIdentities(t)
-		_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn)
+		_, pki, _, wsURL, _ := startTestHub(t, "tcp4", "127.0.0.1:0", "", ids.policy, stunConn, net.ParseIP("203.0.113.10"))
 
 		sessBCh := make(chan *peer.Session, 1)
 		clientA, _ := peer.NewClient(peer.Config{
@@ -477,7 +479,7 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 			Policy:            ids.policy,
 			SignalingURL:      wsURL,
 			TLSConfig:         pki.clientTLS,
-			STUNServerURI:     "stun:203.0.113.10:3478",
+			STUNServerURI:     "stuns:203.0.113.10:5349",
 			NetworkTypes:      []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:   false,
 			VNet:              netA1,
@@ -492,7 +494,7 @@ func TestT11_NetworkChangeAndNATExpiryICERestart(t *testing.T) {
 			Policy:            ids.policy,
 			SignalingURL:      wsURL,
 			TLSConfig:         pki.clientTLS,
-			STUNServerURI:     "stun:203.0.113.10:3478",
+			STUNServerURI:     "stuns:203.0.113.10:5349",
 			NetworkTypes:      []webrtc.NetworkType{webrtc.NetworkTypeUDP4},
 			IncludeLoopback:   false,
 			VNet:              netB,
@@ -635,16 +637,16 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 	wsURL := "wss://" + boundAddr + "/v1/signal"
 
 	srv, err := hub.New(hub.Config{
-		HTTPSListener:  rawLn,
-		TLSConfig:      pki.serverTLS,
-		HubOrigin:      "wss://" + boundAddr,
-		EnableSTUN:     true,
-		STUNListenAddr: "127.0.0.1:0",
-		Policy:         ids.policy,
-		PerIPConnRPS:   50,
-		PerIPConnBurst: 15,
-		STUNPerIPRPS:   50,
-		STUNPerIPBurst: 30,
+		HTTPSListener:   rawLn,
+		TLSConfig:       pki.serverTLS,
+		HubOrigin:       "wss://" + boundAddr,
+		EnableSTUN:      true,
+		STUNSListenAddr: "127.0.0.1:0",
+		Policy:          ids.policy,
+		PerIPConnRPS:    50,
+		PerIPConnBurst:  15,
+		STUNPerIPRPS:    50,
+		STUNPerIPBurst:  30,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -722,7 +724,7 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
-		STUNServerURI:   "stun:" + srv.STUNAddr().String(),
+		STUNServerURI:   "stuns:" + srv.STUNSAddr().String(),
 		IncludeLoopback: true,
 	})
 	defer clientA.Close()
@@ -733,7 +735,7 @@ func TestT12_FloodOversizedSignalingAndMalformedSTUN(t *testing.T) {
 		Policy:          ids.policy,
 		SignalingURL:    wsURL,
 		TLSConfig:       pki.clientTLS,
-		STUNServerURI:   "stun:" + srv.STUNAddr().String(),
+		STUNServerURI:   "stuns:" + srv.STUNSAddr().String(),
 		IncludeLoopback: true,
 		OnSession:       func(s *peer.Session) { sessBCh <- s },
 	})

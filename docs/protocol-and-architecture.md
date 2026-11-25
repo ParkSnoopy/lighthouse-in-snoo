@@ -7,11 +7,15 @@ Application binary messages (<= 16 KiB per message)
 WebRTC DataChannel / DCEP ("data/v1", optional "packet/v1")
 SCTP (congestion control active, max-message-size = 16384)
 DTLS 1.3 (RFC 9147, 0xFEFC, ECDHE + AEAD, replay window = 64, 0-RTT disabled)
-ICE-selected direct UDP transport (host / srflx / prflx only; relay prohibited)
+ICE-selected UDP transport (host / srflx / prflx; relay permitted only with configured turns:/turn:)
 IPv4 / IPv6
 ```
 
-Control-plane signaling runs out of band over `wss://<host>/v1/signal` using TLS 1.3 exclusively. Address discovery uses a UDP-only RFC 8489 STUN Binding responder on `:3478/udp`.
+Control-plane signaling runs out of band over `wss://<host>/v1/signal` using TLS 1.3 exclusively. Address discovery and optional TURN relaying prioritize **DTLS 1.3 over UDP** (`:5349/udp`, RFC 7350 + RFC 8489 + RFC 8656):
+
+- `stuns:<host>[:<port>]` (default port `5349`): runs STUN Binding over DTLS 1.3 / UDP on the shared ICE UDP socket so NAT mappings discovered over STUNS match direct UDP peer traffic.
+- `turns:<host>[:<port>]` (default port `5349`): prioritizes DTLS 1.3 / UDP (`?transport=udp`) automatically; `?transport=tcp` uses TLS 1.3 / TCP when explicitly requested.
+- Plaintext `stun:` and `turn:` (default port `3478`) are rejected by default on both hub and peer and require explicit opt-in via `--insecure` (`AllowInsecure` / `AllowInsecureICE`).
 
 ## 2. Cryptographic Identity and Trust
 
@@ -78,12 +82,15 @@ All cryptographic signatures use RFC 8785 JSON Canonicalization Scheme (`interna
 - Receiving peers independently verify identity, ACL, signature, expiry, session replay history, and generation freshness. Trickled candidates arriving prior to `SetRemoteDescription` are buffered in `seq` order (up to `128`) and installed only after the verified SDP is applied.
 - If WSS disconnects before a negotiation reaches `Connected`, the peer abandons that negotiation so subsequent attempts use a fresh `session_id`. Already-`Connected` direct sessions continue across hub outages.
 
-## 4. Direct Transport, State Machine, and DataChannels
+## 4. Transport, State Machine, and DataChannels
 
-### 4.1 Candidate Policy and Glare Resolution
+### 4.1 ICE Server and Candidate Policy
 
-- Allowed UDP candidate types: `host`, `srflx`, `prflx`.
-- Prohibited: `relay` candidates, TCP candidates, `ice-lite`, audio/video media descriptions, `turn:`/`turns:`/`stuns:` URIs, and candidates targeting hub signaling or STUN endpoints.
+- Default secure schemes: `stuns:` and `turns:` (prioritizing DTLS 1.3 / UDP `:5349/udp` over TLS 1.3 / TCP).
+- Plaintext `stun:` and `turn:` fail closed (`ErrInsecureICEProhibited`) unless `--insecure` / `AllowInsecureICE: true` is set.
+- Peer ICE candidate admission:
+  - Direct-only mode (no `turns:`/`turn:` configured): only UDP `host`, `srflx`, and `prflx` candidates are accepted; `relay` candidates, TCP candidates, `ice-lite`, audio/video media sections, and hub endpoints are rejected.
+  - TURN-enabled mode (`turns:` or `--insecure` `turn:` configured): UDP `relay` candidates are admitted alongside `host`/`srflx`/`prflx` while retaining strict end-to-end DTLS 1.3 (`0xFEFC`) + SHA-256 fingerprint authentication between peers.
 - Concurrent offers for the same peer pair resolve deterministically: the offer from the lexicographically smaller `peer_id` wins.
 
 ### 4.2 Connection State Machine
@@ -94,11 +101,11 @@ stateDiagram-v2
     Disconnected --> Discovering
     Discovering --> Negotiating: authorized peer online
     Discovering --> Failed: offline or denied
-    Negotiating --> Authenticating: direct UDP candidate pair nominated
+    Negotiating --> Authenticating: valid UDP candidate pair nominated
     Negotiating --> Failed: timeout or prohibited candidate
     Authenticating --> Connected: DTLS 1.3 (0xFEFC) + SHA-256 fingerprint + data/v1 open
     Authenticating --> Failed: downgrade, fingerprint mismatch, or transport failure
-    Connected --> Reconnecting: direct path lost or network change
+    Connected --> Reconnecting: path lost or network change
     Reconnecting --> Negotiating: bounded signed ICE restart (generation + 1)
     Reconnecting --> Failed: retry budget exhausted or hub offline
     Connected --> Disconnected: close
@@ -112,17 +119,19 @@ stateDiagram-v2
 | `data/v1` | `true` | Reliable | `16 KiB` per message |
 | `packet/v1` (optional) | `false` | `maxRetransmits = 0` | `16 KiB` per message |
 
-The answerer closes any incoming DataChannel with an unrecognized label or mismatched reliability attributes. Outbound senders enforce a `1 MiB` per-peer queue cap combined with SCTP `BufferedAmount` low/high watermarks (`256 KiB` / `512 KiB`), suspending new payload transmission immediately whenever the direct path is unverified.
+The answerer closes any incoming DataChannel with an unrecognized label or mismatched reliability attributes. Outbound senders enforce a `1 MiB` per-peer queue cap combined with SCTP `BufferedAmount` low/high watermarks (`256 KiB` / `512 KiB`), suspending new payload transmission immediately whenever the path is unverified.
 
 ## 5. Pinned Reference Dependencies
 
 | Module | Version | Role |
 | --- | --- | --- |
 | `github.com/pion/webrtc/v5` | `v5.0.0-rc.4` | Native Go WebRTC PeerConnection, ICE, SCTP, DCEP |
-| `github.com/pion/dtls/v4` | `v4.0.1` | DTLS 1.3 (RFC 9147) handshake and AEAD record layer |
+| `github.com/pion/dtls/v4` | `v4.0.1` | DTLS 1.3 (RFC 9147) for peer transport and RFC 7350 DTLS/UDP STUNS/TURNS |
 | `github.com/pion/ice/v5` | `v5.0.0-rc.9` | Full ICE agent and candidate parser |
 | `github.com/pion/stun/v5` | `v5.0.0-rc.3` | RFC 8489 STUN wire codec |
+| `github.com/pion/turn/v6` | `v6.0.0-rc.1` | RFC 8656 authenticated DTLS/UDP TURNS server and client |
 | `github.com/pion/sdp/v3` | `v3.0.20` | SDP parsing and pre-installation policy inspection |
 | `github.com/pion/transport/v5` | `v5.1.5` | Network abstraction and `vnet` virtual NAT/router testing |
 | `github.com/coder/websocket` | `v1.8.15` | Bounded TLS 1.3 WebSocket client and server |
+| `github.com/cloudflare/circl` | `v1.6.5` | RFC 8032 Ed448 identity and authority signatures |
 | `modernc.org/sqlite` | `v1.63.0` | Optional pure-Go SQLite administrative policy persistence |

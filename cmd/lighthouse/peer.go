@@ -33,18 +33,23 @@ func newPeerCommand() *cli.Command {
 		hubOrigin  string
 		caPath     string
 		stunURI    string
+		turnURI    string
+		turnUser   string
+		turnPass   string
+		insecure   bool
 		targetID   string
 		packetCh   bool
 	)
 
 	cmd := &cli.Command{
 		Name:       "peer",
-		ShortAbout: "Run the direct-only DTLS 1.3 WebRTC peer client",
-		LongAbout:  "Authenticate to a Lighthouse hub over TLS 1.3 WSS and establish direct DTLS 1.3 SCTP DataChannel sessions without TURN or relay fallbacks.",
+		ShortAbout: "Run the DTLS 1.3 WebRTC peer client",
+		LongAbout:  "Authenticate to a Lighthouse hub over TLS 1.3 WSS, use DTLS 1.3 / UDP stuns:/turns: by default (or opt in to plaintext stun:/turn: with --insecure), and establish DTLS 1.3 SCTP DataChannel sessions.",
 		Examples: []string{
 			"lighthouse peer --key peer.key --gen-key --print-id",
-			"lighthouse peer --key peer-b.key --membership peer-b.json --policy policy.json --hub wss://hub.example.com/v1/signal --stun stun:hub.example.com:3478",
-			"lighthouse peer --key peer-a.key --membership peer-a.json --policy policy.json --hub wss://hub.example.com/v1/signal --stun stun:hub.example.com:3478 --connect <PEER_B_ID>",
+			"lighthouse peer --key peer-b.key --membership peer-b.json --policy policy.json --hub wss://hub.example.com/v1/signal --stun stuns:hub.example.com:5349",
+			"lighthouse peer --key peer-a.key --membership peer-a.json --policy policy.json --turn turns:hub.example.com:5349 --turn-user u --turn-pass p --connect <PEER_B_ID>",
+			"lighthouse peer --insecure --key peer-a.key --policy policy.json --stun stun:hub.example.com:3478 --connect <PEER_B_ID>",
 		},
 		Run: func(cctx *cli.Context) error {
 			logger := slog.New(slog.NewJSONHandler(cctx.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -138,6 +143,10 @@ func newPeerCommand() *cli.Command {
 				HubOrigin:           hubOrigin,
 				TLSConfig:           tlsCfg,
 				STUNServerURI:       stunURI,
+				TURNServerURI:       turnURI,
+				TURNUsername:        turnUser,
+				TURNCredential:      turnPass,
+				AllowInsecureICE:    insecure,
 				EnablePacketChannel: packetCh,
 				Logger:              logger,
 				OnSession: func(s *peer.Session) {
@@ -148,6 +157,10 @@ func newPeerCommand() *cli.Command {
 				},
 			})
 			if err != nil {
+				if errors.Is(err, peer.ErrInvalidICEConfig) || errors.Is(err, peer.ErrInsecureICEProhibited) {
+					fmt.Fprintf(cctx.Stderr, "error: %v\n\nFor more information, try '--help'.\n", err)
+					return &cli.ExitError{Code: 2, Err: err}
+				}
 				logger.Error("create peer client failed", "err", err)
 				return err
 			}
@@ -169,7 +182,7 @@ func newPeerCommand() *cli.Command {
 			if targetID != "" {
 				sess, err = client.Connect(ctx, targetID)
 				if err != nil {
-					logger.Error("direct peer connection failed", "target", targetID, "err", err)
+					logger.Error("peer connection failed", "target", targetID, "err", err)
 					return err
 				}
 			} else {
@@ -182,7 +195,7 @@ func newPeerCommand() *cli.Command {
 			defer sess.Close()
 
 			diag := sess.Diagnostics()
-			logger.Info("direct session established",
+			logger.Info("session established",
 				"remote_peer_id", diag.RemotePeerID,
 				"dtls_version", diag.DTLSVersion,
 				"local_type", diag.LocalCandidateType,
@@ -225,8 +238,8 @@ func newPeerCommand() *cli.Command {
 		Long:      "key",
 		Short:     'k',
 		ValueName: "PATH",
-		ShortHelp: "Ed25519 identity key file path",
-		LongHelp:  "Path to persistent 0600 Ed25519 identity key JSON file",
+		ShortHelp: "Identity key file path",
+		LongHelp:  "Path to persistent 0600 identity key JSON file",
 		Default:   "peer-key.json",
 	})
 	cmd.BoolOpt(&genKey, cli.Option{
@@ -286,17 +299,44 @@ func newPeerCommand() *cli.Command {
 	cmd.StringOpt(&caPath, cli.Option{
 		Long:      "ca",
 		ValueName: "PATH",
-		ShortHelp: "PEM Root CA bundle for hub TLS",
-		LongHelp:  "Optional custom PEM Root CA certificate file for validating the hub TLS 1.3 certificate",
+		ShortHelp: "PEM Root CA bundle for hub TLS/DTLS",
+		LongHelp:  "Optional custom PEM Root CA certificate file for validating hub TLS 1.3 WSS and DTLS 1.3 STUNS/TURNS certificates",
 	})
 	cmd.StringOpt(&stunURI, cli.Option{
 		Long:      "stun",
 		Short:     's',
 		ValueName: "URI",
-		ShortHelp: "UDP STUN server URI",
-		LongHelp:  "Single UDP STUN server URI (stun:host:port); TURN and TCP URIs are prohibited",
+		ShortHelp: "STUNS/TURNS server URI (DTLS/UDP prioritized)",
+		LongHelp:  "STUNS or TURNS server URI (stuns:host:5349 or turns:host:5349 over DTLS 1.3/UDP); plaintext stun:/turn: require --insecure",
 		EnvVar:    "LIGHTHOUSE_STUN_URI",
 		Default:   resolvedDefaultSTUNURI(),
+	})
+	cmd.StringOpt(&turnURI, cli.Option{
+		Long:      "turn",
+		ValueName: "URI",
+		ShortHelp: "Optional TURNS/TURN relay URI (DTLS/UDP prioritized)",
+		LongHelp:  "Optional TURNS relay URI (turns:host:5349 over DTLS 1.3/UDP; pass ?transport=tcp for TLS/TCP); plaintext turn: requires --insecure",
+		EnvVar:    "LIGHTHOUSE_TURN_URI",
+		Default:   resolvedDefaultTURNURI(),
+	})
+	cmd.StringOpt(&turnUser, cli.Option{
+		Long:      "turn-user",
+		ValueName: "USER",
+		ShortHelp: "Username for TURNS/TURN authentication",
+		LongHelp:  "Username sent during RFC 8656 TURNS/TURN long-term credential authentication",
+		EnvVar:    "LIGHTHOUSE_TURN_USER",
+	})
+	cmd.StringOpt(&turnPass, cli.Option{
+		Long:      "turn-pass",
+		ValueName: "PASS",
+		ShortHelp: "Password for TURNS/TURN authentication",
+		LongHelp:  "Password or HMAC credential sent during RFC 8656 TURNS/TURN authentication",
+		EnvVar:    "LIGHTHOUSE_TURN_PASS",
+	})
+	cmd.BoolOpt(&insecure, cli.Option{
+		Long:      "insecure",
+		ShortHelp: "Allow plaintext stun:/turn: URIs",
+		LongHelp:  "Opt in to unencrypted stun: and turn: server URIs; WSS TLS 1.3 and peer DTLS 1.3 remain enforced",
 	})
 	cmd.StringOpt(&targetID, cli.Option{
 		Long:      "connect",

@@ -1,6 +1,8 @@
 package stunserver
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,6 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/dtls/v4"
+	dtlsProtocol "github.com/pion/dtls/v4/pkg/protocol"
+	"github.com/pion/logging"
 	"github.com/pion/stun/v5"
 	"golang.org/x/time/rate"
 
@@ -18,24 +23,44 @@ import (
 const (
 	// MinSTUNHeaderBytes is the fixed 20-byte RFC 8489 STUN header length.
 	MinSTUNHeaderBytes = 20
-	// DefaultMaxDatagramBytes bounds incoming UDP datagrams accepted by the STUN Binding service.
+	// DefaultMaxDatagramBytes bounds incoming plaintext STUN messages.
 	DefaultMaxDatagramBytes = 576
+	// DefaultMaxDTLSDatagramBytes bounds raw UDP datagrams carrying DTLS 1.3 records.
+	DefaultMaxDTLSDatagramBytes = 4096
+	// DefaultSTUNSAddr is the default RFC 7350 DTLS-over-UDP STUNS port.
+	DefaultSTUNSAddr = ":5349"
+	// DefaultInsecureSTUNAddr is the default plaintext UDP STUN port (opt-in only).
+	DefaultInsecureSTUNAddr = ":3478"
 )
 
-// Config configures the UDP-only RFC 8489 STUN Binding server (Section 8).
+// ErrInsecureSTUNProhibited is returned when plaintext UDP STUN is configured without AllowInsecure.
+var ErrInsecureSTUNProhibited = errors.New("stunserver: plaintext UDP STUN requires AllowInsecure=true; use DTLS 1.3 STUNS over UDP")
+
+// Config configures the RFC 8489 / RFC 7350 STUN Binding server.
+// By default it serves STUNS over DTLS 1.3 / UDP (:5349/udp). Plaintext UDP STUN requires AllowInsecure=true.
 type Config struct {
-	ListenAddr       string
-	PacketConn       net.PacketConn // Optional pre-bound UDP PacketConn (e.g. vnet or custom socket).
+	DTLSListenAddr string         // UDP listen address for DTLS 1.3 STUNS (default :5349).
+	DTLSPacketConn net.PacketConn // Optional pre-bound UDP PacketConn wrapped with DTLS 1.3.
+	TLSConfig      *tls.Config    // Required for DTLS 1.3 STUNS (provides server certificate chain).
+
+	AllowInsecure bool           // Explicit opt-in required to serve plaintext UDP STUN.
+	ListenAddr    string         // Plaintext UDP listen address (requires AllowInsecure).
+	PacketConn    net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure).
+
 	MaxDatagramBytes int
 	PerIPRPS         float64
 	PerIPBurst       int
 	MaxTrackedIPs    int
+	MaxConnsPerIP    int
+	MaxTotalConns    int
 	GlobalRPS        float64
 	GlobalBurst      int
+	DTLSReadTimeout  time.Duration
+	LoggerFactory    logging.LoggerFactory
 	Logger           *slog.Logger
 }
 
-// Stats exposes aggregate non-sensitive STUN operational counters (Section 9).
+// Stats exposes aggregate non-sensitive STUN/STUNS operational counters.
 type Stats struct {
 	BindingRequests    uint64
 	BindingResponses   uint64
@@ -45,17 +70,24 @@ type Stats struct {
 	RateLimited        uint64
 }
 
-// Server implements a minimal UDP-only RFC 8489 STUN Binding responder returning
-// XOR-MAPPED-ADDRESS without any TURN allocation or packet forwarding capability.
+// Server implements an RFC 8489 / RFC 7350 STUN Binding responder returning XOR-MAPPED-ADDRESS
+// over DTLS 1.3 / UDP (STUNS) by default, and optionally plaintext UDP when AllowInsecure is set.
 type Server struct {
-	conn      net.PacketConn
-	ownsConn  bool
-	maxBytes  int
-	ipLimiter *ratelimit.KeyedLimiter
-	globalLim *rate.Limiter
-	log       *slog.Logger
-	closed    atomic.Bool
-	wg        sync.WaitGroup
+	dtlsLn       net.Listener
+	dtlsRawConn  net.PacketConn
+	ownsDTLSConn bool
+	udpConn      net.PacketConn
+	ownsUDP      bool
+	maxBytes     int
+	readTimeout  time.Duration
+	ipLimiter    *ratelimit.KeyedLimiter
+	connConc     *ratelimit.ConcurrencyLimiter
+	globalLim    *rate.Limiter
+	log          *slog.Logger
+	closed       atomic.Bool
+	activeMu     sync.Mutex
+	activeConns  map[net.Conn]struct{}
+	wg           sync.WaitGroup
 
 	bindingReqs        atomic.Uint64
 	bindingResps       atomic.Uint64
@@ -65,8 +97,21 @@ type Server struct {
 	rateLimited        atomic.Uint64
 }
 
-// New creates and starts a UDP-only STUN Binding server.
+// New creates and starts a DTLS 1.3 / UDP STUNS and/or opt-in insecure UDP STUN Binding server.
 func New(cfg Config) (*Server, error) {
+	wantsPlainUDP := cfg.ListenAddr != "" || cfg.PacketConn != nil
+	if wantsPlainUDP && !cfg.AllowInsecure {
+		return nil, ErrInsecureSTUNProhibited
+	}
+
+	wantsDTLS := cfg.TLSConfig != nil || cfg.DTLSListenAddr != "" || cfg.DTLSPacketConn != nil
+	if !wantsDTLS && !wantsPlainUDP {
+		return nil, errors.New("stunserver: TLSConfig is required for DTLS 1.3 STUNS (or opt in with AllowInsecure for plaintext UDP)")
+	}
+	if wantsDTLS && (cfg.TLSConfig == nil || len(cfg.TLSConfig.Certificates) == 0) {
+		return nil, errors.New("stunserver: TLSConfig with certificate is required for DTLS 1.3 STUNS")
+	}
+
 	maxBytes := cfg.MaxDatagramBytes
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxDatagramBytes
@@ -83,6 +128,14 @@ func New(cfg Config) (*Server, error) {
 	if maxIPs <= 0 {
 		maxIPs = 8192
 	}
+	maxConnsPerIP := cfg.MaxConnsPerIP
+	if maxConnsPerIP <= 0 {
+		maxConnsPerIP = 64
+	}
+	maxTotalConns := cfg.MaxTotalConns
+	if maxTotalConns <= 0 {
+		maxTotalConns = 4096
+	}
 	globalRPS := cfg.GlobalRPS
 	if globalRPS <= 0 {
 		globalRPS = 5000
@@ -91,45 +144,135 @@ func New(cfg Config) (*Server, error) {
 	if globalBurst <= 0 {
 		globalBurst = 10000
 	}
+	readTimeout := cfg.DTLSReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = 10 * time.Second
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-
-	conn := cfg.PacketConn
-	ownsConn := false
-	if conn == nil {
-		addr := cfg.ListenAddr
-		if addr == "" {
-			addr = ":3478"
-		}
-		var err error
-		conn, err = net.ListenPacket("udp", addr)
-		if err != nil {
-			return nil, fmt.Errorf("listen stun udp %s: %w", addr, err)
-		}
-		ownsConn = true
+	lf := cfg.LoggerFactory
+	if lf == nil {
+		dlf := logging.NewDefaultLoggerFactory()
+		dlf.DefaultLogLevel = logging.LogLevelError
+		lf = dlf
 	}
 
 	s := &Server{
-		conn:      conn,
-		ownsConn:  ownsConn,
-		maxBytes:  maxBytes,
-		ipLimiter: ratelimit.NewKeyedLimiter(perIPRPS, perIPBurst, maxIPs, 5*time.Minute),
-		globalLim: rate.NewLimiter(rate.Limit(globalRPS), globalBurst),
-		log:       logger,
+		maxBytes:    maxBytes,
+		readTimeout: readTimeout,
+		ipLimiter:   ratelimit.NewKeyedLimiter(perIPRPS, perIPBurst, maxIPs, 5*time.Minute),
+		connConc:    ratelimit.NewConcurrencyLimiter(maxConnsPerIP, maxTotalConns),
+		globalLim:   rate.NewLimiter(rate.Limit(globalRPS), globalBurst),
+		log:         logger,
+		activeConns: make(map[net.Conn]struct{}),
 	}
-	s.wg.Add(1)
-	go s.serveLoop()
+
+	if wantsDTLS {
+		rawConn := cfg.DTLSPacketConn
+		ownsDTLS := false
+		if rawConn == nil {
+			addr := cfg.DTLSListenAddr
+			if addr == "" {
+				addr = DefaultSTUNSAddr
+			}
+			var err error
+			rawConn, err = net.ListenPacket("udp", addr)
+			if err != nil {
+				return nil, fmt.Errorf("listen stuns dtls/udp %s: %w", addr, err)
+			}
+			ownsDTLS = true
+		}
+
+		filtered := &guardedDTLSPacketConn{
+			PacketConn: rawConn,
+			srv:        s,
+			maxRawSize: DefaultMaxDTLSDatagramBytes,
+		}
+		dtlsLn, err := dtls.Listen(filtered,
+			dtls.WithCertificates(cfg.TLSConfig.Certificates...),
+			dtls.WithMinVersion(dtlsProtocol.Version1_3),
+			dtls.WithMaxVersion(dtlsProtocol.Version1_3),
+			dtls.WithReplayProtectionWindow(64),
+			dtls.WithFlightInterval(100*time.Millisecond),
+			dtls.WithLoggerFactory(lf),
+		)
+		if err != nil {
+			if ownsDTLS {
+				_ = rawConn.Close()
+			}
+			return nil, fmt.Errorf("start stuns dtls listener: %w", err)
+		}
+		s.dtlsLn = dtlsLn
+		s.dtlsRawConn = rawConn
+		s.ownsDTLSConn = ownsDTLS
+	}
+
+	if wantsPlainUDP {
+		udpConn := cfg.PacketConn
+		ownsUDP := false
+		if udpConn == nil {
+			addr := cfg.ListenAddr
+			if addr == "" {
+				addr = DefaultInsecureSTUNAddr
+			}
+			var err error
+			udpConn, err = net.ListenPacket("udp", addr)
+			if err != nil {
+				if s.dtlsLn != nil {
+					_ = s.dtlsLn.Close()
+				}
+				if s.ownsDTLSConn && s.dtlsRawConn != nil {
+					_ = s.dtlsRawConn.Close()
+				}
+				return nil, fmt.Errorf("listen insecure stun udp %s: %w", addr, err)
+			}
+			ownsUDP = true
+		}
+		s.udpConn = udpConn
+		s.ownsUDP = ownsUDP
+	}
+
+	if s.dtlsLn != nil {
+		s.wg.Add(1)
+		go s.serveDTLSLoop()
+	}
+	if s.udpConn != nil {
+		s.wg.Add(1)
+		go s.serveUDPLoop()
+	}
 	return s, nil
 }
 
-// LocalAddr returns the bound UDP socket address.
-func (s *Server) LocalAddr() net.Addr {
-	return s.conn.LocalAddr()
+// DTLSAddr returns the bound DTLS 1.3 / UDP STUNS address, or nil if disabled.
+func (s *Server) DTLSAddr() net.Addr {
+	if s.dtlsLn == nil {
+		return nil
+	}
+	return s.dtlsLn.Addr()
 }
 
-// Stats returns a snapshot of aggregate STUN counters.
+// UDPAddr returns the bound plaintext UDP STUN address, or nil if disabled.
+func (s *Server) UDPAddr() net.Addr {
+	if s.udpConn == nil {
+		return nil
+	}
+	return s.udpConn.LocalAddr()
+}
+
+// LocalAddr returns the DTLS 1.3 STUNS address when active, otherwise the plaintext UDP address.
+func (s *Server) LocalAddr() net.Addr {
+	if s.dtlsLn != nil {
+		return s.dtlsLn.Addr()
+	}
+	if s.udpConn != nil {
+		return s.udpConn.LocalAddr()
+	}
+	return nil
+}
+
+// Stats returns a snapshot of aggregate STUN/STUNS counters.
 func (s *Server) Stats() Stats {
 	return Stats{
 		BindingRequests:    s.bindingReqs.Load(),
@@ -141,31 +284,202 @@ func (s *Server) Stats() Stats {
 	}
 }
 
-// Close shuts down the STUN UDP server cleanly.
+// Close shuts down the STUNS/STUN server cleanly.
 func (s *Server) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	var err error
-	if s.ownsConn {
-		err = s.conn.Close()
-	} else {
-		_ = s.conn.SetReadDeadline(time.Now())
+	var dtlsErr, rawErr, udpErr error
+	if s.dtlsLn != nil {
+		dtlsErr = s.dtlsLn.Close()
+	}
+	s.activeMu.Lock()
+	conns := make([]net.Conn, 0, len(s.activeConns))
+	for c := range s.activeConns {
+		conns = append(conns, c)
+	}
+	s.activeMu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	if s.dtlsRawConn != nil {
+		if s.ownsDTLSConn {
+			if err := s.dtlsRawConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				rawErr = err
+			}
+		} else {
+			_ = s.dtlsRawConn.SetReadDeadline(time.Now())
+		}
+	}
+	if s.udpConn != nil {
+		if s.ownsUDP {
+			udpErr = s.udpConn.Close()
+		} else {
+			_ = s.udpConn.SetReadDeadline(time.Now())
+		}
 	}
 	s.wg.Wait()
-	return err
+	return errors.Join(dtlsErr, rawErr, udpErr)
 }
 
-func (s *Server) serveLoop() {
+type guardedDTLSPacketConn struct {
+	net.PacketConn
+	srv        *Server
+	maxRawSize int
+}
+
+func (g *guardedDTLSPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, raddr, err := g.PacketConn.ReadFrom(p)
+		if err != nil {
+			return 0, nil, err
+		}
+		ip, _, ok := extractIPPort(raddr)
+		if !ok {
+			g.srv.malformedPackets.Add(1)
+			continue
+		}
+		if !g.srv.globalLim.Allow() || !g.srv.ipLimiter.Allow(ip.String()) {
+			g.srv.rateLimited.Add(1)
+			continue
+		}
+		if n > g.maxRawSize {
+			g.srv.oversizedPackets.Add(1)
+			continue
+		}
+		if n == 0 || !isDTLSRecordByte(p[0]) {
+			// Plaintext STUN/TURN or garbage datagrams sent to the DTLS STUNS port are rejected.
+			if n >= MinSTUNHeaderBytes && stun.IsMessage(p[:n]) {
+				var msg stun.Message
+				if stun.Decode(p[:n], &msg) == nil && msg.Type.Method != stun.MethodBinding {
+					g.srv.unsupportedMethods.Add(1)
+				} else {
+					g.srv.malformedPackets.Add(1)
+				}
+			} else {
+				g.srv.malformedPackets.Add(1)
+			}
+			continue
+		}
+		return n, raddr, nil
+	}
+}
+
+func isDTLSRecordByte(b byte) bool {
+	// DTLS 1.2/1.3 plaintext content types (20..25) or DTLS 1.3 unified ciphertext header (001xxxxx).
+	if b >= 20 && b <= 25 {
+		return true
+	}
+	return dtlsProtocol.IsDTLS13Ciphertext(dtlsProtocol.ContentType(b))
+}
+
+func (s *Server) serveDTLSLoop() {
 	defer s.wg.Done()
 
-	// Read 1 extra byte beyond maxBytes to detect oversized UDP datagrams cleanly.
+	for !s.closed.Load() {
+		conn, err := s.dtlsLn.Accept()
+		if err != nil {
+			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+
+		ip, port, ok := extractIPPort(conn.RemoteAddr())
+		if !ok {
+			s.malformedPackets.Add(1)
+			_ = conn.Close()
+			continue
+		}
+
+		ipKey := ip.String()
+		if !s.connConc.Acquire(ipKey) {
+			s.rateLimited.Add(1)
+			_ = conn.Close()
+			continue
+		}
+
+		s.activeMu.Lock()
+		if s.closed.Load() {
+			s.activeMu.Unlock()
+			s.connConc.Release(ipKey)
+			_ = conn.Close()
+			return
+		}
+		s.activeConns[conn] = struct{}{}
+		s.activeMu.Unlock()
+
+		s.wg.Add(1)
+		go func(c net.Conn, remoteIP net.IP, remotePort int, key string) {
+			defer s.wg.Done()
+			defer func() {
+				s.activeMu.Lock()
+				delete(s.activeConns, c)
+				s.activeMu.Unlock()
+			}()
+			defer s.connConc.Release(key)
+			defer c.Close()
+			s.handleDTLSConn(c, remoteIP, remotePort, key)
+		}(conn, ip, port, ipKey)
+	}
+}
+
+func (s *Server) handleDTLSConn(conn net.Conn, remoteIP net.IP, remotePort int, ipKey string) {
+	if dc, ok := conn.(*dtls.Conn); ok {
+		hsCtx, cancel := context.WithTimeout(context.Background(), s.readTimeout)
+		err := dc.HandshakeContext(hsCtx)
+		cancel()
+		if err != nil {
+			return
+		}
+	}
+
 	buf := make([]byte, s.maxBytes+1)
 	var req stun.Message
 	var resp stun.Message
 
 	for !s.closed.Load() {
-		n, raddr, err := s.conn.ReadFrom(buf)
+		_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if !s.globalLim.Allow() || !s.ipLimiter.Allow(ipKey) {
+			s.rateLimited.Add(1)
+			return
+		}
+		if n > s.maxBytes {
+			s.oversizedPackets.Add(1)
+			continue
+		}
+		if n < MinSTUNHeaderBytes || !stun.IsMessage(buf[:n]) {
+			s.malformedPackets.Add(1)
+			continue
+		}
+
+		out, shouldReply := s.processMessage(&req, &resp, buf[:n], remoteIP, remotePort)
+		if !shouldReply {
+			continue
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(out); err != nil {
+			return
+		}
+		if resp.Type == stun.BindingSuccess {
+			s.bindingResps.Add(1)
+		}
+	}
+}
+
+func (s *Server) serveUDPLoop() {
+	defer s.wg.Done()
+
+	buf := make([]byte, s.maxBytes+1)
+	var req stun.Message
+	var resp stun.Message
+
+	for !s.closed.Load() {
+		n, raddr, err := s.udpConn.ReadFrom(buf)
 		if err != nil {
 			if s.closed.Load() || errors.Is(err, net.ErrClosed) {
 				return
@@ -178,13 +492,13 @@ func (s *Server) serveLoop() {
 			continue
 		}
 
-		udpAddr, ok := extractUDPAddr(raddr)
+		ip, port, ok := extractIPPort(raddr)
 		if !ok {
 			s.malformedPackets.Add(1)
 			continue
 		}
 
-		ipKey := udpAddr.IP.String()
+		ipKey := ip.String()
 		if !s.globalLim.Allow() || !s.ipLimiter.Allow(ipKey) {
 			s.rateLimited.Add(1)
 			continue
@@ -199,73 +513,91 @@ func (s *Server) serveLoop() {
 			continue
 		}
 
-		req.Reset()
-		if err := stun.Decode(buf[:n], &req); err != nil {
-			s.malformedPackets.Add(1)
+		out, shouldReply := s.processMessage(&req, &resp, buf[:n], ip, port)
+		if !shouldReply {
 			continue
 		}
-
-		// Indications never elicit responses in RFC 8489.
-		if req.Type.Class == stun.ClassIndication {
-			if req.Type.Method != stun.MethodBinding {
-				s.unsupportedMethods.Add(1)
-			}
-			continue
-		}
-
-		// Reject any non-Binding request (including TURN Allocate/Connect/etc.).
-		if req.Type != stun.BindingRequest {
-			s.unsupportedMethods.Add(1)
-			if req.Type.Class == stun.ClassRequest {
-				resp.Reset()
-				errType := stun.NewType(req.Type.Method, stun.ClassErrorResponse)
-				if buildErr := resp.Build(
-					stun.NewTransactionIDSetter(req.TransactionID),
-					errType,
-					stun.CodeBadRequest,
-					stun.Fingerprint,
-				); buildErr == nil {
-					_, _ = s.conn.WriteTo(resp.Raw, raddr)
-				}
-			}
-			continue
-		}
-
-		s.bindingReqs.Add(1)
-		resp.Reset()
-		if err := resp.Build(
-			stun.NewTransactionIDSetter(req.TransactionID),
-			stun.BindingSuccess,
-			&stun.XORMappedAddress{
-				IP:   udpAddr.IP,
-				Port: udpAddr.Port,
-			},
-			stun.Fingerprint,
-		); err != nil {
-			continue
-		}
-		if _, err := s.conn.WriteTo(resp.Raw, raddr); err == nil {
+		if _, err := s.udpConn.WriteTo(out, raddr); err == nil && resp.Type == stun.BindingSuccess {
 			s.bindingResps.Add(1)
 		}
 	}
 }
 
-func extractUDPAddr(addr net.Addr) (*net.UDPAddr, bool) {
-	if u, ok := addr.(*net.UDPAddr); ok && len(u.IP) > 0 && u.Port > 0 {
-		return u, true
+func (s *Server) processMessage(req, resp *stun.Message, raw []byte, remoteIP net.IP, remotePort int) ([]byte, bool) {
+	req.Reset()
+	if err := stun.Decode(raw, req); err != nil {
+		s.malformedPackets.Add(1)
+		return nil, false
+	}
+
+	// Indications never elicit responses in RFC 8489.
+	if req.Type.Class == stun.ClassIndication {
+		if req.Type.Method != stun.MethodBinding {
+			s.unsupportedMethods.Add(1)
+		}
+		return nil, false
+	}
+
+	// Reject any non-Binding request (including TURN Allocate/Connect/etc.).
+	if req.Type != stun.BindingRequest {
+		s.unsupportedMethods.Add(1)
+		if req.Type.Class == stun.ClassRequest {
+			resp.Reset()
+			errType := stun.NewType(req.Type.Method, stun.ClassErrorResponse)
+			if buildErr := resp.Build(
+				stun.NewTransactionIDSetter(req.TransactionID),
+				errType,
+				stun.CodeBadRequest,
+				stun.Fingerprint,
+			); buildErr == nil {
+				return resp.Raw, true
+			}
+		}
+		return nil, false
+	}
+
+	s.bindingReqs.Add(1)
+	resp.Reset()
+	if err := resp.Build(
+		stun.NewTransactionIDSetter(req.TransactionID),
+		stun.BindingSuccess,
+		&stun.XORMappedAddress{
+			IP:   remoteIP,
+			Port: remotePort,
+		},
+		stun.Fingerprint,
+	); err != nil {
+		return nil, false
+	}
+	return resp.Raw, true
+}
+
+func extractIPPort(addr net.Addr) (net.IP, int, bool) {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if len(a.IP) > 0 && a.Port > 0 {
+			return a.IP, a.Port, true
+		}
+	case *net.TCPAddr:
+		if len(a.IP) > 0 && a.Port > 0 {
+			return a.IP, a.Port, true
+		}
+	}
+	if addr == nil {
+		return nil, 0, false
 	}
 	host, portStr, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		return nil, false
+		return nil, 0, false
 	}
 	var port int
 	_, err = fmt.Sscanf(portStr, "%d", &port)
 	if err != nil || port <= 0 || port > 65535 {
-		return nil, false
+		return nil, 0, false
 	}
-	return &net.UDPAddr{IP: ip, Port: port}, true
+	return ip, port, true
 }

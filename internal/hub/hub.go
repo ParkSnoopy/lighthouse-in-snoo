@@ -14,16 +14,21 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/pion/logging"
+	"github.com/pion/transport/v5"
+	"github.com/pion/turn/v6"
 
 	"lighthouse-in-snoo/internal/jcs"
 	"lighthouse-in-snoo/internal/ratelimit"
 	"lighthouse-in-snoo/internal/store"
 	"lighthouse-in-snoo/internal/stunserver"
+	"lighthouse-in-snoo/internal/turnserver"
 	"lighthouse-in-snoo/pkg/identity"
 	"lighthouse-in-snoo/pkg/protocol"
 )
 
-// Config configures the Lighthouse control-plane hub and integrated STUN service.
+// Config configures the Lighthouse control-plane hub and integrated STUNS/TURNS service.
+// By default STUNS/TURNS run over DTLS 1.3 / UDP (:5349/udp); plaintext UDP requires AllowInsecure=true.
 type Config struct {
 	HTTPSListenAddr string
 	HTTPSListener   net.Listener // Optional pre-bound TCP listener (used in tests).
@@ -32,9 +37,25 @@ type Config struct {
 	TLSKeyFile      string
 	HubOrigin       string // Canonical wss://host[:port] expected in registration proofs.
 
-	EnableSTUN     bool
-	STUNListenAddr string
-	STUNPacketConn net.PacketConn // Optional pre-bound UDP PacketConn (e.g. vnet or test socket).
+	AllowInsecure   bool           // Explicit opt-in required to serve plaintext UDP STUN/TURN.
+	EnableSTUN      bool           // Enable DTLS 1.3 STUNS over UDP (and plaintext UDP if AllowInsecure).
+	STUNSListenAddr string         // DTLS 1.3 UDP listen address for STUNS/TURNS (default :5349).
+	STUNSPacketConn net.PacketConn // Optional pre-bound UDP PacketConn for DTLS 1.3 STUNS/TURNS.
+	STUNListenAddr  string         // Plaintext UDP STUN/TURN listen address (requires AllowInsecure).
+	STUNPacketConn  net.PacketConn // Optional pre-bound plaintext UDP PacketConn (requires AllowInsecure).
+
+	EnableTURN         bool              // Enable authenticated DTLS 1.3 TURNS (and plaintext TURN if AllowInsecure).
+	TURNSTLSListenAddr string            // Optional secondary TLS 1.3 TCP listen address for ?transport=tcp fallback.
+	TURNRealm          string            // TURN authentication realm (default "lighthouse").
+	TURNSecret         string            // Shared secret for time-limited HMAC TURN REST credentials.
+	TURNUsers          map[string]string // Optional static username -> password TURN credentials.
+	TURNAuthHandler    turn.AuthHandler  // Optional custom TURN AuthHandler.
+	TURNPublicIP       net.IP            // Optional advertised public relay IP for TURN allocations.
+	TURNRelayBindAddr  string            // Local bind IP for TURN UDP relay sockets.
+	TURNRelayMinPort   uint16
+	TURNRelayMaxPort   uint16
+	TURNNet            transport.Net
+	PionLoggerFactory  logging.LoggerFactory
 
 	Policy              identity.PolicyConfig
 	SQLitePath          string
@@ -123,14 +144,15 @@ type negotiationRecord struct {
 	senderGens       map[string]*senderGenState // key: senderPeerID + ":" + gen
 }
 
-// Server is the single-container Lighthouse control-plane service (HTTPS/WSS + STUN).
-// It intentionally has zero dependency on pion/webrtc or pion/turn (Section 2.1).
+// Server is the single-container Lighthouse control-plane service (HTTPS/WSS + STUNS/TURNS).
+// It never instantiates a WebRTC PeerConnection; application payloads remain E2E DTLS 1.3 encrypted.
 type Server struct {
 	cfg           Config
 	hubOrigin     string
 	trust         *identity.TrustVerifier
 	sqlStore      *store.Store
 	stunSrv       *stunserver.Server
+	turnSrv       *turnserver.Server
 	httpSrv       *http.Server
 	httpsListener net.Listener
 	log           *slog.Logger
@@ -214,15 +236,72 @@ func New(cfg Config) (*Server, error) {
 	}
 	ln := tls.NewListener(rawLn, tlsCfg)
 
-	var stunSrv *stunserver.Server
-	if cfg.EnableSTUN || cfg.STUNPacketConn != nil || cfg.STUNListenAddr != "" {
-		stunSrv, err = stunserver.New(stunserver.Config{
-			ListenAddr: cfg.STUNListenAddr,
-			PacketConn: cfg.STUNPacketConn,
-			PerIPRPS:   cfg.STUNPerIPRPS,
-			PerIPBurst: cfg.STUNPerIPBurst,
-			Logger:     cfg.Logger,
-		})
+	wantsPlainUDP := cfg.STUNListenAddr != "" || cfg.STUNPacketConn != nil
+	if wantsPlainUDP && !cfg.AllowInsecure {
+		_ = ln.Close()
+		if sqlStore != nil {
+			_ = sqlStore.Close()
+		}
+		return nil, stunserver.ErrInsecureSTUNProhibited
+	}
+
+	wantsTURN := cfg.EnableTURN || cfg.TURNSecret != "" || len(cfg.TURNUsers) > 0 || cfg.TURNAuthHandler != nil
+	wantsSTUNS := cfg.STUNSListenAddr != "" || cfg.STUNSPacketConn != nil
+	if (cfg.EnableSTUN || wantsTURN) && !wantsSTUNS && !wantsPlainUDP && cfg.TURNSTLSListenAddr == "" {
+		cfg.STUNSListenAddr = stunserver.DefaultSTUNSAddr
+		wantsSTUNS = true
+	}
+
+	var (
+		stunSrv *stunserver.Server
+		turnSrv *turnserver.Server
+	)
+	if wantsTURN {
+		turnCfg := turnserver.Config{
+			TLSConfig:        tlsCfg,
+			AllowInsecure:    cfg.AllowInsecure,
+			TLSListenAddr:    cfg.TURNSTLSListenAddr,
+			UDPListenAddr:    cfg.STUNListenAddr,
+			UDPPacketConn:    cfg.STUNPacketConn,
+			Realm:            cfg.TURNRealm,
+			SharedSecret:     cfg.TURNSecret,
+			Users:            cfg.TURNUsers,
+			AuthHandler:      cfg.TURNAuthHandler,
+			PublicIP:         cfg.TURNPublicIP,
+			RelayBindAddress: cfg.TURNRelayBindAddr,
+			RelayMinPort:     cfg.TURNRelayMinPort,
+			RelayMaxPort:     cfg.TURNRelayMaxPort,
+			RelayNet:         cfg.TURNNet,
+			LoggerFactory:    cfg.PionLoggerFactory,
+		}
+		if wantsSTUNS {
+			turnCfg.DTLSListenAddr = cfg.STUNSListenAddr
+			turnCfg.DTLSPacketConn = cfg.STUNSPacketConn
+		}
+		turnSrv, err = turnserver.New(turnCfg)
+		if err != nil {
+			_ = ln.Close()
+			if sqlStore != nil {
+				_ = sqlStore.Close()
+			}
+			return nil, err
+		}
+	} else if wantsSTUNS || wantsPlainUDP {
+		stunCfg := stunserver.Config{
+			AllowInsecure: cfg.AllowInsecure,
+			ListenAddr:    cfg.STUNListenAddr,
+			PacketConn:    cfg.STUNPacketConn,
+			PerIPRPS:      cfg.STUNPerIPRPS,
+			PerIPBurst:    cfg.STUNPerIPBurst,
+			LoggerFactory: cfg.PionLoggerFactory,
+			Logger:        cfg.Logger,
+		}
+		if wantsSTUNS {
+			stunCfg.TLSConfig = tlsCfg
+			stunCfg.DTLSListenAddr = cfg.STUNSListenAddr
+			stunCfg.DTLSPacketConn = cfg.STUNSPacketConn
+		}
+		stunSrv, err = stunserver.New(stunCfg)
 		if err != nil {
 			_ = ln.Close()
 			if sqlStore != nil {
@@ -238,6 +317,7 @@ func New(cfg Config) (*Server, error) {
 		trust:         trust,
 		sqlStore:      sqlStore,
 		stunSrv:       stunSrv,
+		turnSrv:       turnSrv,
 		httpsListener: ln,
 		log:           cfg.Logger,
 		ipConnRate:    ratelimit.NewKeyedLimiter(cfg.PerIPConnRPS, cfg.PerIPConnBurst, 8192, 5*time.Minute),
@@ -364,12 +444,47 @@ func (s *Server) HTTPSAddr() net.Addr {
 	return s.httpsListener.Addr()
 }
 
-// STUNAddr returns the bound UDP address of the STUN Binding service, or nil if disabled.
-func (s *Server) STUNAddr() net.Addr {
-	if s.stunSrv == nil {
-		return nil
+// STUNSAddr returns the bound DTLS 1.3 / UDP STUNS/TURNS address, or nil if disabled.
+func (s *Server) STUNSAddr() net.Addr {
+	if s.turnSrv != nil && s.turnSrv.DTLSAddr() != nil {
+		return s.turnSrv.DTLSAddr()
 	}
-	return s.stunSrv.LocalAddr()
+	if s.stunSrv != nil && s.stunSrv.DTLSAddr() != nil {
+		return s.stunSrv.DTLSAddr()
+	}
+	return nil
+}
+
+// TURNSTLSAddr returns the optional TLS 1.3 / TCP TURNS address, or nil if disabled.
+func (s *Server) TURNSTLSAddr() net.Addr {
+	if s.turnSrv != nil {
+		return s.turnSrv.TLSAddr()
+	}
+	return nil
+}
+
+// STUNUDPAddr returns the bound opt-in plaintext UDP STUN/TURN address, or nil if disabled.
+func (s *Server) STUNUDPAddr() net.Addr {
+	if s.turnSrv != nil && s.turnSrv.UDPAddr() != nil {
+		return s.turnSrv.UDPAddr()
+	}
+	if s.stunSrv != nil && s.stunSrv.UDPAddr() != nil {
+		return s.stunSrv.UDPAddr()
+	}
+	return nil
+}
+
+// STUNAddr returns the primary STUNS/TURNS DTLS address when active, otherwise the plaintext UDP address.
+func (s *Server) STUNAddr() net.Addr {
+	if a := s.STUNSAddr(); a != nil {
+		return a
+	}
+	return s.STUNUDPAddr()
+}
+
+// TURNActive reports whether the integrated TURNS/TURN relay service is running.
+func (s *Server) TURNActive() bool {
+	return s.turnSrv != nil
 }
 
 // HubOrigin returns the canonical WSS origin configured for registration proofs.
@@ -453,12 +568,16 @@ func (s *Server) Close() error {
 	if s.stunSrv != nil {
 		stunErr = s.stunSrv.Close()
 	}
+	var turnErr error
+	if s.turnSrv != nil {
+		turnErr = s.turnSrv.Close()
+	}
 	var sqlErr error
 	if s.sqlStore != nil {
 		sqlErr = s.sqlStore.Close()
 	}
 	s.wg.Wait()
-	return errors.Join(stunErr, sqlErr)
+	return errors.Join(stunErr, turnErr, sqlErr)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
