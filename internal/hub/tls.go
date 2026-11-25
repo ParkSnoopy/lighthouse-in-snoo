@@ -136,7 +136,7 @@ func loadOrGenerateAutoTLS(cfg *Config, canonicalOrigin string) (cert tls.Certif
 			return loaded, loadedAlgo, true, nil
 		}
 
-		cert, certPEM, keyPEM, genErr := generateSelfSignedServerCert(canonicalOrigin, algo, cfg.TLSRSABits)
+		cert, certPEM, keyPEM, genErr := generateSelfSignedServerCert(canonicalOrigin, cfg.TURNPublicIP, algo, cfg.TLSRSABits)
 		if genErr != nil {
 			return tls.Certificate{}, "", false, genErr
 		}
@@ -151,7 +151,7 @@ func loadOrGenerateAutoTLS(cfg *Config, canonicalOrigin string) (cert tls.Certif
 		return cert, algo, true, nil
 	}
 
-	cert, _, _, err = generateSelfSignedServerCert(canonicalOrigin, algo, cfg.TLSRSABits)
+	cert, _, _, err = generateSelfSignedServerCert(canonicalOrigin, cfg.TURNPublicIP, algo, cfg.TLSRSABits)
 	if err != nil {
 		return tls.Certificate{}, "", false, err
 	}
@@ -196,6 +196,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 
 func generateSelfSignedServerCert(
 	canonicalOrigin string,
+	extraIP net.IP,
 	algo identity.Algorithm,
 	rsaBits int,
 ) (cert tls.Certificate, certPEM, keyPEM []byte, err error) {
@@ -213,10 +214,13 @@ func generateSelfSignedServerCert(
 	if u, parseErr := url.Parse(canonicalOrigin); parseErr == nil {
 		host := u.Hostname()
 		if ip := net.ParseIP(host); ip != nil {
-			ips = append(ips, ip)
+			ips = appendUniqueIP(ips, ip)
 		} else if host != "" && host != "localhost" {
 			dnsNames = append(dnsNames, host)
 		}
+	}
+	if extraIP != nil {
+		ips = appendUniqueIP(ips, extraIP)
 	}
 	now := time.Now()
 	tmpl := &x509.Certificate{
@@ -247,6 +251,15 @@ func generateSelfSignedServerCert(
 		PrivateKey:  priv,
 		Leaf:        leaf,
 	}, certPEM, keyPEM, nil
+}
+
+func appendUniqueIP(ips []net.IP, candidate net.IP) []net.IP {
+	for _, existing := range ips {
+		if existing.Equal(candidate) {
+			return ips
+		}
+	}
+	return append(ips, candidate)
 }
 
 func generateTLSKey(algo identity.Algorithm, rsaBits int) (crypto.Signer, x509.SignatureAlgorithm, error) {

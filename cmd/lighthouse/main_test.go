@@ -62,7 +62,7 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lighthouse-ui --help failed: %v\n%s", err, string(uiHelpOut))
 	}
-	for _, want := range []string{"--ifname <NAME>", "--hub <URL>", "--tcp-only", "--blacklist <PATH>"} {
+	for _, want := range []string{"--domain <DOMAIN>", "[env: LIGHTHOUSE_DOMAIN]", "--ifname <NAME>", "--hub <URL>", "--tcp-only", "--blacklist <PATH>"} {
 		if !strings.Contains(string(uiHelpOut), want) {
 			t.Fatalf("lighthouse-ui --help missing %q:\n%s", want, string(uiHelpOut))
 		}
@@ -73,13 +73,15 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 		}
 	}
 
-	// Hub subcommand help: blinded universal hub with --cidr, --tls-algo & universal relay (no hub passphrase or TLS path env vars).
+	// Hub subcommand help: blinded universal hub with --domain, --cidr, --tls-algo & universal relay.
 	hubHelp, err := exec.Command(hubBin, "help", "hub").CombinedOutput()
 	if err != nil {
 		t.Fatalf("lighthouse help hub failed: %v\n%s", err, string(hubHelp))
 	}
 	for _, want := range []string{
 		"Usage: lighthouse hub [OPTIONS]",
+		"--domain <DOMAIN>",
+		"[env: LIGHTHOUSE_DOMAIN]",
 		"--https-addr <ADDR>",
 		"[env: LIGHTHOUSE_HTTPS_ADDR]",
 		"--stuns-addr <ADDR>",
@@ -132,8 +134,10 @@ func TestZeroConfigHubCLIAndVersionAlignment(t *testing.T) {
 		t.Fatalf("expected --insecure hint:\n%s", string(hubInsecureOut))
 	}
 
-	// Invalid hub --cidr and --tls-algo rejected with exit code 2.
+	// Invalid hub --domain, --cidr, and --tls-algo rejected with exit code 2.
 	for _, badArgs := range [][]string{
+		{"hub", "--domain", "bad domain name"},
+		{"hub", "--domain", "hub.example.com:99999"},
 		{"hub", "--cidr", "not-a-cidr"},
 		{"hub", "--tls-algo", "ed448"},
 		{"hub", "--tls-algo", "bogus"},
@@ -196,15 +200,24 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	binPath := filepath.Join(tmpDir, "lighthouse-ver")
+	uiBinPath := filepath.Join(tmpDir, "lighthouse-ui-ver")
 	if out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build binary failed: %v\n%s", err, string(out))
 	}
+	uiBuildArgs := []string{"build"}
+	if exec.Command("pkg-config", "--exists", "xxf86vm").Run() != nil {
+		uiBuildArgs = append(uiBuildArgs, "-tags", "wayland")
+	}
+	uiBuildArgs = append(uiBuildArgs, "-o", uiBinPath, "../lighthouse-ui")
+	if out, err := exec.Command("go", uiBuildArgs...).CombinedOutput(); err != nil {
+		t.Fatalf("build ui binary failed: %v\n%s", err, string(out))
+	}
 
-	// Verify runtime .env sets LIGHTHOUSE_* defaults when process env is unset.
+	// Verify single LIGHTHOUSE_DOMAIN in runtime .env auto-configures hub origin, TURN host/realm, and UI WSS URL.
 	dotEnvDir := t.TempDir()
 	dotEnvContent := strings.Join([]string{
-		"# Runtime defaults",
-		"LIGHTHOUSE_HUB_ORIGIN=wss://hub.dotenv.example",
+		"# Single-domain runtime defaults",
+		"LIGHTHOUSE_DOMAIN=hub.dotenv.example",
 		"NON_LIGHTHOUSE_VAR=ignored",
 	}, "\n") + "\n"
 	if err := os.WriteFile(filepath.Join(dotEnvDir, ".env"), []byte(dotEnvContent), 0o600); err != nil {
@@ -218,20 +231,53 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dotenv hub --help failed: %v\n%s", err, string(dotEnvHelp))
 	}
-	if !strings.Contains(string(dotEnvHelp), "[default: wss://hub.dotenv.example]") {
-		t.Fatalf("dotenv hub --help missing runtime .env origin:\n%s", string(dotEnvHelp))
+	for _, want := range []string{
+		"[default: wss://hub.dotenv.example]",
+		"[default: hub.dotenv.example]",
+	} {
+		if !strings.Contains(string(dotEnvHelp), want) {
+			t.Fatalf("dotenv hub --help missing auto-configured %q:\n%s", want, string(dotEnvHelp))
+		}
 	}
 
-	// Explicit process ENV overrides .env without rebuilding.
+	uiDotEnvCmd := exec.Command(uiBinPath, "--help")
+	uiDotEnvCmd.Dir = dotEnvDir
+	uiDotEnvCmd.Env = stripLighthouseEnv(os.Environ())
+	uiDotEnvHelp, err := uiDotEnvCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dotenv ui --help failed: %v\n%s", err, string(uiDotEnvHelp))
+	}
+	if !strings.Contains(string(uiDotEnvHelp), "[default: wss://hub.dotenv.example/v1/signal]") {
+		t.Fatalf("dotenv ui --help missing auto-configured WSS URL:\n%s", string(uiDotEnvHelp))
+	}
+
+	// Explicit process ENV LIGHTHOUSE_DOMAIN (with port) overrides .env without rebuilding.
 	envCmd := exec.Command(binPath, "hub", "--help")
 	envCmd.Dir = dotEnvDir
-	envCmd.Env = append(stripLighthouseEnv(os.Environ()), "LIGHTHOUSE_HUB_ORIGIN=wss://hub.env.example")
+	envCmd.Env = append(stripLighthouseEnv(os.Environ()), "LIGHTHOUSE_DOMAIN=hub.env.example:8443")
 	envHelp, err := envCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("env hub --help failed: %v\n%s", err, string(envHelp))
 	}
-	if !strings.Contains(string(envHelp), "[default: wss://hub.env.example]") {
-		t.Fatalf("runtime env override missing origin:\n%s", string(envHelp))
+	for _, want := range []string{
+		"[default: wss://hub.env.example:8443]",
+		"[default: hub.env.example]",
+	} {
+		if !strings.Contains(string(envHelp), want) {
+			t.Fatalf("runtime env override missing %q:\n%s", want, string(envHelp))
+		}
+	}
+
+	// Explicit LIGHTHOUSE_HUB_ORIGIN still overrides LIGHTHOUSE_DOMAIN.
+	overrideCmd := exec.Command(binPath, "hub", "--help")
+	overrideCmd.Dir = dotEnvDir
+	overrideCmd.Env = append(stripLighthouseEnv(os.Environ()), "LIGHTHOUSE_HUB_ORIGIN=wss://custom.override.example")
+	overrideHelp, err := overrideCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("override hub --help failed: %v\n%s", err, string(overrideHelp))
+	}
+	if !strings.Contains(string(overrideHelp), "[default: wss://custom.override.example]") {
+		t.Fatalf("explicit LIGHTHOUSE_HUB_ORIGIN override missing:\n%s", string(overrideHelp))
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 
 func newHubCommand() *cli.Command {
 	var (
+		domainStr        string
 		httpsAddr        string
 		stunsAddr        string
 		stunAddr         string
@@ -40,21 +41,42 @@ func newHubCommand() *cli.Command {
 		tlsKey           string
 		hbInterval       time.Duration
 		presenceTTL      time.Duration
+
+		hubOriginOpt   *cli.Option
+		turnAdvHostOpt *cli.Option
+		turnRealmOpt   *cli.Option
 	)
 
 	cmd := &cli.Command{
 		Name:       "hub",
 		ShortAbout: "Run the zero-config blinded universal signaling hub and relay",
-		LongAbout:  "Run a Lighthouse blinded signaling hub and universal DTLS 1.3/UDP STUNS+TURNS relay with hub-managed virtual IPv4 CIDR assignment (default 10.88.0.0/16), automatic passphrase-room ACL with empty-room pruning, and auto-generated TLS 1.3 certificates by algorithm (--tls-algo).",
+		LongAbout:  "Run a Lighthouse blinded signaling hub and universal DTLS 1.3/UDP STUNS+TURNS relay with hub-managed virtual IPv4 CIDR assignment (default 10.88.0.0/16), automatic passphrase-room ACL with empty-room pruning, single-domain auto-configuration (--domain / LIGHTHOUSE_DOMAIN), and auto-generated TLS 1.3 certificates by algorithm (--tls-algo).",
 		Examples: []string{
 			"lighthouse hub",
-			"lighthouse hub --cidr 10.88.0.0/16 --tls-algo ed25519 --turn-public-ip 203.0.113.10",
-			"lighthouse hub --https-addr :8443 --stuns-addr :5349 --hub-origin wss://hub.example.com --tls-algo nistp-256",
+			"lighthouse hub --domain hub.example.com",
+			"lighthouse hub --domain hub.example.com --cidr 10.88.0.0/16 --tls-algo ed25519 --turn-public-ip 203.0.113.10",
 			"lighthouse hub --tcp-only --stuns-addr :5349",
 			"lighthouse hub --insecure --stun-addr :3478",
 		},
 		Run: func(ctx *cli.Context) error {
 			logger := slog.New(slog.NewJSONHandler(ctx.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+			if domainStr != "" {
+				dom, domErr := cli.NormalizeDomain(domainStr)
+				if domErr != nil {
+					fmt.Fprintf(ctx.Stderr, "error: invalid --domain %q: %v\n", domainStr, domErr)
+					return &cli.ExitError{Code: 2, Err: domErr}
+				}
+				if !hubOriginOpt.IsSet() {
+					hubOrigin = dom.HubOrigin()
+				}
+				if !turnAdvHostOpt.IsSet() {
+					turnAdvHost = dom.Hostname
+				}
+				if !turnRealmOpt.IsSet() {
+					turnRealm = dom.Hostname
+				}
+			}
 
 			if stunAddr != "" && !insecure {
 				fmt.Fprintln(ctx.Stderr, "error: plaintext '--stun-addr' requires '--insecure' (use '--stuns-addr' for encrypted STUNS)\n\nFor more information, try '--help'.")
@@ -150,6 +172,8 @@ func newHubCommand() *cli.Command {
 				"tls_persisted", srv.TLSPersisted(),
 				"insecure", insecure,
 				"hub_origin", srv.HubOrigin(),
+				"turn_advertise_host", turnAdvHost,
+				"turn_realm", turnRealm,
 				"virtual_cidr", srv.VirtualCIDR().String(),
 			)
 
@@ -166,6 +190,13 @@ func newHubCommand() *cli.Command {
 		},
 	}
 
+	cmd.StringOpt(&domainStr, cli.Option{
+		Long:      "domain",
+		ValueName: "DOMAIN",
+		ShortHelp: "Single hub domain auto-configuring WSS origin, TURN host/realm, and TLS SAN",
+		LongHelp:  "Public domain (or host:port) for this hub; automatically derives --hub-origin (wss://<domain>), --turn-advertise-host, --turn-realm, and TLS cert SAN unless explicitly overridden",
+		EnvVar:    "LIGHTHOUSE_DOMAIN",
+	})
 	cmd.StringOpt(&httpsAddr, cli.Option{
 		Long:      "https-addr",
 		ValueName: "ADDR",
@@ -222,12 +253,12 @@ func newHubCommand() *cli.Command {
 		LongHelp:  "Optional shared secret for HMAC TURN REST credentials (auto-generated ephemerally when unset)",
 		EnvVar:    "LIGHTHOUSE_TURN_SECRET",
 	})
-	cmd.StringOpt(&turnRealm, cli.Option{
+	turnRealmOpt = cmd.StringOpt(&turnRealm, cli.Option{
 		Long:      "turn-realm",
 		ValueName: "REALM",
 		ShortHelp: "TURN authentication realm",
 		EnvVar:    "LIGHTHOUSE_TURN_REALM",
-		Default:   turnserver.DefaultRealm,
+		Default:   cli.DefaultTURNRealm(turnserver.DefaultRealm),
 	})
 	cmd.StringOpt(&turnPublicIPStr, cli.Option{
 		Long:      "turn-public-ip",
@@ -235,11 +266,12 @@ func newHubCommand() *cli.Command {
 		ShortHelp: "Public IP advertised in TURN relay allocations",
 		EnvVar:    "LIGHTHOUSE_TURN_PUBLIC_IP",
 	})
-	cmd.StringOpt(&turnAdvHost, cli.Option{
+	turnAdvHostOpt = cmd.StringOpt(&turnAdvHost, cli.Option{
 		Long:      "turn-advertise-host",
 		ValueName: "HOST",
 		ShortHelp: "Host advertised to peers in universal relay URIs",
 		EnvVar:    "LIGHTHOUSE_TURN_ADVERTISE_HOST",
+		Default:   cli.DefaultTURNAdvertiseHost(),
 	})
 	cmd.StringOpt(&turnTLSAddr, cli.Option{
 		Long:      "turn-tls-addr",
@@ -257,12 +289,12 @@ func newHubCommand() *cli.Command {
 		ValueName: "PORT",
 		ShortHelp: "Maximum UDP port for TURN relay allocations",
 	})
-	cmd.StringOpt(&hubOrigin, cli.Option{
+	hubOriginOpt = cmd.StringOpt(&hubOrigin, cli.Option{
 		Long:      "hub-origin",
 		ValueName: "URL",
-		ShortHelp: "Canonical WSS hub origin",
+		ShortHelp: "Canonical WSS hub origin (auto-derived from --domain when unset)",
 		EnvVar:    "LIGHTHOUSE_HUB_ORIGIN",
-		Default:   resolvedDefaultHubOrigin(),
+		Default:   cli.DefaultHubOrigin(),
 	})
 	cmd.StringOpt(&tlsAlgoStr, cli.Option{
 		Long:      "tls-algo",

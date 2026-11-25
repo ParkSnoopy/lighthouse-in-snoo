@@ -17,7 +17,10 @@ import (
 )
 
 func main() {
+	cli.LoadDotEnvIfPresent(".env")
+
 	var (
+		domainStr     string
 		keyPath       string
 		algoStr       string
 		rsaBits       int
@@ -28,6 +31,8 @@ func main() {
 		ifName        string
 		tcpOnly       bool
 		insecure      bool
+
+		hubURLOpt *cli.Option
 	)
 
 	defaultDir := defaultConfigDir()
@@ -38,6 +43,16 @@ func main() {
 		ShortAbout: "Fyne desktop app binding Lighthouse as an OS TUN interface",
 		LongAbout:  "Bind a local OS TUN virtual network interface (lh0) to Lighthouse with explicit Allow/Deny/Blacklist incoming consent and passphrase-scoped peer broadcasting.",
 		Run: func(ctx *cli.Context) error {
+			if domainStr != "" {
+				dom, domErr := cli.NormalizeDomain(domainStr)
+				if domErr != nil {
+					fmt.Fprintf(ctx.Stderr, "error: invalid --domain %q: %v\n", domainStr, domErr)
+					return &cli.ExitError{Code: 2, Err: domErr}
+				}
+				if !hubURLOpt.IsSet() {
+					hubURL = dom.HubURL()
+				}
+			}
 			algo, err := identity.ParseAlgorithm(algoStr)
 			if err != nil {
 				fmt.Fprintln(ctx.Stderr, err)
@@ -119,12 +134,18 @@ func main() {
 		ShortHelp: "Local peer blacklist JSON path",
 		Default:   filepath.Join(defaultDir, "blacklist.json"),
 	})
-	cmd.StringOpt(&hubURL, cli.Option{
+	cmd.StringOpt(&domainStr, cli.Option{
+		Long:      "domain",
+		ValueName: "DOMAIN",
+		ShortHelp: "Single hub domain auto-configuring --hub (wss://<domain>/v1/signal)",
+		EnvVar:    "LIGHTHOUSE_DOMAIN",
+	})
+	hubURLOpt = cmd.StringOpt(&hubURL, cli.Option{
 		Long:      "hub",
 		ValueName: "URL",
-		ShortHelp: "Universal Lighthouse hub WSS URL",
+		ShortHelp: "Universal Lighthouse hub WSS URL (auto-derived from --domain when unset)",
 		EnvVar:    "LIGHTHOUSE_HUB_URL",
-		Default:   "wss://localhost:8443/v1/signal",
+		Default:   cli.DefaultHubURL(),
 	})
 	cmd.StringOpt(&caPath, cli.Option{
 		Long:      "ca",

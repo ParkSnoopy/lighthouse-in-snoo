@@ -56,6 +56,11 @@ type Option struct {
 	isSet   bool
 }
 
+// IsSet reports whether the option was explicitly configured via CLI flag or its EnvVar.
+func (o *Option) IsSet() bool {
+	return o != nil && o.isSet
+}
+
 // Command defines a CLI command or nested subcommand.
 type Command struct {
 	Name        string
