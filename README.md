@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon/lighthouse-in-snoo.png" alt="Lighthouse" width="128" height="128" />
+</p>
+
 # Lighthouse
 
 Lighthouse binds a local OS virtual network interface (`lh0`) through a Fyne desktop app (`lighthouse-ui`) and connects peers over end-to-end encrypted WebRTC tunnels via one zero-config universal hub and relay (`lighthouse hub`).

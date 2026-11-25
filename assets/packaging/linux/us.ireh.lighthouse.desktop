@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lighthouse
+Comment=Zero-config peer-to-peer TUN virtual network interface
+Exec=lighthouse-ui
+Icon=us.ireh.lighthouse
+Terminal=false
+Categories=Network;Utility;
+StartupWMClass=us.ireh.lighthouse

@@ -132,8 +132,10 @@ func NewController(a fyne.App, opts Options) (*Controller, error) {
 	}
 
 	a.Settings().SetTheme(rawblock.NewTheme())
+	a.SetIcon(AppIcon())
 
 	w := a.NewWindow("LIGHTHOUSE")
+	w.SetIcon(AppIcon())
 	w.Resize(fyne.NewSize(1120, 820))
 
 	c := &Controller{

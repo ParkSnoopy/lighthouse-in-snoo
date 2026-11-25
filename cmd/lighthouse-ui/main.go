@@ -71,7 +71,8 @@ func main() {
 				}
 			}
 
-			fyneApp := app.NewWithID("io.lighthouse.ui")
+			fyneApp := app.NewWithID(ui.AppID)
+			ui.ApplyRuntimePlatformIcon()
 			ctrl, err := ui.NewController(fyneApp, ui.Options{
 				KeyPair:          kp,
 				BlacklistPath:    blacklistPath,
