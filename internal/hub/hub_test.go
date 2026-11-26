@@ -816,3 +816,221 @@ func TestHubAcceptsRotatingDomainAndRandomPortWhenDomainOmitted(t *testing.T) {
 		t.Fatalf("unexpected direct dynamic-origin registration: %+v", regB)
 	}
 }
+
+func TestHubCloudtypeNetworkingAlignment(t *testing.T) {
+	t.Parallel()
+
+	srvTLS, cliTLS := makeCert(t)
+	kpA, _ := identity.GenerateKeyPair()
+	kpB, _ := identity.GenerateKeyPair()
+
+	rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendURL, err := url.Parse("http://" + rawLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := hub.New(&hub.Config{
+		HTTPSListener:      rawLn,
+		TLSConfig:          srvTLS,
+		EnableSTUN:         true,
+		EnableTURN:         true,
+		STUNSListenAddr:    "127.0.0.1:0",
+		TURNSTLSListenAddr: "127.0.0.1:0",
+		TURNAdvertiseHost:  "svc.sel3.cloudtype.app:31838",
+	})
+	if err != nil {
+		_ = rawLn.Close()
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	rp := httputil.NewSingleHostReverseProxy(backendURL)
+	proxySrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("X-Test-Proxy-Case") {
+		case "backend-port-443":
+			r.Host = "port-0-lighthouse-in-snoo-abc.sel3.cloudtype.app:8443"
+			r.Header.Del("X-Forwarded-Host")
+			r.Header.Set("X-Forwarded-Port", "443")
+		case "rfc7239-forwarded":
+			r.Header.Del("X-Forwarded-Host")
+			r.Header.Del("X-Forwarded-Port")
+			r.Header.Set("Forwarded", `for=198.51.100.9;proto=https;host="port-0-fwd.sel3.cloudtype.app"`)
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	proxySrv.TLS = srvTLS.Clone()
+	proxySrv.TLS.MinVersion = tls.VersionTLS13
+	proxySrv.TLS.MaxVersion = tls.VersionTLS13
+	proxySrv.StartTLS()
+	defer proxySrv.Close()
+
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: cliTLS}}
+
+	// 1. Default PaaS/Cloudtype root "/" health check returns 200 OK (GET and HEAD), unknown paths return 404.
+	resp, err := hc.Get(proxySrv.URL + "/")
+	if err != nil {
+		t.Fatalf("GET / via reverse proxy: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != `{"status":"ok"}` {
+		t.Fatalf("GET / = %d %q; want 200 ok", resp.StatusCode, string(body))
+	}
+
+	headResp, err := hc.Head(proxySrv.URL + "/")
+	if err != nil {
+		t.Fatalf("HEAD / via reverse proxy: %v", err)
+	}
+	_ = headResp.Body.Close()
+	if headResp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD / = %d; want 200", headResp.StatusCode)
+	}
+
+	missResp, err := hc.Get(proxySrv.URL + "/does-not-exist")
+	if err != nil {
+		t.Fatalf("GET /does-not-exist: %v", err)
+	}
+	_ = missResp.Body.Close()
+	if missResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET /does-not-exist = %d; want 404", missResp.StatusCode)
+	}
+
+	// 2. X-Forwarded-Port=443 strips internal backend port from Host and preserves external TURN host:port.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	proxyWSS := "wss://" + strings.TrimPrefix(proxySrv.URL, "https://") + "/v1/signal"
+	cA, _, err := websocket.Dial(ctx, proxyWSS, &websocket.DialOptions{
+		HTTPClient: hc,
+		HTTPHeader: http.Header{"X-Test-Proxy-Case": []string{"backend-port-443"}},
+	})
+	if err != nil {
+		t.Fatalf("dial backend-port-443: %v", err)
+	}
+	defer cA.CloseNow()
+
+	_, rawChalA, err := cA.Read(ctx)
+	if err != nil {
+		t.Fatalf("read challenge A: %v", err)
+	}
+	var chalA protocol.ChallengeMessage
+	if err := json.Unmarshal(rawChalA, &chalA); err != nil {
+		t.Fatal(err)
+	}
+	const wantOriginA = "wss://port-0-lighthouse-in-snoo-abc.sel3.cloudtype.app"
+	if chalA.HubOrigin != wantOriginA {
+		t.Fatalf("challenge HubOrigin = %q; want %q", chalA.HubOrigin, wantOriginA)
+	}
+	proofA, err := kpA.SignRegistrationChallenge(chalA.Challenge, wantOriginA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	regRawA, _ := json.Marshal(protocol.RegisterMessage{
+		V:         protocol.Version,
+		Type:      protocol.TypeRegister,
+		PeerID:    kpA.PeerID,
+		PublicKey: identity.EncodePublicKey(kpA.PublicKey),
+		HubOrigin: wantOriginA,
+		Challenge: chalA.Challenge,
+		Proof:     proofA,
+	})
+	if err := cA.Write(ctx, websocket.MessageText, regRawA); err != nil {
+		t.Fatal(err)
+	}
+	_, respRawA, err := cA.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var regA protocol.RegisteredMessage
+	if err := json.Unmarshal(respRawA, &regA); err != nil {
+		t.Fatal(err)
+	}
+	if regA.Relay == nil {
+		t.Fatal("expected relay info in registered response")
+	}
+	wantDTLS := "turns:svc.sel3.cloudtype.app:31838"
+	wantTCP := "turns:svc.sel3.cloudtype.app:31838?transport=tcp"
+	if len(regA.Relay.URIs) != 2 || regA.Relay.URIs[0] != wantDTLS || regA.Relay.URIs[1] != wantTCP {
+		t.Fatalf("relay URIs = %v; want [%s %s]", regA.Relay.URIs, wantDTLS, wantTCP)
+	}
+
+	// 3. Heartbeat triggers keepalive WebSocket Ping without disrupting subsequent JSON traffic.
+	hbRaw, _ := json.Marshal(protocol.HeartbeatMessage{
+		V:    protocol.Version,
+		Type: protocol.TypeHeartbeat,
+	})
+	if err := cA.Write(ctx, websocket.MessageText, hbRaw); err != nil {
+		t.Fatalf("write heartbeat: %v", err)
+	}
+	keys, err := identity.DeriveChannelKeys("cloudtype-keepalive-room")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinRaw, _ := json.Marshal(protocol.ChannelJoinMessage{
+		V:         protocol.Version,
+		Type:      protocol.TypeChannelJoin,
+		ChannelID: keys.ChannelID,
+	})
+	if err := cA.Write(ctx, websocket.MessageText, joinRaw); err != nil {
+		t.Fatalf("write channel_join after heartbeat: %v", err)
+	}
+	_, peersRaw, err := cA.Read(ctx)
+	if err != nil {
+		t.Fatalf("read channel_peers after heartbeat: %v", err)
+	}
+	var peersMsg protocol.ChannelPeersMessage
+	if err := json.Unmarshal(peersRaw, &peersMsg); err != nil || peersMsg.Type != protocol.TypeChannelPeers {
+		t.Fatalf("unexpected message after heartbeat: %s (err=%v)", string(peersRaw), err)
+	}
+
+	// 4. RFC 7239 Forwarded header host resolution.
+	cB, _, err := websocket.Dial(ctx, proxyWSS, &websocket.DialOptions{
+		HTTPClient: hc,
+		HTTPHeader: http.Header{"X-Test-Proxy-Case": []string{"rfc7239-forwarded"}},
+	})
+	if err != nil {
+		t.Fatalf("dial rfc7239-forwarded: %v", err)
+	}
+	defer cB.CloseNow()
+
+	_, rawChalB, err := cB.Read(ctx)
+	if err != nil {
+		t.Fatalf("read challenge B: %v", err)
+	}
+	var chalB protocol.ChallengeMessage
+	if err := json.Unmarshal(rawChalB, &chalB); err != nil {
+		t.Fatal(err)
+	}
+	const wantOriginB = "wss://port-0-fwd.sel3.cloudtype.app"
+	if chalB.HubOrigin != wantOriginB {
+		t.Fatalf("RFC 7239 challenge HubOrigin = %q; want %q", chalB.HubOrigin, wantOriginB)
+	}
+	proofB, err := kpB.SignRegistrationChallenge(chalB.Challenge, wantOriginB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	regRawB, _ := json.Marshal(protocol.RegisterMessage{
+		V:         protocol.Version,
+		Type:      protocol.TypeRegister,
+		PeerID:    kpB.PeerID,
+		PublicKey: identity.EncodePublicKey(kpB.PublicKey),
+		HubOrigin: wantOriginB,
+		Challenge: chalB.Challenge,
+		Proof:     proofB,
+	})
+	if err := cB.Write(ctx, websocket.MessageText, regRawB); err != nil {
+		t.Fatal(err)
+	}
+	_, respRawB, err := cB.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var regB protocol.RegisteredMessage
+	if err := json.Unmarshal(respRawB, &regB); err != nil || regB.PeerID != kpB.PeerID {
+		t.Fatalf("unexpected RFC 7239 registration: %s (err=%v)", string(respRawB), err)
+	}
+}

@@ -54,9 +54,7 @@ COPY --from=builder /out/lighthouse /usr/local/bin/lighthouse
 
 USER 10001:10001
 VOLUME ["/etc/lighthouse"]
-EXPOSE 8443/tcp
-EXPOSE 5349/udp
-EXPOSE 5349/tcp
+EXPOSE 8443
 
 ENTRYPOINT ["/usr/local/bin/lighthouse"]
 CMD ["hub"]

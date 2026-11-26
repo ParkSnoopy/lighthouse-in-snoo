@@ -223,19 +223,24 @@ func (s *Server) resolveRequestOrigin(r *http.Request) string {
 	}
 	host := strings.TrimSpace(r.Host)
 	if r.TLS == nil {
-		if xfh := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); xfh != "" {
-			first, _, _ := strings.Cut(xfh, ",")
-			if candidate := strings.TrimSpace(first); candidate != "" {
-				host = candidate
-			}
+		hostFromProxyHeader := false
+		if xfh := firstHeaderToken(r.Header.Get("X-Forwarded-Host")); xfh != "" {
+			host = xfh
+			hostFromProxyHeader = true
+		} else if fwdHost := extractForwardedHost(r.Header.Get("Forwarded")); fwdHost != "" {
+			host = fwdHost
+			hostFromProxyHeader = true
 		}
 		if host != "" {
-			if _, _, err := net.SplitHostPort(host); err != nil {
-				if xfp := strings.TrimSpace(r.Header.Get("X-Forwarded-Port")); xfp != "" {
-					firstPort, _, _ := strings.Cut(xfp, ",")
-					firstPort = strings.TrimSpace(firstPort)
-					if p, pErr := strconv.Atoi(firstPort); pErr == nil && p >= 1 && p <= 65535 && p != 443 && p != 80 {
-						host = net.JoinHostPort(strings.Trim(host, "[]"), firstPort)
+			_, _, splitErr := net.SplitHostPort(host)
+			hasExplicitProxyPort := hostFromProxyHeader && splitErr == nil
+			if xfp := firstHeaderToken(r.Header.Get("X-Forwarded-Port")); xfp != "" && !hasExplicitProxyPort {
+				if p, pErr := strconv.Atoi(xfp); pErr == nil && p >= 1 && p <= 65535 {
+					bareHost := stripHostPort(host)
+					if p == 443 || p == 80 {
+						host = bareHost
+					} else {
+						host = net.JoinHostPort(bareHost, xfp)
 					}
 				}
 			}
@@ -255,4 +260,35 @@ func (s *Server) resolveRequestOrigin(r *http.Request) string {
 		}
 	}
 	return "wss://localhost:8443"
+}
+
+func firstHeaderToken(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	first, _, _ := strings.Cut(trimmed, ",")
+	return strings.TrimSpace(first)
+}
+
+func extractForwardedHost(raw string) string {
+	first := firstHeaderToken(raw)
+	if first == "" {
+		return ""
+	}
+	for param := range strings.SplitSeq(first, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(param), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(k), "host") {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(v), `"`)
+	}
+	return ""
+}
+
+func stripHostPort(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return strings.Trim(h, "[]")
+	}
+	return strings.Trim(host, "[]")
 }

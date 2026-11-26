@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -109,18 +110,34 @@ type Stats struct {
 }
 
 type peerSession struct {
-	id         uint64
-	conn       *websocket.Conn
-	remoteIP   string
-	peerID     string
-	publicKey  identity.PublicKey
-	assignedIP netip.Addr
-	expiresAt  atomic.Int64 // Unix nanos of presence lease expiry
-	writeMu    sync.Mutex
-	closed     atomic.Bool
-	cancel     context.CancelFunc
-	subscribed map[string]struct{} // guarded by hub.mu
-	broadcasts map[string]struct{} // guarded by hub.mu
+	id           uint64
+	conn         *websocket.Conn
+	remoteIP     string
+	peerID       string
+	publicKey    identity.PublicKey
+	assignedIP   netip.Addr
+	expiresAt    atomic.Int64 // Unix nanos of presence lease expiry
+	writeMu      sync.Mutex
+	closed       atomic.Bool
+	cancel       context.CancelFunc
+	pingInFlight atomic.Bool
+	pingWG       sync.WaitGroup
+	subscribed   map[string]struct{} // guarded by hub.mu
+	broadcasts   map[string]struct{} // guarded by hub.mu
+}
+
+func (ps *peerSession) triggerKeepalivePing(ctx context.Context) {
+	if ps.closed.Load() || !ps.pingInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	ps.pingWG.Add(1)
+	go func() {
+		defer ps.pingWG.Done()
+		defer ps.pingInFlight.Store(false)
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		_ = ps.conn.Ping(pctx)
+	}()
 }
 
 func (ps *peerSession) sendRaw(ctx context.Context, payload []byte) error {
@@ -380,6 +397,7 @@ func New(cfgIn *Config) (*Server, error) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/{$}", s.handleHealthz)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/v1/signal", s.handleSignalWS)
 
@@ -681,8 +699,13 @@ func (s *Server) formatAdvertisedAddr(addr net.Addr, reqOrigin string) string {
 	if err != nil {
 		return addr.String()
 	}
-	if s.cfg.TURNAdvertiseHost != "" {
-		return net.JoinHostPort(s.cfg.TURNAdvertiseHost, port)
+	if adv := strings.TrimSpace(s.cfg.TURNAdvertiseHost); adv != "" {
+		if advHost, advPort, splitErr := net.SplitHostPort(adv); splitErr == nil && advHost != "" {
+			if p, pErr := strconv.Atoi(advPort); pErr == nil && p >= 1 && p <= 65535 {
+				return net.JoinHostPort(advHost, advPort)
+			}
+		}
+		return net.JoinHostPort(strings.Trim(adv, "[]"), port)
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || ip.IsUnspecified() {
@@ -789,6 +812,7 @@ func (s *Server) handleSignalWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close(websocket.StatusPolicyViolation, errCode)
 		return
 	}
+	defer ps.pingWG.Wait()
 	defer s.unregisterSession(ps)
 
 	s.regOK.Add(1)
@@ -987,6 +1011,7 @@ func (s *Server) handleAuthenticatedMessage(ctx context.Context, ps *peerSession
 			return
 		}
 		ps.expiresAt.Store(s.nowFunc().Add(s.cfg.PresenceTTL).UnixNano())
+		ps.triggerKeepalivePing(ctx)
 
 	case protocol.TypeChannelJoin:
 		s.handleChannelJoin(ctx, ps, raw)

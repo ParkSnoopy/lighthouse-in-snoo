@@ -96,8 +96,10 @@ func TestNormalizeDomain(t *testing.T) {
 }
 
 func TestSingleDomainEnvResolutionAndOverrides(t *testing.T) {
-	// Clear relevant LIGHTHOUSE_* variables for isolated env checks.
+	// Clear relevant LIGHTHOUSE_* and PaaS PORT variables for isolated env checks.
 	for _, k := range []string{
+		"PORT",
+		"LIGHTHOUSE_HTTPS_ADDR",
 		"LIGHTHOUSE_DOMAIN",
 		"LIGHTHOUSE_STUN_DOMAIN",
 		"LIGHTHOUSE_HUB_ORIGIN",
@@ -110,6 +112,29 @@ func TestSingleDomainEnvResolutionAndOverrides(t *testing.T) {
 	}
 
 	// Defaults when nothing is set (hub origin empty => accept all domains/ports dynamically).
+	if got := cli.DefaultHTTPSAddr(); got != ":8443" {
+		t.Fatalf("DefaultHTTPSAddr() = %q; want :8443", got)
+	}
+	t.Setenv("PORT", "8080")
+	if got := cli.DefaultHTTPSAddr(); got != ":8080" {
+		t.Fatalf("DefaultHTTPSAddr() with PORT=8080 = %q; want :8080", got)
+	}
+	t.Setenv("PORT", ":9090")
+	if got := cli.DefaultHTTPSAddr(); got != ":9090" {
+		t.Fatalf("DefaultHTTPSAddr() with PORT=:9090 = %q; want :9090", got)
+	}
+	t.Setenv("PORT", "not-a-port")
+	if got := cli.DefaultHTTPSAddr(); got != ":8443" {
+		t.Fatalf("DefaultHTTPSAddr() with invalid PORT = %q; want :8443", got)
+	}
+	t.Setenv("PORT", "8080")
+	t.Setenv("LIGHTHOUSE_HTTPS_ADDR", "127.0.0.1:9443")
+	if got := cli.DefaultHTTPSAddr(); got != "127.0.0.1:9443" {
+		t.Fatalf("DefaultHTTPSAddr() with explicit LIGHTHOUSE_HTTPS_ADDR = %q; want 127.0.0.1:9443", got)
+	}
+	_ = os.Unsetenv("PORT")
+	_ = os.Unsetenv("LIGHTHOUSE_HTTPS_ADDR")
+
 	if got := cli.DefaultHubOrigin(); got != "" {
 		t.Fatalf("DefaultHubOrigin() = %q; want empty (accept all)", got)
 	}

@@ -205,9 +205,9 @@ func newHubCommand() *cli.Command {
 		Long:      "https-addr",
 		ValueName: "ADDR",
 		ShortHelp: "HTTPS/WSS listen address",
-		LongHelp:  "TCP listen address for TLS 1.3 /healthz and /v1/signal endpoints",
+		LongHelp:  "TCP listen address for TLS 1.3 and reverse-proxied /, /healthz, and /v1/signal endpoints (honors PORT)",
 		EnvVar:    "LIGHTHOUSE_HTTPS_ADDR",
-		Default:   ":8443",
+		Default:   cli.DefaultHTTPSAddr(),
 	})
 	cmd.StringOpt(&stunsAddr, cli.Option{
 		Long:      "stuns-addr",

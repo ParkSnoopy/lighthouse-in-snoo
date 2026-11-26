@@ -201,6 +201,9 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 			if strings.Contains(text, "gcr.io/") {
 				t.Fatalf("Dockerfile must not reference gcr.io images")
 			}
+			if !strings.Contains(text, "EXPOSE 8443\n") {
+				t.Fatalf("Dockerfile must expose single primary HTTP/WSS port 8443 for PaaS alignment")
+			}
 		}
 		if rel == filepath.Join(".github", "workflows", "build.yml") {
 			if strings.Contains(text, "\n  verify:\n") {
@@ -314,12 +317,24 @@ func TestSingleSourceVersionAndRuntimeEnvDefaults(t *testing.T) {
 	if !strings.Contains(string(overrideHelp), "[default: wss://custom.override.example]") {
 		t.Fatalf("explicit LIGHTHOUSE_HUB_ORIGIN override missing:\n%s", string(overrideHelp))
 	}
+
+	// Standard PaaS PORT env var (e.g. Cloudtype) configures default --https-addr when LIGHTHOUSE_HTTPS_ADDR is unset.
+	portCmd := exec.Command(binPath, "hub", "--help")
+	portCmd.Dir = dotEnvDir
+	portCmd.Env = append(stripLighthouseEnv(os.Environ()), "PORT=8080")
+	portHelp, err := portCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PORT hub --help failed: %v\n%s", err, string(portHelp))
+	}
+	if !strings.Contains(string(portHelp), "[default: :8080]") {
+		t.Fatalf("PORT=8080 default --https-addr missing:\n%s", string(portHelp))
+	}
 }
 
 func stripLighthouseEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "LIGHTHOUSE_") {
+		if strings.HasPrefix(kv, "LIGHTHOUSE_") || strings.HasPrefix(kv, "PORT=") {
 			continue
 		}
 		out = append(out, kv)

@@ -49,6 +49,8 @@ docker pull ghcr.io/<owner>/<repo>:latest
 docker compose up -d --build
 ```
 
+For PaaS / reverse-proxy hosts such as Cloudtype (HTTP/HTTPS TLS termination on port `443`, no UDP): expose port `8443` (or set `PORT`) as an **HTTP** service, leave `LIGHTHOUSE_DOMAIN` unset to accept rotating hosts, optionally set `LIGHTHOUSE_NO_RELAY=true` when UDP `5349` is unavailable, and connect clients using the bare HTTPS hostname (e.g. `port-0-<app>-<id>.sel3.cloudtype.app`).
+
 All `LIGHTHOUSE_*` environment variables and optional local `.env` entries are read at runtime.
 
 ### 2. Run the Universal Hub
@@ -71,14 +73,14 @@ Run with a single domain (`LIGHTHOUSE_DOMAIN` in `.env` or `--domain`) to auto-c
 | Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
 | `--domain` | `LIGHTHOUSE_DOMAIN` | *(accept all)* | Optional hub domain pinning `--hub-origin` (`wss://<domain>`), `--turn-advertise-host`, `--turn-realm`, and TLS SAN; omit to accept rotating domains/ports (e.g. Cloudtype) |
-| `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:8443` | TCP listen address for HTTPS/WSS signaling |
+| `--https-addr` | `LIGHTHOUSE_HTTPS_ADDR` | `:${PORT}` / `:8443` | TCP listen address for HTTPS/WSS signaling (honors `PORT`) |
 | `--stuns-addr` | `LIGHTHOUSE_STUNS_ADDR` | `:5349` | Encrypted STUNS/TURNS address (UDP default; TCP with `--tcp-only`) |
 | `--cidr` | `LIGHTHOUSE_CIDR` | `10.88.0.0/16` | Virtual IPv4 subnet CIDR assigned to connected peers |
 | `--tls-algo` | `LIGHTHOUSE_TLS_ALGO` | `ed25519` | TLS/DTLS key algorithm generated on initial run (`ed25519`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) |
 | `--tls-rsa-bits` | `LIGHTHOUSE_TLS_RSA_BITS` | `3072` | RSA modulus bit length when `--tls-algo=rsa` (`2048`–`8192`) |
 | `--no-relay` | `LIGHTHOUSE_NO_RELAY` | `false` | Disable integrated universal TURNS relay |
 | `--turn-public-ip` | `LIGHTHOUSE_TURN_PUBLIC_IP` | *(auto)* | Public IP advertised in TURN relay allocations |
-| `--turn-advertise-host` | `LIGHTHOUSE_TURN_ADVERTISE_HOST` | *(from domain)* | Host advertised to peers in universal relay URIs |
+| `--turn-advertise-host` | `LIGHTHOUSE_TURN_ADVERTISE_HOST` | *(from domain)* | Host (or `host:port`) advertised to peers in universal relay URIs |
 | `--turn-secret` | `LIGHTHOUSE_TURN_SECRET` | *(ephemeral)* | Optional HMAC secret for universal relay credentials |
 | `--turn-realm` | `LIGHTHOUSE_TURN_REALM` | *(from domain / `lighthouse`)* | TURN authentication realm |
 | `--turn-tls-addr` | `LIGHTHOUSE_TURN_TLS_ADDR` | *(disabled)* | Optional TLS 1.3 / TCP TURNS fallback address |

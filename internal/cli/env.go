@@ -150,6 +150,21 @@ func ResolveDomainFromEnv() (DomainConfig, bool) {
 	return DomainConfig{}, false
 }
 
+// DefaultHTTPSAddr resolves the hub HTTPS/WSS listen address from LIGHTHOUSE_HTTPS_ADDR,
+// falling back to standard PaaS PORT (e.g. Cloudtype) and finally ":8443".
+func DefaultHTTPSAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("LIGHTHOUSE_HTTPS_ADDR")); addr != "" {
+		return addr
+	}
+	if rawPort := strings.TrimSpace(os.Getenv("PORT")); rawPort != "" {
+		trimmed := strings.TrimPrefix(rawPort, ":")
+		if p, err := strconv.Atoi(trimmed); err == nil && p >= 1 && p <= 65535 {
+			return ":" + trimmed
+		}
+	}
+	return ":8443"
+}
+
 // DefaultHubOrigin resolves the optional pinned WSS hub origin for CLI help and startup.
 // When neither LIGHTHOUSE_HUB_ORIGIN nor LIGHTHOUSE_DOMAIN is set, it returns "" so the hub
 // dynamically accepts any incoming domain or forwarded port.

@@ -5,7 +5,7 @@
 Lighthouse separates the network into two components:
 
 1. **Blinded Zero-Config Universal Hub (`cmd/lighthouse` / `internal/hub`)**: A `CGO_ENABLED=0` static `linux/amd64` server (packaged on `debian:13-slim`) with no hub passphrase, static ACL policy files, or database. It provides:
-   - TLS 1.3 WSS signaling (`/v1/signal`) and privacy-preserving health endpoint (`/healthz`), auto-generating and persisting `tls.crt`/`tls.key` in `/etc/lighthouse` on initial container startup using `--tls-algo` (`LIGHTHOUSE_TLS_ALGO`, default `ed25519`; supports `ed25519`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) with in-memory fallback when non-writable. The listener also multiplexes plaintext HTTP/WebSocket traffic forwarded by TLS-terminating reverse proxies (Cloudtype, Nginx, Caddy, Kubernetes Ingress) from private, loopback, link-local, or CGNAT addresses while rejecting TLS 1.2 and public plaintext HTTP.
+   - TLS 1.3 WSS signaling (`/v1/signal`) and privacy-preserving health endpoints (`/` and `/healthz`), auto-generating and persisting `tls.crt`/`tls.key` in `/etc/lighthouse` on initial container startup using `--tls-algo` (`LIGHTHOUSE_TLS_ALGO`, default `ed25519`; supports `ed25519`, `nistp-256`, `nistp-384`, `nistp-521`, `rsa`) with in-memory fallback when non-writable. The listener honors `PORT` when `LIGHTHOUSE_HTTPS_ADDR` is unset, multiplexes plaintext HTTP/WebSocket traffic forwarded by TLS-terminating reverse proxies (Cloudtype, Nginx, Caddy, Kubernetes Ingress) from private, loopback, link-local, or CGNAT addresses while rejecting TLS 1.2 and public plaintext HTTP, and responds to client `heartbeat` frames with RFC 6455 WebSocket `Ping` control frames so reverse-proxy idle read timeouts (e.g. Cloudtype Free Tier `60 s`) never drop live peers.
    - Optional single-domain runtime auto-configuration (`--domain` / `LIGHTHOUSE_DOMAIN` in `.env` or process environment): pins canonical `wss://<domain>` hub origin, TURN advertise host and realm, and auto-generated TLS certificate SAN; when omitted, the hub dynamically accepts any incoming domain or forwarded port (including PaaS rotating domains such as Cloudtype) while keeping per-connection challenge-origin binding intact. Clients accept bare domains (`hub.example.com` or `host:port`) without `wss://` or `/v1/signal` boilerplate.
    - Hub-managed IPv4 CIDR assignment (`--cidr` / `LIGHTHOUSE_CIDR`, default `10.88.0.0/16`), advertising `virtual_cidr` and `assigned_ip` in `registered`.
    - Passphrase-bucketed room forwarding (opaque 32-byte `channel_id` tokens; the hub accepts any peer and never sees raw passphrases or decrypted peer labels).
@@ -77,8 +77,8 @@ All signed frames use RFC 8785 JCS (`internal/jcs`), rejecting invalid UTF-8, du
 
 ## 4. Control-Plane Wire Protocol (v2)
 
-- `GET /healthz`: HTTP `200` `{"status":"ok"}`, `Cache-Control: no-store`.
-- `WSS /v1/signal`: TLS 1.3 exclusively, UTF-8 JSON text frames, `64 KiB` frame cap, single-use 32-byte challenges (`60 s` expiry), `20 s` heartbeats / `60 s` leases.
+- `GET /` and `GET /healthz`: HTTP `200` `{"status":"ok"}`, `Cache-Control: no-store`.
+- `WSS /v1/signal`: TLS 1.3 exclusively (or plaintext HTTP/WS behind trusted TLS-terminating reverse proxies), UTF-8 JSON text frames, `64 KiB` frame cap, single-use 32-byte challenges (`60 s` expiry), `20 s` heartbeats (answered with RFC 6455 WebSocket `Ping` keepalives) / `60 s` leases.
 
 | Type | Direction | Description |
 | --- | --- | --- |
