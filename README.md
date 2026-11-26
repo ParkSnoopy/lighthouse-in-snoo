@@ -11,10 +11,17 @@ The receiving user must approve each new connection.
 ## How it works
 
 ```mermaid
-flowchart TD
-    accTitle: Connect two Lighthouse clients
-    hub["Connect to the same hub"] --> discover["Find a peer with the same passphrase"]
-    discover -->|Peer selects Allow| tunnel["Use the encrypted tunnel"]
+block-beta
+    columns 3
+    space signal["Hub: WSS signaling"] space
+    a["Peer A (TUN)"] space b["Peer B (TUN)"]
+    space relay["Hub: optional TURNS relay"] space
+
+    a <--> signal
+    signal <--> b
+    a <--> relay
+    relay <--> b
+    a -- "Direct WebRTC tunnel" --- b
 ```
 
 ## Connect with the desktop app
